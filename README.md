@@ -32,7 +32,7 @@ The core model topology splits token activation maps into three immutable operat
 
 ## 2. In-Place Latent Learning (DSR + GEPA)
 
-FATE'O'SISTERS implements a continuous, end-to-end Test-Time Training (TTT) loop that updates model weights dynamically based on streaming execution trajectories without interrupting runtime inference:
+The MOIRA engine framework implements a continuous, end-to-end Test-Time Training (TTT) loop that updates FATE'O'SISTERS model weights dynamically based on streaming execution trajectories without interrupting runtime inference:
 
 1. **Sifting (DSR):** The active inference thread evaluates a prompt. If the DSR gate inside the Lachesis loop flags a trajectory as a novel algorithmic path or high-entropy transaction, it captures the raw activation slice.
 2. **Isolation (GEPA):** The Guided Evolutionary Parameter Adjustment pipeline takes the captured slice and drops it into a lock-free `crossbeam-channel`. This hands the trace over to an isolated background worker thread instantly, avoiding any latency or stuttering in the main application thread.
@@ -60,7 +60,7 @@ To ensure the continuous background training thread never causes an OS-level pag
 
 
 ### `src/engine.rs`
-Contains the implementation of the `FateOSistersEngine` struct. Manages device allocations (Targeting native `Cuda` platforms, falling back gracefully to `Cpu`), evaluates DSR activation entropy curves, applies the 1:2:3 blending functions, and enforces the Identity Lock Suppression Mask.
+Contains the implementation of the core 'MoiraEngine' struct. Manages device allocations (Targeting native `Cuda` platforms, falling back gracefully to `Cpu`), evaluates DSR activation entropy curves, applies the 1:2:3 blending functions, and enforces the Identity Lock Suppression Mask.
 
 ### `src/memory.rs`
 Houses the multi-tiered asynchronous caching loop. It isolates user interaction pipelines from background training matrices, handles lock-free cross-thread communication, and guarantees that host-side configurations remain bounded via the disk Write-Ahead Log (WAL).
@@ -68,18 +68,18 @@ Houses the multi-tiered asynchronous caching loop. It isolates user interaction 
 ### `src/data_sifter.rs`
 Implements the streaming token interfaces. It establishes direct HTTP network iteration maps to pre-filtered open-source reasoning, algorithmic, and function-calling datasets, skipping encyclopedic data to preserve parameter density inside the custom 4,096 BPE tokenizer wrapper.
 
-
+---
 
 ## 4. Public API Interface Example
 
-For integration into native system runtimes, the `FateOSistersEngine` provides a streamlined, zero-allocation programmatic boundary:
+For integration into native system runtimes, the `MoiraEngine` provides a streamlined, zero-allocation programmatic boundary:
 
 ```rust
-use fate_o_sisters::engine::FateOSistersEngine;
+use moira::MoiraEngine;
 
 fn main() -> candle_core::Result<()> {
-    // Initialize the engine with a 4,096 token vocabulary and 128 hidden dimensions
-    let mut engine = FateOSistersEngine::new(4096, 128)?;
+    // Initialize the MOIRA engine to execute the FATE'O'SISTERS model architecture
+    let mut engine = MoiraEngine::new(4096, 128)?;
 
     // Stream inputs directly into the core processing pipeline
     let input_tokens = vec![102, 45, 899, 12];
@@ -95,7 +95,7 @@ fn main() -> candle_core::Result<()> {
     Ok(())
 }
 
-
+---
 
 ## 5. Hardware Compilation Backends
 
