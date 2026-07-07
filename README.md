@@ -1,9 +1,10 @@
 ```markdown
-# FATE'O'SISTERS
 
-FATE'O'SISTERS is a high-performance, on-device latent reasoning engine implemented natively in Rust via the Hugging Face Candle tensor framework. By replacing traditional flat, linear transformer execution with deep recursive parameter reuse, the engine maps a **2-Billion parameter physical matrix profile** to an **18-Billion parameter effective logical depth** ($2\text{B base weights} \times 9\text{ recurrent evaluation steps}$).
+FATE'O'SISTERS is a high-performance, on-device latent reasoning model implemented natively in Rust via the **MOIRA engine framework** (utilizing the Hugging Face Candle tensor library). By replacing traditional flat, linear transformer execution with deep recursive parameter reuse, the MOIRA engine maps a **2-Billion parameter physical matrix profile** to an **18-Billion parameter effective logical depth** ($2\text{B base weights} \times 9\text{ recurrent evaluation steps}$).
 
 The architecture is explicitly optimized to eliminate encyclopedic parameter bloat in favor of zero-allocation algorithmic execution, local Model Context Protocol (MCP) tool integration, and in-place test-time parameter adjustment within bounded edge hardware constraints.
+
+
 
 ---
 
