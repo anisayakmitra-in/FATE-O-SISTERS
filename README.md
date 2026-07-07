@@ -96,7 +96,6 @@ fn main() -> candle_core::Result<()> {
 
 
 
-``markdown
 ## 5. Hardware Compilation Backends
 
 The engine utilizes conditional compilation flags within the Hugging Face Candle framework to optimize matrix operations based on host system environments:
