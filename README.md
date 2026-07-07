@@ -50,14 +50,13 @@ To ensure the continuous background training thread never causes an OS-level pag
 ## 3. Core Repository File Layout
 
 
-```
 ├── Cargo.toml            # Workspace metadata, CUDA compiler flags, & Candle dependencies
 └── src/
 ├── main.rs           # System binary entry, telemetry handshake, & execution hooks
 ├── engine.rs         # 3-6-9 Tensor matrices, IndexCache buffers, & Mixing Law layers
 ├── memory.rs         # Async L0/L1/L2 supervisors, atomic interrupts, & WAL handles
 └── data_sifter.rs    # Streaming dataset iterators & 4,096 vocabulary BPE wrappers
-```
+
 
 ### `src/engine.rs`
 Contains the implementation of the `FateOSistersEngine` struct. Manages device allocations (Targeting native `Cuda` platforms, falling back gracefully to `Cpu`), evaluates DSR activation entropy curves, applies the 1:2:3 blending functions, and enforces the Identity Lock Suppression Mask.
@@ -68,4 +67,4 @@ Houses the multi-tiered asynchronous caching loop. It isolates user interaction 
 ### `src/data_sifter.rs`
 Implements the streaming token interfaces. It establishes direct HTTP network iteration maps to pre-filtered open-source reasoning, algorithmic, and function-calling datasets, skipping encyclopedic data to preserve parameter density inside the custom 4,096 BPE tokenizer wrapper.
 
-```
+
