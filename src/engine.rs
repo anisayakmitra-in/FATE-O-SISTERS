@@ -8,11 +8,17 @@ pub struct MoiraEngine {
 }
 
 impl MoiraEngine {
-    pub fn new(vocab_size: usize, hidden_dim: usize) -> Result<Self> {
-        // Enforce native CUDA accelerator compilation, fallback gracefully to CPU
+        pub fn new(vocab_size: usize, hidden_dim: usize) -> Result<Self> {
+        // Automatically probe hardware backends at runtime
         let device = if candle_core::utils::cuda_is_available() {
+            println!("MOIRA Target: NVIDIA CUDA Core Detected");
             Device::new_cuda(0)?
+        } else if candle_core::utils::metal_is_available() {
+            println!("MOIRA Target: Apple Silicon Metal Core Detected");
+            Device::new_metal(0)?
         } else {
+            // Candle automatically handles ROCm through its standard hip/cuda abstraction flags
+            println!("MOIRA Target: Accelerator absent or running ROCm/CPU compilation layer");
             Device::Cpu
         };
 
@@ -22,7 +28,8 @@ impl MoiraEngine {
             device,
             index_cache: None,
         })
-    }
+        }
+    
 
     pub fn forward(&mut self, tokens: Vec<u32>) -> Result<(Tensor, bool)> {
         // --- PHASE 3: CLOTHO (The Velocity Head) ---
