@@ -68,3 +68,38 @@ Houses the multi-tiered asynchronous caching loop. It isolates user interaction 
 Implements the streaming token interfaces. It establishes direct HTTP network iteration maps to pre-filtered open-source reasoning, algorithmic, and function-calling datasets, skipping encyclopedic data to preserve parameter density inside the custom 4,096 BPE tokenizer wrapper.
 
 
+
+## 4. Public API Interface Example
+
+For integration into native system runtimes, the `FateOSistersEngine` provides a streamlined, zero-allocation programmatic boundary:
+
+```rust
+use fate_o_sisters::engine::FateOSistersEngine;
+
+fn main() -> candle_core::Result<()> {
+    // Initialize the engine with a 4,096 token vocabulary and 128 hidden dimensions
+    let mut engine = FateOSistersEngine::new(4096, 128)?;
+
+    // Stream inputs directly into the core processing pipeline
+    let input_tokens = vec![102, 45, 899, 12];
+    
+    // The forward pass evaluates the 3-6-9 strategy and returns normalized token 
+    // probabilities along with the dynamic DSR agentic gate status
+    let (probabilities, agent_gate_triggered) = engine.forward(input_tokens)?;
+
+    if agent_gate_triggered {
+        // Handle native Model Context Protocol (MCP) data verification workflows
+    }
+
+    Ok(())
+}
+
+
+
+``markdown
+## 5. Hardware Compilation Backends
+
+The engine utilizes conditional compilation flags within the Hugging Face Candle framework to optimize matrix operations based on host system environments:
+
+* **CUDA Acceleration (`--features cuda`):** Binds execution loops directly to local NVCC compilers, optimizing the Phase 6 Lachesis recurrent loops for native tensor cores.
+* **CPU Fallback Framework:** Reverts to low-overhead parallel execution configurations if a dedicated hardware accelerator is absent, preserving activation tracking safety.
