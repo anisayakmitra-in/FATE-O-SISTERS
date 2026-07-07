@@ -1,0 +1,21 @@
+[package]
+name = "moira"
+version = "0.1.0"
+edition = "2024"
+description = "On-device latent reasoning engine for the FATE'O'SISTERS architecture"
+
+[dependencies]
+# Core tensor operations and neural network layers via Hugging Face Candle
+candle-core = { version = "0.8.0" }
+candle-nn = { version = "0.8.0" }
+
+# High-performance, lock-free channels for the GEPA background memory thread
+crossbeam-channel = "0.5"
+
+# Fast, thread-safe atomic configuration switches
+lazy_static = "1.5"
+atomic = "0.6"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
