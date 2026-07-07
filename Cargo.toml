@@ -19,3 +19,5 @@ atomic = "0.6"
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+rocm = ["candle-core/rocm", "candle-nn/rocm"]
