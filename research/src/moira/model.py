@@ -275,9 +275,13 @@ class TSKBlock(nn.Module):
         spool_rank: int,
         knot_slots: int,
         num_landmark_types: int = 8,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
         self.knot_slots = knot_slots
+        self.residual_dropout = nn.Dropout(dropout)
         self.thread_norm = nn.LayerNorm(d_model)
         self.thread = ThreadLocalAttention(d_model, n_heads, thread_radius)
         self.spool_norm = nn.LayerNorm(d_model)
@@ -300,11 +304,11 @@ class TSKBlock(nn.Module):
         state: SpoolState | None = None,
     ) -> tuple[Tensor, SpoolState]:
         thread_output = self.thread(self.thread_norm(hidden), visibility)
-        hidden = hidden + thread_output
+        hidden = hidden + self.residual_dropout(thread_output)
         spool_output, next_state = self.spool(
             self.spool_norm(hidden), state, valid_tokens=valid_tokens
         )
-        hidden = hidden + spool_output
+        hidden = hidden + self.residual_dropout(spool_output)
         normalized = self.knot_norm(hidden)
         landmarks, type_ids, _, landmark_visibility = self.sequence_landmarks(
             normalized,
@@ -312,8 +316,8 @@ class TSKBlock(nn.Module):
             mode=mode,
             source_lengths=source_lengths,
         )
-        hidden = hidden + self.knot(
-            normalized, landmarks, type_ids, landmark_visibility
+        hidden = hidden + self.residual_dropout(
+            self.knot(normalized, landmarks, type_ids, landmark_visibility)
         )
         return hidden, next_state
 
@@ -351,9 +355,16 @@ class TSKBlock(nn.Module):
         for batch_index in range(batch):
             valid_length = int(valid_lengths[batch_index].item())
             landmark_count = min(capacity, valid_length)
-            for landmark_index in range(landmark_count):
-                start = landmark_index * valid_length // landmark_count
-                end = (landmark_index + 1) * valid_length // landmark_count
+            source_length = None
+            if mode is CognitiveMode.LACHESIS:
+                assert source_lengths is not None
+                source_length = int(source_lengths[batch_index].item())
+            spans = _landmark_spans(
+                valid_length,
+                landmark_count,
+                source_length=source_length,
+            )
+            for landmark_index, (start, end) in enumerate(spans):
                 landmarks[batch_index, landmark_index] = hidden[
                     batch_index, start:end
                 ].mean(dim=0)
@@ -408,11 +419,13 @@ class MoiraModel(nn.Module):
                     thread_radius=config.thread_radius,
                     spool_rank=config.spool_rank,
                     knot_slots=config.knot_slots,
+                    dropout=config.dropout,
                 )
                 for _ in range(config.n_layers)
             ]
         )
         self.pulse = Pulse(config.d_model)
+        self.embedding_dropout = nn.Dropout(config.dropout)
         self.final_norm = nn.LayerNorm(config.d_model)
         self.output_projection = nn.Linear(
             config.d_model, config.vocab_size, bias=False
@@ -476,7 +489,9 @@ class MoiraModel(nn.Module):
             CognitiveMode.LACHESIS: 1,
             CognitiveMode.ATROPOS: 2,
         }[mode]
-        hidden = self.token_embedding(tokens) + self.mode_embedding.weight[mode_index]
+        hidden = self.embedding_dropout(
+            self.token_embedding(tokens) + self.mode_embedding.weight[mode_index]
+        )
         next_spools = []
         for block, spool_state in zip(self.blocks, spool_states):
             hidden, next_spool = block(
@@ -558,6 +573,44 @@ class MoiraModel(nn.Module):
         return batch, length
 
 
+def _landmark_spans(
+    valid_length: int,
+    landmark_count: int,
+    *,
+    source_length: int | None,
+) -> tuple[tuple[int, int], ...]:
+    """Partition valid tokens without crossing a Lachesis source boundary."""
+    if landmark_count == 0:
+        return ()
+
+    def uniform(start: int, end: int, count: int) -> tuple[tuple[int, int], ...]:
+        width = end - start
+        return tuple(
+            (
+                start + index * width // count,
+                start + (index + 1) * width // count,
+            )
+            for index in range(count)
+        )
+
+    if source_length is None or source_length in (0, valid_length):
+        return uniform(0, valid_length, landmark_count)
+    if landmark_count == 1:
+        return ((0, source_length),)
+
+    target_length = valid_length - source_length
+    proportional = (
+        landmark_count * source_length + valid_length // 2
+    ) // valid_length
+    minimum_source = max(1, landmark_count - target_length)
+    maximum_source = min(source_length, landmark_count - 1)
+    source_count = min(max(proportional, minimum_source), maximum_source)
+    target_count = landmark_count - source_count
+    return uniform(0, source_length, source_count) + uniform(
+        source_length, valid_length, target_count
+    )
+
+
 def _apply_rope(tensor: Tensor) -> Tensor:
     _, _, length, head_dim = tensor.shape
     positions = torch.arange(length, device=tensor.device, dtype=tensor.dtype)
@@ -576,9 +629,18 @@ def _apply_rope(tensor: Tensor) -> Tensor:
 
 
 def _safe_masked_softmax(scores: Tensor, allowed: Tensor) -> Tensor:
-    masked = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+    finite_allowed = allowed & torch.isfinite(scores)
+    has_finite_allowed = finite_allowed.any(dim=-1, keepdim=True)
+    masked = scores.masked_fill(~finite_allowed, -torch.inf)
+    masked = torch.where(has_finite_allowed, masked, 0.0)
     weights = torch.softmax(masked, dim=-1)
-    return torch.where(allowed.any(dim=-1, keepdim=True), weights, 0.0)
+    weights = torch.where(finite_allowed & torch.isfinite(weights), weights, 0.0)
+    total = weights.sum(dim=-1, keepdim=True)
+    return torch.where(
+        total > 0,
+        weights / total.clamp_min(torch.finfo(scores.dtype).tiny),
+        0.0,
+    )
 
 
 def _validate_hidden(

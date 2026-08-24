@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -16,7 +18,9 @@ from moira.model import (
 )
 
 
-def _tiny_config(*, tie_embeddings: bool = True) -> ModelConfig:
+def _tiny_config(
+    *, tie_embeddings: bool = True, dropout: float = 0.0
+) -> ModelConfig:
     return ModelConfig(
         vocab_size=16,
         d_model=8,
@@ -28,6 +32,7 @@ def _tiny_config(*, tie_embeddings: bool = True) -> ModelConfig:
         knot_slots=3,
         capsule_width=4,
         max_seq_len=8,
+        dropout=dropout,
         tie_embeddings=tie_embeddings,
     )
 
@@ -68,6 +73,32 @@ def test_thread_intersects_visibility_with_locality_and_zeros_blocked_rows() -> 
     assert torch.equal(output[:, 1], torch.zeros_like(output[:, 1]))
 
 
+def test_thread_overflow_cannot_select_a_blocked_future_value() -> None:
+    """Catches masked sentinels outranking an allowed score that overflowed."""
+    layer = ThreadLocalAttention(d_model=2, n_heads=1, radius=1)
+    with torch.no_grad():
+        for projection in (
+            layer.query_projection,
+            layer.key_projection,
+            layer.value_projection,
+            layer.output_projection,
+        ):
+            projection.weight.zero_()
+        layer.query_projection.weight[0, 0] = 2e20
+        layer.key_projection.weight[0, 0] = -2e20
+        layer.value_projection.weight.copy_(torch.eye(2))
+        layer.output_projection.weight.copy_(torch.eye(2))
+
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    visibility = torch.zeros((1, 2, 2), dtype=torch.bool)
+    visibility[:, 0, 0] = True
+
+    output = layer(hidden, visibility)
+
+    assert torch.isfinite(output).all()
+    assert torch.equal(output[:, 0], torch.zeros_like(output[:, 0]))
+
+
 def test_spool_full_sequence_matches_chunked_execution() -> None:
     """Catches recurrence that depends on arbitrary forward-call chunk boundaries."""
     torch.manual_seed(7)
@@ -90,6 +121,7 @@ def test_spool_invalid_tokens_emit_zero_and_do_not_change_state() -> None:
     torch.manual_seed(17)
     layer = SpoolRecurrent(d_model=6, rank=2)
     initial = SpoolState(torch.randn(2, 2, 6))
+    initial_snapshot = initial.memory.clone()
     x = torch.randn(2, 3, 6)
     valid = torch.tensor([[False, False, False], [True, False, True]])
 
@@ -104,6 +136,7 @@ def test_spool_invalid_tokens_emit_zero_and_do_not_change_state() -> None:
     assert torch.equal(output[1, 1], torch.zeros_like(output[1, 1]))
     assert torch.allclose(output[1, [0, 2]], expected_second[0], atol=1e-6)
     assert torch.allclose(state.memory[1], expected_state.memory[0], atol=1e-6)
+    assert torch.equal(initial.memory, initial_snapshot)
 
 
 def test_spool_rejects_malformed_state() -> None:
@@ -160,6 +193,38 @@ def test_knot_respects_typed_causal_visibility_and_zeros_blocked_rows() -> None:
     )
     assert torch.isfinite(baseline).all()
     assert torch.equal(baseline[:, 2], torch.zeros_like(baseline[:, 2]))
+
+
+def test_knot_overflow_cannot_select_a_blocked_landmark() -> None:
+    """Catches non-finite allowed scores exposing a forbidden landmark."""
+    layer = KnotLandmarkAttention(d_model=2, max_landmarks=2)
+    with torch.no_grad():
+        for projection in (
+            layer.query_projection,
+            layer.key_projection,
+            layer.value_projection,
+            layer.output_projection,
+        ):
+            projection.weight.zero_()
+        layer.type_embedding.weight.zero_()
+        layer.query_projection.weight[0, 0] = 2e20
+        layer.key_projection.weight[0, 0] = -2e20
+        layer.value_projection.weight.copy_(torch.eye(2))
+        layer.output_projection.weight.copy_(torch.eye(2))
+
+    hidden = torch.tensor([[[1.0, 0.0]]])
+    landmarks = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    visibility = torch.tensor([[[True, False]]])
+
+    output = layer(
+        hidden,
+        landmarks,
+        torch.zeros((1, 2), dtype=torch.int64),
+        visibility,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.equal(output, torch.zeros_like(output))
 
 
 def test_sequence_landmarks_are_contiguous_means_with_mode_correct_visibility() -> None:
@@ -225,6 +290,107 @@ def test_sequence_landmarks_are_contiguous_means_with_mode_correct_visibility() 
     )
 
 
+def test_lachesis_landmarks_never_pool_across_the_source_boundary() -> None:
+    """Catches a landmark that mixes bidirectional source and causal target tokens."""
+    block = TSKBlock(
+        d_model=4,
+        n_heads=2,
+        thread_radius=1,
+        spool_rank=2,
+        knot_slots=3,
+    )
+    hidden = torch.tensor([[[float(value)] * 4 for value in range(1, 6)]])
+    valid = torch.ones((1, 5), dtype=torch.bool)
+
+    landmarks, _, end_positions, visibility = block.sequence_landmarks(
+        hidden,
+        valid,
+        mode=CognitiveMode.LACHESIS,
+        source_lengths=torch.tensor([2]),
+    )
+
+    assert torch.equal(
+        landmarks,
+        torch.tensor([[[1.5] * 4, [3.0] * 4, [4.5] * 4]]),
+    )
+    assert torch.equal(end_positions, torch.tensor([[1, 2, 4]]))
+    assert torch.equal(
+        visibility[0],
+        torch.tensor(
+            [
+                [1, 0, 0],
+                [1, 0, 0],
+                [1, 1, 0],
+                [1, 1, 0],
+                [1, 1, 1],
+            ],
+            dtype=torch.bool,
+        ),
+    )
+
+
+def test_lachesis_single_landmark_preserves_source_without_crossing_boundary() -> None:
+    """Catches forced source/target mixing when Knot capacity is one."""
+    block = TSKBlock(
+        d_model=4,
+        n_heads=2,
+        thread_radius=1,
+        spool_rank=2,
+        knot_slots=1,
+    )
+    hidden = torch.tensor([[[float(value)] * 4 for value in range(1, 5)]])
+
+    landmarks, _, end_positions, _ = block.sequence_landmarks(
+        hidden,
+        torch.ones((1, 4), dtype=torch.bool),
+        mode=CognitiveMode.LACHESIS,
+        source_lengths=torch.tensor([2]),
+    )
+
+    assert torch.equal(landmarks, torch.tensor([[[1.5] * 4]]))
+    assert torch.equal(end_positions, torch.tensor([[1]]))
+
+
+@pytest.mark.parametrize(
+    ("source_length", "expected_visibility"),
+    [
+        (
+            0,
+            torch.tensor(
+                [[0, 0], [1, 0], [1, 0], [1, 1]], dtype=torch.bool
+            ),
+        ),
+        (4, torch.ones((4, 2), dtype=torch.bool)),
+    ],
+)
+def test_lachesis_empty_or_full_source_keeps_the_unsplit_layout(
+    source_length: int,
+    expected_visibility: torch.Tensor,
+) -> None:
+    """Catches edge sources producing empty spans or the wrong visibility policy."""
+    block = TSKBlock(
+        d_model=4,
+        n_heads=2,
+        thread_radius=1,
+        spool_rank=2,
+        knot_slots=2,
+    )
+    hidden = torch.tensor([[[float(value)] * 4 for value in range(1, 5)]])
+
+    landmarks, _, end_positions, visibility = block.sequence_landmarks(
+        hidden,
+        torch.ones((1, 4), dtype=torch.bool),
+        mode=CognitiveMode.LACHESIS,
+        source_lengths=torch.tensor([source_length]),
+    )
+
+    assert torch.equal(
+        landmarks, torch.tensor([[[1.5] * 4, [3.5] * 4]])
+    )
+    assert torch.equal(end_positions, torch.tensor([[1, 3]]))
+    assert torch.equal(visibility[0], expected_visibility)
+
+
 def test_atropos_future_token_cannot_change_prior_logits() -> None:
     """Catches future public-token leakage through any Thread-Spool-Knot path."""
     torch.manual_seed(11)
@@ -238,11 +404,87 @@ def test_atropos_future_token_cannot_change_prior_logits() -> None:
     assert torch.allclose(a[:, :4], b[:, :4], atol=1e-6)
 
 
+def test_lachesis_future_target_cannot_change_source_or_prior_target_logits() -> None:
+    """Catches target-side future leakage through any Thread-Spool-Knot path."""
+    torch.manual_seed(13)
+    model = MoiraModel(_tiny_config()).eval()
+    left = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+    right = torch.tensor([[1, 2, 3, 4, 5, 9], [7, 8, 9, 10, 15, 14]])
+    valid = torch.tensor(
+        [[True, True, True, True, True, True], [True, True, True, True, True, False]]
+    )
+    source_lengths = torch.tensor([3, 2])
+
+    a = model(
+        left,
+        mode=CognitiveMode.LACHESIS,
+        valid_tokens=valid,
+        source_lengths=source_lengths,
+    ).logits
+    b = model(
+        right,
+        mode=CognitiveMode.LACHESIS,
+        valid_tokens=valid,
+        source_lengths=source_lengths,
+    ).logits
+
+    assert torch.allclose(a[0, :5], b[0, :5], atol=1e-6)
+    assert torch.allclose(a[1, :4], b[1, :4], atol=1e-6)
+    assert torch.equal(a[1, 5], torch.zeros_like(a[1, 5]))
+    assert torch.equal(b[1, 5], torch.zeros_like(b[1, 5]))
+
+
+def test_configured_dropout_is_used_and_seed_replay_is_deterministic() -> None:
+    """Catches an accepted dropout setting that is ignored by the model."""
+    torch.manual_seed(19)
+    model = MoiraModel(_tiny_config(dropout=0.5)).train()
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+
+    torch.manual_seed(101)
+    first = model(tokens, mode=CognitiveMode.ATROPOS).logits
+    torch.manual_seed(101)
+    replay = model(tokens, mode=CognitiveMode.ATROPOS).logits
+    torch.manual_seed(102)
+    different_seed = model(tokens, mode=CognitiveMode.ATROPOS).logits
+
+    assert torch.equal(first, replay)
+    assert not torch.equal(first, different_seed)
+
+    model.eval()
+    torch.manual_seed(201)
+    first_eval = model(tokens, mode=CognitiveMode.ATROPOS).logits
+    torch.manual_seed(202)
+    second_eval = model(tokens, mode=CognitiveMode.ATROPOS).logits
+    assert torch.equal(first_eval, second_eval)
+
+    zero_dropout = MoiraModel(_tiny_config(dropout=0.0)).train()
+    first_zero = zero_dropout(tokens, mode=CognitiveMode.ATROPOS).logits
+    second_zero = zero_dropout(tokens, mode=CognitiveMode.ATROPOS).logits
+    assert torch.equal(first_zero, second_zero)
+
+
 def test_every_trainable_parameter_receives_a_finite_gradient() -> None:
     """Catches any counted parameter disconnected from the representative objective."""
     torch.manual_seed(23)
     model = MoiraModel(_tiny_config())
-    output = model(torch.tensor([[1, 2, 3, 4]]), mode=CognitiveMode.ATROPOS)
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        warm = model(tokens, mode=CognitiveMode.ATROPOS).state
+    incoming = MoiraState(
+        spools=tuple(
+            SpoolState(spool.memory.detach().clone()) for spool in warm.spools
+        ),
+        pulse=PulseState(
+            fast=warm.pulse.fast.detach().clone(),
+            slow=warm.pulse.slow.detach().clone(),
+        ),
+    )
+    model.zero_grad(set_to_none=True)
+    output = model(
+        tokens,
+        mode=CognitiveMode.ATROPOS,
+        state=incoming,
+    )
 
     (
         output.logits.square().mean()
@@ -260,8 +502,14 @@ def test_every_trainable_parameter_receives_a_finite_gradient() -> None:
         for name, parameter in model.named_parameters()
         if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
     ]
+    all_zero = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None and not bool(torch.any(parameter.grad != 0))
+    ]
     assert missing == []
     assert nonfinite == []
+    assert all_zero == []
 
 
 def test_model_ledger_counts_unique_tied_weights_and_classifies_every_layer() -> None:
@@ -294,6 +542,37 @@ def test_model_ledger_counts_unique_tied_weights_and_classifies_every_layer() ->
     ledger.assert_matches()
 
 
+@pytest.mark.parametrize("tie_embeddings", [True, False])
+def test_model_ledger_matches_tied_and_untied_output_heads(
+    tie_embeddings: bool,
+) -> None:
+    """Catches double-counting tied storage or omitting an untied output head."""
+    model = MoiraModel(_tiny_config(tie_embeddings=tie_embeddings))
+
+    ledger = model.parameter_ledger()
+    unique_count = sum(
+        parameter.numel()
+        for parameter in {id(item): item for item in model.parameters()}.values()
+        if parameter.requires_grad
+    )
+
+    assert ledger.total_trainable == unique_count
+    assert (
+        model.output_projection.weight is model.token_embedding.weight
+    ) is tie_embeddings
+
+
+def test_model_ledger_enforces_the_configured_expected_count() -> None:
+    """Catches model-level expected-count validation being bypassed."""
+    config = replace(
+        _tiny_config(),
+        expected_trainable_parameters=1,
+    )
+
+    with pytest.raises(ValueError, match="expected"):
+        MoiraModel(config).parameter_ledger()
+
+
 def test_model_state_is_explicit_single_pulse_and_forward_is_deterministic() -> None:
     """Catches hidden cross-call state, per-layer Pulse state, or stochastic CPU output."""
     torch.manual_seed(29)
@@ -307,6 +586,24 @@ def test_model_state_is_explicit_single_pulse_and_forward_is_deterministic() -> 
     assert len(first.state.spools) == model.config.n_layers
     assert isinstance(first.state.pulse, PulseState)
     assert not hasattr(first.state, "pulses")
+
+
+def test_model_forward_does_not_mutate_any_caller_owned_state_tensor() -> None:
+    """Catches in-place Spool or Pulse updates crossing an execution boundary."""
+    torch.manual_seed(30)
+    model = MoiraModel(_tiny_config()).eval()
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    incoming = model(tokens, mode=CognitiveMode.ATROPOS).state
+    spool_snapshots = tuple(spool.memory.clone() for spool in incoming.spools)
+    fast_snapshot = incoming.pulse.fast.clone()
+    slow_snapshot = incoming.pulse.slow.clone()
+
+    model(tokens, mode=CognitiveMode.ATROPOS, state=incoming)
+
+    for spool, snapshot in zip(incoming.spools, spool_snapshots):
+        assert torch.equal(spool.memory, snapshot)
+    assert torch.equal(incoming.pulse.fast, fast_snapshot)
+    assert torch.equal(incoming.pulse.slow, slow_snapshot)
 
 
 def test_padding_is_zero_and_cannot_change_valid_outputs_or_state() -> None:
