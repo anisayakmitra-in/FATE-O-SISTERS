@@ -55,6 +55,8 @@ def _validate_source_lengths(
         or source_lengths.device != valid_tokens.device
     ):
         raise ValueError("source_lengths must be int64 [batch] on valid_tokens.device")
+    if torch.any(~valid_tokens[:, :-1] & valid_tokens[:, 1:]):
+        raise ValueError("valid_tokens must be right-padded for lachesis source lengths")
     valid_lengths = valid_tokens.sum(dim=1)
     if torch.any(source_lengths < 0) or torch.any(source_lengths > valid_lengths):
         raise ValueError("source_lengths must be within each row's valid token length")

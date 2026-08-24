@@ -142,3 +142,12 @@ def test_lachesis_rejects_source_lengths_from_a_different_device() -> None:
 
     with pytest.raises(ValueError, match="source_lengths"):
         build_visibility_mask(CognitiveMode.LACHESIS, valid_tokens, source_lengths)
+
+
+def test_lachesis_rejects_non_right_padded_valid_tokens() -> None:
+    """Catches a valid-token count that hides a sparse, ambiguous source layout."""
+    valid_tokens = torch.tensor([[True, False, True, False]])
+    source_lengths = torch.tensor([2], dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="right-padded"):
+        build_visibility_mask(CognitiveMode.LACHESIS, valid_tokens, source_lengths)
