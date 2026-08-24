@@ -1,0 +1,43 @@
+schema_version = 1
+
+[model]
+vocab_size = 64
+d_model = 32
+n_layers = 2
+n_heads = 4
+ffn_dim = 64
+thread_radius = 3
+spool_rank = 8
+knot_slots = 4
+capsule_width = 16
+max_seq_len = 32
+dropout = 0.1
+tie_embeddings = true
+expected_trainable_parameters = 24478
+
+[data]
+kind = "synthetic-indexed-v1"
+seed = 13031997
+train_split = 0
+eval_split = 1
+batch_size = 8
+
+[optimization]
+optimizer = "adamw"
+learning_rate = 0.0003
+weight_decay = 0.01
+gradient_accumulation_steps = 1
+schedule = "cosine-with-warmup"
+warmup_steps = 2
+schedule_total_steps = 20
+precision = "fp32"
+clip_grad_norm = 1.0
+
+[reproducibility]
+seed = 20260824
+deterministic = "strict"
+
+[run]
+log_every_steps = 1
+checkpoint_every_steps = 2
+keep_last_checkpoints = 2
