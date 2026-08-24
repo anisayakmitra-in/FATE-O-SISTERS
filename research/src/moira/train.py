@@ -20,7 +20,7 @@ from torch.nn import functional as F
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import checkpoint_run_lock, load_checkpoint, save_checkpoint
 from .config import TrainingConfig
 from .masks import CognitiveMode
 from .model import MoiraModel
@@ -65,8 +65,26 @@ def train_until(
     resume: str | os.PathLike[str] | None = None,
     device: str = "cpu",
 ) -> TrainingResult:
-    """Train to one operational stop without changing the semantic schedule."""
     _validate_phase_zero(config, stop_at_step=stop_at_step, device=device)
+    with checkpoint_run_lock(run_dir):
+        return _train_until_locked(
+            config,
+            run_dir,
+            stop_at_step=stop_at_step,
+            resume=resume,
+            device=device,
+        )
+
+
+def _train_until_locked(
+    config: TrainingConfig,
+    run_dir: str | os.PathLike[str],
+    *,
+    stop_at_step: int,
+    resume: str | os.PathLike[str] | None,
+    device: str,
+) -> TrainingResult:
+    """Train to one operational stop without changing the semantic schedule."""
     _seed_strict(config.reproducibility.seed)
     model, optimizer, scheduler = _build_components(config)
     scaler = None

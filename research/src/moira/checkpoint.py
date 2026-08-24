@@ -1,7 +1,8 @@
-"""Atomic, weights-only-compatible checkpoints for deterministic MOIRA runs."""
+"""Phase-0 CPU correctness checkpoints; this is not a 3B-scalable loader."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -9,21 +10,24 @@ import os
 import random
 import re
 import stat
+import struct
 import tempfile
 import zipfile
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from threading import Lock, RLock, local
 from typing import Any, Iterator, Mapping
 
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim import AdamW, Optimizer
+from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
-from .ledger import ParameterLedger
+from .ledger import ParameterLedger, ParameterSubsystem
+from .model import MoiraModel
 from .synthetic import DataCursor
 
 
@@ -40,27 +44,39 @@ PHASE0_MAX_CONTAINER_ENTRIES = 16_384
 PHASE0_MAX_TENSORS = 8_192
 PHASE0_MAX_TENSOR_RANK = 8
 PHASE0_MAX_TENSOR_STORAGE_BYTES = 256 * 1024 * 1024
+PHASE0_MAX_TENSOR_DIMENSION = 1_000_000
+PHASE0_MAX_TENSOR_NUMEL = 64 * 1024 * 1024
+PHASE0_MAX_TENSOR_LOGICAL_BYTES = 256 * 1024 * 1024
+PHASE0_MAX_TOTAL_TENSOR_LOGICAL_BYTES = 256 * 1024 * 1024
 PHASE0_MAX_STRING_BYTES = 64 * 1024
+PHASE0_MAX_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
+PHASE0_MAX_SCAN_CANDIDATES = 64
+PHASE0_MAX_SCAN_BYTES = 3 * (
+    PHASE0_MAX_CHECKPOINT_BYTES + PHASE0_MAX_CONTROL_JSON_BYTES
+)
+PHASE0_INACTIVE_PARAMETER_ALIASES = frozenset(
+    {
+        "pulse.appraisal_projection.weight",
+        "pulse.appraisal_projection.bias",
+        "pulse.fast_to_slow.weight",
+        "pulse.fast_to_slow.bias",
+    }
+)
 _PHASE0_TENSOR_DTYPES = frozenset(
     {
         torch.bool,
         torch.uint8,
-        torch.int8,
-        torch.int16,
-        torch.int32,
         torch.int64,
-        torch.float16,
-        torch.bfloat16,
         torch.float32,
-        torch.float64,
-        torch.complex64,
-        torch.complex128,
     }
 )
 _STEP_NAME = re.compile(r"step-([0-9]{9})\.pt\Z", re.ASCII)
 _SIDECAR_NAME = re.compile(r"step-[0-9]{9}\.json\Z", re.ASCII)
 _PRUNING_MARKER_NAME = re.compile(
     r"\.step-([0-9]{9})\.pruning\.json\Z", re.ASCII
+)
+_INVALID_TOMBSTONE_NAME = re.compile(
+    r"\.(step-[0-9]{9}\.(?:pt|json))\.invalid\Z", re.ASCII
 )
 _SIDECAR_KEYS = {
     "schema_version",
@@ -101,6 +117,9 @@ _REQUIRED_PAYLOAD_KEYS = {
     "counters",
     "last_metrics",
 }
+_RUN_LOCKS_GUARD = Lock()
+_RUN_LOCKS: dict[str, RLock] = {}
+_RUN_LOCK_LOCAL = local()
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +139,100 @@ class LoadedCheckpoint:
     data_cursor: DataCursor
     counters: dict[str, int]
     last_metrics: dict[str, float]
+
+
+@contextmanager
+def checkpoint_run_lock(
+    run_dir: str | os.PathLike[str],
+) -> Iterator[Path]:
+    """Hold the permanent per-run Phase-0 writer lock, reentrantly in one thread."""
+    with _checkpoint_directory_lock(Path(run_dir) / "checkpoints") as checkpoint_dir:
+        yield checkpoint_dir
+
+
+@contextmanager
+def _checkpoint_directory_lock(checkpoint_dir: Path) -> Iterator[Path]:
+    _reject_symlink_hops(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _validate_checkpoint_dir(checkpoint_dir)
+    key = str(checkpoint_dir.resolve(strict=True))
+    with _RUN_LOCKS_GUARD:
+        process_lock = _RUN_LOCKS.setdefault(key, RLock())
+    with process_lock:
+        held = getattr(_RUN_LOCK_LOCAL, "held", {})
+        entry = held.get(key)
+        if entry is not None:
+            held[key] = (entry[0] + 1, entry[1])
+            _RUN_LOCK_LOCAL.held = held
+            try:
+                yield checkpoint_dir
+            finally:
+                depth, descriptor = held[key]
+                held[key] = (depth - 1, descriptor)
+            return
+
+        descriptor = _acquire_run_lock(checkpoint_dir)
+        held[key] = (1, descriptor)
+        _RUN_LOCK_LOCAL.held = held
+        try:
+            yield checkpoint_dir
+        finally:
+            del held[key]
+            _release_run_lock(descriptor)
+
+
+def _acquire_run_lock(checkpoint_dir: Path) -> int:
+    lock_path = checkpoint_dir / ".run.lock"
+    _reject_symlink_hops(lock_path)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    if os.name != "nt":
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ValueError("checkpoint writer lock cannot be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        named = lock_path.lstat()
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(opened, named):
+            raise ValueError("checkpoint writer lock is not a stable regular file")
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+            _fsync_directory(checkpoint_dir)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(descriptor)
+        if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            raise ValueError("checkpoint writer lock is held by another process") from error
+        raise
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _release_run_lock(descriptor: int) -> None:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def save_checkpoint(
@@ -145,16 +258,20 @@ def save_checkpoint(
     if global_step > 999_999_999:
         raise ValueError("global_step is outside the Phase 0 canonical range")
     _require_positive_integer("keep_last_checkpoints", keep_last_checkpoints)
-    if not isinstance(model, nn.Module):
-        raise ValueError("model must be an nn.Module")
-    if not isinstance(optimizer, Optimizer):
-        raise ValueError("optimizer must be an Optimizer")
-    if not isinstance(scheduler, LRScheduler):
-        raise ValueError("scheduler must be an LRScheduler")
+    if not isinstance(model, MoiraModel):
+        raise ValueError("Phase 0 checkpoints require a MoiraModel")
+    if type(optimizer) is not AdamW:
+        raise ValueError("Phase 0 checkpoints require AdamW")
+    if type(scheduler) is not LambdaLR:
+        raise ValueError("Phase 0 checkpoints require LambdaLR")
     if not isinstance(data_cursor, DataCursor):
         raise ValueError("data_cursor must be a DataCursor")
+    if scaler is not None:
+        raise ValueError("Phase 0 checkpoints require scaler=None")
     if not isinstance(parameter_ledger, ParameterLedger):
         raise ValueError("parameter_ledger must be a ParameterLedger")
+    if parameter_ledger._model is not model:
+        raise ValueError("parameter ledger must belong to the checkpoint model")
     parameter_ledger.assert_matches()
 
     manifests = _normalize_manifests(semantic_manifests)
@@ -162,8 +279,6 @@ def save_checkpoint(
     normalized_provenance = _normalize_provenance(provenance)
     model_state = dict(model.state_dict())
     ledger_evidence = _ledger_evidence(parameter_ledger, model_state)
-    if scaler is not None:
-        raise ValueError("Phase 0 checkpoints require scaler=None")
     payload: dict[str, Any] = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "lineage_id": lineage_id,
@@ -190,10 +305,30 @@ def save_checkpoint(
         "last_metrics": _normalize_metrics(last_metrics),
     }
     _validate_payload(payload, expected_manifests=manifests)
+    _validate_phase0_component_binding(model, optimizer, scheduler, payload, manifests)
 
-    checkpoint_dir = Path(run_dir) / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    _validate_checkpoint_dir(checkpoint_dir)
+    with checkpoint_run_lock(run_dir) as checkpoint_dir:
+        return _commit_checkpoint(
+            checkpoint_dir,
+            lineage_id=lineage_id,
+            global_step=global_step,
+            payload=payload,
+            manifests=manifests,
+            manifest_hashes=manifest_hashes,
+            keep_last_checkpoints=keep_last_checkpoints,
+        )
+
+
+def _commit_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    lineage_id: str,
+    global_step: int,
+    payload: Mapping[str, object],
+    manifests: Mapping[str, Mapping[str, object]],
+    manifest_hashes: Mapping[str, str],
+    keep_last_checkpoints: int,
+) -> CheckpointRecord:
     run_metadata = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "lineage_id": lineage_id,
@@ -279,7 +414,8 @@ def save_checkpoint(
                 raise ValueError("checkpoint sidecar has different committed content")
     _publish_json_once(sidecar_path, sidecar)
     reopened_sidecar = _read_json(sidecar_path, "checkpoint sidecar")
-    _validate_sidecar(reopened_sidecar, checkpoint_path, reopened)
+    _validate_sidecar_integrity(reopened_sidecar, checkpoint_path)
+    _validate_sidecar_binding(reopened_sidecar, checkpoint_path, reopened)
 
     pointer = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -321,9 +457,10 @@ def verify_checkpoint(
     _validate_regular_file(path, "checkpoint artifact")
     sidecar_path = path.with_suffix(".json")
     sidecar = _read_json(sidecar_path, "checkpoint sidecar")
+    _validate_sidecar_integrity(sidecar, path)
     payload = _load_payload(path)
     _validate_payload(payload, expected_manifests=expected_manifests)
-    _validate_sidecar(sidecar, path, payload)
+    _validate_sidecar_binding(sidecar, path, payload)
     if expected_lineage_id is not None:
         _require_non_empty_string("expected_lineage_id", expected_lineage_id)
         if payload["lineage_id"] != expected_lineage_id:
@@ -342,22 +479,46 @@ def load_checkpoint(
     expected_lineage_id: str | None = None,
     auto: bool = False,
 ) -> LoadedCheckpoint:
+    source_path = Path(source)
+    checkpoint_dir = source_path / "checkpoints" if auto else source_path.parent
+    with _checkpoint_directory_lock(checkpoint_dir):
+        return _load_checkpoint_locked(
+            source_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            expected_manifests=expected_manifests,
+            expected_lineage_id=expected_lineage_id,
+            auto=auto,
+        )
+
+
+def _load_checkpoint_locked(
+    source: str | os.PathLike[str],
+    *,
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    scaler: object | None,
+    expected_manifests: Mapping[str, Mapping[str, object]],
+    expected_lineage_id: str | None,
+    auto: bool,
+) -> LoadedCheckpoint:
     """Strictly restore components and restore process RNG state last."""
     normalized_expected = _normalize_manifests(expected_manifests)
-    checkpoint_path = _resolve_checkpoint(
+    checkpoint_path, payload, _ = _resolve_checkpoint(
         Path(source),
         auto=auto,
         expected_manifests=normalized_expected,
         expected_lineage_id=expected_lineage_id,
     )
-    payload = verify_checkpoint(
-        checkpoint_path,
-        expected_manifests=expected_manifests,
-        expected_lineage_id=expected_lineage_id,
-    )
     _validate_model_compatibility(model, payload)
     if scaler is not None:
         raise ValueError("Phase 0 checkpoints require scaler=None")
+    _validate_phase0_component_binding(
+        model, optimizer, scheduler, payload, normalized_expected
+    )
     _preflight_components(model, optimizer, scheduler, payload)
     cursor = _cursor_from_payload(payload)
     counters = dict(payload["counters"])
@@ -568,8 +729,9 @@ def _validate_payload(
         raise ValueError("scheduler state must be a mapping")
     if payload["scaler_state"] is not None:
         raise ValueError("Phase 0 checkpoint scaler state must be null")
+    metrics = _normalize_metrics(payload["last_metrics"])
+    _validate_phase0_saved_progress(payload, manifests, metrics)
     _validate_rng_state(payload["rng_state"])
-    _normalize_metrics(payload["last_metrics"])
 
 
 def _validate_training_counters(
@@ -638,24 +800,40 @@ def _ledger_evidence(
 def _validate_model_state_and_ledger(payload: Mapping[str, object]) -> None:
     state = payload["model_state"]
     evidence = payload["parameter_ledger"]
-    if not isinstance(state, dict) or not state or not isinstance(evidence, dict):
+    if (
+        not isinstance(state, dict)
+        or not state
+        or not isinstance(evidence, dict)
+        or set(evidence) != {"total_trainable", "entries", "model_state_schema"}
+    ):
         raise ValueError("model state and parameter ledger must be mappings")
     schema = evidence.get("model_state_schema")
     entries = evidence.get("entries")
     total = evidence.get("total_trainable")
+    subsystems = {subsystem.value for subsystem in ParameterSubsystem}
     valid_entries = isinstance(entries, list) and bool(entries) and all(
         isinstance(entry, dict)
+        and set(entry) == {"aliases", "subsystem", "trainable_parameters"}
         and isinstance(entry.get("aliases"), list)
         and bool(entry["aliases"])
         and all(isinstance(alias, str) and alias for alias in entry["aliases"])
+        and entry["aliases"] == sorted(set(entry["aliases"]))
+        and entry.get("subsystem") in subsystems
         and _is_positive_integer(entry.get("trainable_parameters"))
         for entry in entries or []
     )
+    aliases = [
+        alias
+        for entry in entries or []
+        if isinstance(entry, dict)
+        for alias in entry.get("aliases", [])
+    ]
     if (
         not isinstance(schema, dict)
         or set(schema) != set(state)
         or not _is_positive_integer(total)
         or not valid_entries
+        or len(aliases) != len(set(aliases))
         or sum(entry["trainable_parameters"] for entry in entries) != total
     ):
         raise ValueError("model-state mismatch with parameter ledger evidence")
@@ -665,6 +843,7 @@ def _validate_model_state_and_ledger(payload: Mapping[str, object]) -> None:
             not isinstance(name, str)
             or not isinstance(tensor, Tensor)
             or not isinstance(expected, dict)
+            or set(expected) != {"shape", "dtype", "numel"}
             or expected.get("shape") != list(tensor.shape)
             or expected.get("dtype") != str(tensor.dtype)
             or expected.get("numel") != tensor.numel()
@@ -673,8 +852,8 @@ def _validate_model_state_and_ledger(payload: Mapping[str, object]) -> None:
 
 
 def _validate_model_compatibility(model: nn.Module, payload: Mapping[str, object]) -> None:
-    if not isinstance(model, nn.Module):
-        raise ValueError("model must be an nn.Module")
+    if not isinstance(model, MoiraModel):
+        raise ValueError("Phase 0 checkpoints require a MoiraModel")
     expected = model.state_dict()
     observed = payload["model_state"]
     if not isinstance(observed, Mapping) or set(expected) != set(observed):
@@ -685,11 +864,262 @@ def _validate_model_compatibility(model: nn.Module, payload: Mapping[str, object
             saved.shape != tensor.shape or saved.dtype != tensor.dtype
         ):
             raise ValueError("model-state mismatch with the constructed model")
+    actual_ledger = _ledger_evidence(model.parameter_ledger(), expected)
+    if not _values_equal(actual_ledger, payload["parameter_ledger"]):
+        raise ValueError("parameter ledger does not match the constructed model")
+
+
+def _validate_phase0_saved_progress(
+    payload: Mapping[str, object],
+    manifests: Mapping[str, Mapping[str, object]],
+    metrics: Mapping[str, float],
+) -> None:
+    step = int(payload["global_step"])
+    expected_lr, base_lr, weight_decay = _phase0_learning_rates(manifests, step)
+    optimizer_state = payload["optimizer_state"]
+    scheduler_state = payload["scheduler_state"]
+    if (
+        not isinstance(optimizer_state, dict)
+        or set(optimizer_state) != {"state", "param_groups"}
+        or not isinstance(optimizer_state["param_groups"], list)
+        or len(optimizer_state["param_groups"]) != 1
+        or not isinstance(optimizer_state["state"], dict)
+        or not optimizer_state["state"]
+    ):
+        raise ValueError("Phase 0 AdamW optimizer state is incomplete")
+    group = optimizer_state["param_groups"][0]
+    expected_group_keys = {
+        "lr",
+        "betas",
+        "eps",
+        "weight_decay",
+        "amsgrad",
+        "maximize",
+        "foreach",
+        "capturable",
+        "differentiable",
+        "fused",
+        "decoupled_weight_decay",
+        "initial_lr",
+        "params",
+    }
+    if not isinstance(group, dict) or set(group) != expected_group_keys:
+        raise ValueError("Phase 0 AdamW parameter group schema is invalid")
+    parameters = group["params"]
+    state = optimizer_state["state"]
+    if (
+        not isinstance(parameters, list)
+        or not parameters
+        or len(parameters) != len(set(parameters))
+        or not all(isinstance(item, int) and not isinstance(item, bool) for item in parameters)
+        or not set(state) <= set(parameters)
+        or type(group["betas"]) is not tuple
+        or group["betas"] != (0.9, 0.999)
+        or type(group["eps"]) is not float
+        or group["eps"] != 1e-8
+        or group["amsgrad"] is not False
+        or group["foreach"] is not False
+        or group["fused"] is not False
+        or group["maximize"] is not False
+        or group["capturable"] is not False
+        or group["differentiable"] is not False
+        or group["decoupled_weight_decay"] is not True
+        or type(group["initial_lr"]) is not float
+        or type(group["weight_decay"]) is not float
+        or type(group["lr"]) is not float
+        or not _same_float(group["initial_lr"], base_lr)
+        or not _same_float(group["weight_decay"], weight_decay)
+        or not _same_float(group["lr"], expected_lr)
+    ):
+        raise ValueError("Phase 0 AdamW parameter group is incompatible")
+    for parameter_state in state.values():
+        if not isinstance(parameter_state, dict) or set(parameter_state) != {
+            "step",
+            "exp_avg",
+            "exp_avg_sq",
+        }:
+            raise ValueError("Phase 0 AdamW parameter state schema is invalid")
+        saved_step = parameter_state["step"]
+        exp_avg = parameter_state["exp_avg"]
+        exp_avg_sq = parameter_state["exp_avg_sq"]
+        if (
+            not isinstance(saved_step, Tensor)
+            or saved_step.device.type != "cpu"
+            or saved_step.dtype is not torch.float32
+            or saved_step.layout is not torch.strided
+            or saved_step.ndim != 0
+            or float(saved_step.item()) != step
+            or not isinstance(exp_avg, Tensor)
+            or not isinstance(exp_avg_sq, Tensor)
+            or exp_avg.shape != exp_avg_sq.shape
+            or exp_avg.dtype is not torch.float32
+            or exp_avg_sq.dtype is not torch.float32
+            or exp_avg.device.type != "cpu"
+            or exp_avg_sq.device.type != "cpu"
+            or exp_avg.layout is not torch.strided
+            or exp_avg_sq.layout is not torch.strided
+        ):
+            raise ValueError("Phase 0 AdamW progress is incompatible")
+
+    scheduler_keys = {
+        "base_lrs",
+        "last_epoch",
+        "_step_count",
+        "_is_initial",
+        "_get_lr_called_within_step",
+        "_last_lr",
+        "lr_lambdas",
+    }
+    if not isinstance(scheduler_state, dict) or set(scheduler_state) != scheduler_keys:
+        raise ValueError("Phase 0 LambdaLR state schema is invalid")
+    if (
+        type(scheduler_state["last_epoch"]) is not int
+        or type(scheduler_state["_step_count"]) is not int
+        or scheduler_state["last_epoch"] != step
+        or scheduler_state["_step_count"] != step + 1
+        or scheduler_state["_is_initial"] is not False
+        or scheduler_state["_get_lr_called_within_step"] is not False
+        or scheduler_state["lr_lambdas"] != [None]
+        or not _single_matching_float(scheduler_state["base_lrs"], base_lr)
+        or not _single_matching_float(scheduler_state["_last_lr"], expected_lr)
+        or not _same_float(metrics.get("learning_rate"), expected_lr)
+    ):
+        raise ValueError("Phase 0 LambdaLR progress is inconsistent with global_step")
+
+
+def _validate_phase0_component_binding(
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    payload: Mapping[str, object],
+    manifests: Mapping[str, Mapping[str, object]],
+) -> None:
+    if not isinstance(model, MoiraModel) or type(optimizer) is not AdamW:
+        raise ValueError("Phase 0 requires MoiraModel with AdamW")
+    if type(scheduler) is not LambdaLR or scheduler.optimizer is not optimizer:
+        raise ValueError("Phase 0 requires an optimizer-bound LambdaLR")
+    if len(optimizer.param_groups) != 1:
+        raise ValueError("Phase 0 AdamW requires one parameter group")
+    actual_parameters = list(optimizer.param_groups[0]["params"])
+    model_parameters = list(model.parameters())
+    if [id(item) for item in actual_parameters] != [id(item) for item in model_parameters]:
+        raise ValueError("Phase 0 AdamW parameters are not bound to the model")
+    runtime_group = optimizer.param_groups[0]
+    if (
+        runtime_group.get("betas") != (0.9, 0.999)
+        or runtime_group.get("eps") != 1e-8
+        or runtime_group.get("foreach") is not False
+        or runtime_group.get("fused") is not False
+        or runtime_group.get("amsgrad") is not False
+        or runtime_group.get("maximize") is not False
+        or runtime_group.get("capturable") is not False
+        or runtime_group.get("differentiable") is not False
+        or runtime_group.get("decoupled_weight_decay") is not True
+    ):
+        raise ValueError("Phase 0 AdamW runtime options are incompatible")
+
+    optimizer_state = payload["optimizer_state"]
+    saved_group = optimizer_state["param_groups"][0]
+    live_group = optimizer.state_dict()["param_groups"][0]
+    if saved_group["params"] != live_group["params"]:
+        raise ValueError("saved AdamW parameters do not bind to the constructed model")
+    aliases_by_parameter: dict[int, set[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        aliases_by_parameter.setdefault(id(parameter), set()).add(name)
+    all_aliases = set().union(*aliases_by_parameter.values())
+    if not PHASE0_INACTIVE_PARAMETER_ALIASES <= all_aliases:
+        raise ValueError("Phase 0 inactive parameter alias contract drifted")
+    expected_active = {
+        saved_id
+        for saved_id, parameter in zip(saved_group["params"], actual_parameters)
+        if aliases_by_parameter[id(parameter)].isdisjoint(
+            PHASE0_INACTIVE_PARAMETER_ALIASES
+        )
+    }
+    saved_state = optimizer_state["state"]
+    if set(saved_state) != expected_active:
+        raise ValueError("Phase 0 AdamW active parameter coverage is incomplete")
+    for saved_id, parameter in zip(saved_group["params"], actual_parameters):
+        if saved_id not in expected_active:
+            continue
+        parameter_state = saved_state[saved_id]
+        for name in ("exp_avg", "exp_avg_sq"):
+            value = parameter_state[name]
+            if (
+                value.shape != parameter.shape
+                or value.dtype != parameter.dtype
+                or value.device.type != "cpu"
+                or value.layout is not torch.strided
+            ):
+                raise ValueError("AdamW tensor state does not match its model parameter")
+
+    expected_lr, _, _ = _phase0_learning_rates(manifests, int(payload["global_step"]))
+    if not _same_float(saved_group["lr"], expected_lr):
+        raise ValueError("AdamW learning rate is inconsistent with the manifest")
+
+
+def _phase0_learning_rates(
+    manifests: Mapping[str, Mapping[str, object]], step: int
+) -> tuple[float, float, float]:
+    optimization = manifests["optimization"]
+    base_lr = optimization.get("learning_rate")
+    weight_decay = optimization.get("weight_decay")
+    warmup = optimization.get("warmup_steps")
+    total = optimization.get("schedule_total_steps")
+    if (
+        optimization.get("optimizer") != "adamw"
+        or optimization.get("schedule") != "cosine-with-warmup"
+        or optimization.get("precision") != "fp32"
+        or optimization.get("gradient_accumulation_steps") != 1
+        or not _is_finite_number(base_lr, positive=True)
+        or not _is_finite_number(weight_decay, non_negative=True)
+        or not isinstance(warmup, int)
+        or isinstance(warmup, bool)
+        or warmup < 0
+        or not _is_positive_integer(total)
+        or step > total
+    ):
+        raise ValueError("Phase 0 optimization manifest is incompatible")
+    if warmup and step < warmup:
+        factor = float(step + 1) / warmup
+    else:
+        progress = (step - warmup) / max(1, total - warmup)
+        progress = min(max(progress, 0.0), 1.0)
+        factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(base_lr) * factor, float(base_lr), float(weight_decay)
+
+
+def _single_matching_float(value: object, expected: float) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 1
+        and type(value[0]) is float
+        and _same_float(value[0], expected)
+    )
+
+
+def _same_float(value: object, expected: float) -> bool:
+    return _is_finite_number(value) and math.isclose(
+        float(value), expected, rel_tol=0.0, abs_tol=1e-15
+    )
+
+
+def _is_finite_number(
+    value: object, *, positive: bool = False, non_negative: bool = False
+) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    number = float(value)
+    return (
+        math.isfinite(number)
+        and (not positive or number > 0.0)
+        and (not non_negative or number >= 0.0)
+    )
 
 
 def _validate_state_tree(value: object) -> None:
     stack = [(value, 0)]
-    entries = tensors = tensor_bytes = 0
+    entries = tensors = tensor_storage_bytes = tensor_logical_bytes = 0
     storages: set[tuple[int, int]] = set()
     containers: set[int] = set()
     while stack:
@@ -699,25 +1129,34 @@ def _validate_state_tree(value: object) -> None:
             raise ValueError("checkpoint state exceeds the Phase 0 structure budget")
         if isinstance(current, Tensor):
             tensors += 1
-            if current.device.type == "cpu" and current.layout is torch.strided:
-                storage = current.untyped_storage()
-                storage_key = (storage.data_ptr(), storage.nbytes())
-                if storage_key not in storages:
-                    storages.add(storage_key)
-                    tensor_bytes += storage.nbytes()
+            logical_bytes = current.numel() * current.element_size()
             if (
                 tensors > PHASE0_MAX_TENSORS
-                or tensor_bytes > PHASE0_MAX_TENSOR_STORAGE_BYTES
                 or current.ndim > PHASE0_MAX_TENSOR_RANK
+                or any(size > PHASE0_MAX_TENSOR_DIMENSION for size in current.shape)
+                or current.numel() > PHASE0_MAX_TENSOR_NUMEL
+                or logical_bytes > PHASE0_MAX_TENSOR_LOGICAL_BYTES
                 or current.dtype not in _PHASE0_TENSOR_DTYPES
                 or current.device.type != "cpu"
                 or current.layout is not torch.strided
-                or (
-                    (current.is_floating_point() or current.is_complex())
-                    and not bool(torch.isfinite(current).all())
+                or any(
+                    size > 1 and stride == 0
+                    for size, stride in zip(current.shape, current.stride())
                 )
             ):
                 raise ValueError("checkpoint tensor state is outside Phase 0 bounds")
+            tensor_logical_bytes += logical_bytes
+            if tensor_logical_bytes > PHASE0_MAX_TOTAL_TENSOR_LOGICAL_BYTES:
+                raise ValueError("checkpoint tensor logical state exceeds Phase 0 bounds")
+            storage = current.untyped_storage()
+            storage_key = (storage.data_ptr(), storage.nbytes())
+            if storage_key not in storages:
+                storages.add(storage_key)
+                tensor_storage_bytes += storage.nbytes()
+            if tensor_storage_bytes > PHASE0_MAX_TENSOR_STORAGE_BYTES:
+                raise ValueError("checkpoint tensor storage exceeds Phase 0 bounds")
+            if current.is_floating_point() and not bool(torch.isfinite(current).all()):
+                raise ValueError("checkpoint tensor state must be finite")
         elif type(current) in (dict, list, tuple):
             if id(current) in containers:
                 raise ValueError("checkpoint state contains a repeated container")
@@ -741,9 +1180,6 @@ def _validate_state_tree(value: object) -> None:
         elif isinstance(current, float):
             if not math.isfinite(current):
                 raise ValueError("checkpoint floating state must be finite")
-        elif isinstance(current, complex):
-            if not math.isfinite(current.real) or not math.isfinite(current.imag):
-                raise ValueError("checkpoint complex state must be finite")
         elif current is not None and not isinstance(current, (int, bool)):
             raise ValueError("checkpoint state contains an unsupported value")
 
@@ -754,80 +1190,12 @@ def _preflight_components(
     scheduler: LRScheduler,
     payload: Mapping[str, object],
 ) -> None:
-    _validate_optimizer_schema(optimizer.state_dict(), payload["optimizer_state"])
-    _validate_component_schema(
-        scheduler.state_dict(), payload["scheduler_state"], "scheduler"
-    )
     cloned_model, cloned_optimizer, cloned_scheduler = deepcopy(
         (model, optimizer, scheduler)
     )
     cloned_model.load_state_dict(payload["model_state"], strict=True)
     cloned_scheduler.load_state_dict(payload["scheduler_state"])
     cloned_optimizer.load_state_dict(payload["optimizer_state"])
-    for parameter, state in cloned_optimizer.state.items():
-        if not isinstance(parameter, Tensor) or not isinstance(state, Mapping):
-            raise ValueError("optimizer state is incompatible with its parameters")
-        for name, state_value in state.items():
-            if isinstance(state_value, Tensor) and name != "step":
-                if state_value.shape != parameter.shape:
-                    raise ValueError("optimizer tensor state has an incompatible shape")
-
-
-def _validate_optimizer_schema(expected: object, observed: object) -> None:
-    if (
-        not isinstance(expected, Mapping)
-        or not isinstance(observed, Mapping)
-        or set(expected) != {"state", "param_groups"}
-        or set(observed) != {"state", "param_groups"}
-    ):
-        raise ValueError("optimizer state schema is invalid")
-    expected_groups = expected["param_groups"]
-    observed_groups = observed["param_groups"]
-    if (
-        not isinstance(expected_groups, list)
-        or not isinstance(observed_groups, list)
-        or len(expected_groups) != len(observed_groups)
-    ):
-        raise ValueError("optimizer parameter groups are incompatible")
-    saved_parameters: set[int] = set()
-    for expected_group, observed_group in zip(expected_groups, observed_groups):
-        if (
-            not isinstance(expected_group, Mapping)
-            or not isinstance(observed_group, Mapping)
-            or set(expected_group) != set(observed_group)
-            or not isinstance(observed_group.get("params"), list)
-            or len(expected_group["params"]) != len(observed_group["params"])
-            or not all(
-                isinstance(item, int) and not isinstance(item, bool)
-                for item in observed_group["params"]
-            )
-        ):
-            raise ValueError("optimizer parameter groups are incompatible")
-        for key in expected_group:
-            if key != "params":
-                _validate_component_schema(
-                    expected_group[key], observed_group[key], "optimizer"
-                )
-        saved_parameters.update(observed_group["params"])
-    observed_state = observed["state"]
-    if not isinstance(observed_state, Mapping) or not set(observed_state) <= saved_parameters:
-        raise ValueError("optimizer state references unknown parameters")
-
-
-def _validate_component_schema(expected: object, observed: object, label: str) -> None:
-    if isinstance(expected, Mapping):
-        expected = {key: value for key, value in expected.items() if not callable(value)}
-        if not isinstance(observed, Mapping) or set(expected) != set(observed):
-            raise ValueError(f"{label} state schema is incompatible")
-        for key in expected:
-            _validate_component_schema(expected[key], observed[key], label)
-    elif isinstance(expected, (list, tuple)):
-        if not isinstance(observed, type(expected)) or len(expected) != len(observed):
-            raise ValueError(f"{label} state schema is incompatible")
-        for left, right in zip(expected, observed):
-            _validate_component_schema(left, right, label)
-    elif type(expected) is not type(observed):
-        raise ValueError(f"{label} state schema is incompatible")
 
 
 def _validate_rng_state(state: object) -> None:
@@ -944,16 +1312,17 @@ def _validate_sidecar_integrity(sidecar: Mapping[str, object], path: Path) -> No
         raise ValueError("checkpoint sidecar path mismatch")
     _require_positive_integer("checkpoint sidecar byte_size", sidecar.get("byte_size"))
     _validate_sha256(sidecar.get("sha256"), "checkpoint sidecar")
+    if sidecar["byte_size"] > PHASE0_MAX_CHECKPOINT_BYTES:
+        raise ValueError("checkpoint exceeds the Phase 0 artifact size budget")
     if sidecar.get("byte_size") != path.stat().st_size:
         raise ValueError("checkpoint byte size mismatch")
     if sidecar.get("sha256") != _sha256(path):
         raise ValueError("checkpoint sha256 mismatch")
 
 
-def _validate_sidecar(
+def _validate_sidecar_binding(
     sidecar: Mapping[str, object], path: Path, payload: Mapping[str, object]
 ) -> None:
-    _validate_sidecar_integrity(sidecar, path)
     filename_step = _canonical_step(path)
     if sidecar.get("step") != filename_step:
         raise ValueError("checkpoint sidecar filename step mismatch")
@@ -970,12 +1339,13 @@ def _preflight_archive(path: Path) -> None:
     size = path.stat().st_size
     if not 0 < size <= PHASE0_MAX_CHECKPOINT_BYTES:
         raise ValueError("checkpoint exceeds the Phase 0 artifact size budget")
+    expected_members = _preflight_zip_eocd(path, size)
     try:
         with zipfile.ZipFile(path) as archive:
             members = archive.infolist()
     except (OSError, zipfile.BadZipFile) as error:
         raise ValueError("checkpoint artifact is not a valid ZIP archive") from error
-    if not members or len(members) > PHASE0_MAX_ARCHIVE_MEMBERS:
+    if len(members) != expected_members:
         raise ValueError("checkpoint archive member budget is invalid")
     names: set[str] = set()
     uncompressed = 0
@@ -1003,6 +1373,94 @@ def _preflight_archive(path: Path) -> None:
             raise ValueError("checkpoint archive exceeds the uncompressed budget")
 
 
+def _preflight_zip_eocd(path: Path, size: int) -> int:
+    tail_size = min(size, 22 + 65_535 + 76)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(size - tail_size)
+            tail = handle.read(tail_size)
+    except OSError as error:
+        raise ValueError("checkpoint ZIP trailer cannot be read") from error
+    signature = b"PK\x05\x06"
+    relative_offset = tail.rfind(signature)
+    if relative_offset < 0 or len(tail) - relative_offset < 22:
+        raise ValueError("checkpoint ZIP EOCD is missing")
+    eocd_offset = size - tail_size + relative_offset
+    (
+        _,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_size,
+    ) = struct.unpack_from("<4s4H2LH", tail, relative_offset)
+    if (
+        eocd_offset + 22 + comment_size != size
+        or disk_number != 0
+        or central_disk != 0
+        or disk_entries != total_entries
+        or total_entries in (0, 0xFFFF)
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+        or total_entries > PHASE0_MAX_ARCHIVE_MEMBERS
+        or central_size > PHASE0_MAX_CENTRAL_DIRECTORY_BYTES
+        or central_offset + central_size > eocd_offset
+    ):
+        raise ValueError("checkpoint ZIP central-directory budget or layout is invalid")
+    central_end = central_offset + central_size
+    if central_end != eocd_offset:
+        zip64_size = struct.calcsize("<4sQ2H2L4Q")
+        locator_size = struct.calcsize("<4sLQL")
+        if central_end + zip64_size + locator_size != eocd_offset:
+            raise ValueError("checkpoint ZIP has an inconsistent trailing record")
+        zip64_relative = central_end - (size - tail_size)
+        locator_relative = zip64_relative + zip64_size
+        if zip64_relative < 0:
+            raise ValueError(
+                "checkpoint ZIP64 compatibility trailer exceeds the tail budget"
+            )
+        zip64 = struct.unpack_from("<4sQ2H2L4Q", tail, zip64_relative)
+        locator = struct.unpack_from("<4sLQL", tail, locator_relative)
+        if (
+            zip64[0] != b"PK\x06\x06"
+            or zip64[1] != 44
+            or zip64[4] != 0
+            or zip64[5] != 0
+            or zip64[6] != total_entries
+            or zip64[7] != total_entries
+            or zip64[8] != central_size
+            or zip64[9] != central_offset
+            or locator[0] != b"PK\x06\x07"
+            or locator[1] != 0
+            or locator[2] != central_end
+            or locator[3] != 1
+        ):
+            raise ValueError("checkpoint ZIP64 compatibility trailer is inconsistent")
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(central_offset)
+            central = handle.read(central_size)
+    except OSError as error:
+        raise ValueError("checkpoint ZIP central directory cannot be read") from error
+    position = entries = 0
+    while position < len(central):
+        if len(central) - position < 46 or central[position : position + 4] != b"PK\x01\x02":
+            raise ValueError("checkpoint ZIP central directory is invalid")
+        name_size, extra_size, entry_comment_size = struct.unpack_from(
+            "<3H", central, position + 28
+        )
+        position += 46 + name_size + extra_size + entry_comment_size
+        entries += 1
+        if position > len(central) or entries > total_entries:
+            raise ValueError("checkpoint ZIP central-directory entry count is invalid")
+    if position != len(central) or entries != total_entries:
+        raise ValueError("checkpoint ZIP central-directory entry count is invalid")
+    return total_entries
+
+
 def _validate_regular_file(path: Path, label: str) -> None:
     _reject_symlink_hops(path)
     try:
@@ -1021,8 +1479,25 @@ def _validate_checkpoint_dir(path: Path) -> None:
 
 def _reject_symlink_hops(path: Path) -> None:
     for candidate in (path, *path.parents):
-        if candidate.is_symlink():
-            raise ValueError("checkpoint paths may not contain symlink hops")
+        try:
+            status = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValueError("checkpoint path components cannot be inspected") from error
+        is_junction = getattr(candidate, "is_junction", None)
+        if (
+            stat.S_ISLNK(status.st_mode)
+            or bool(
+                getattr(status, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            or callable(is_junction)
+            and is_junction()
+        ):
+            raise ValueError(
+                "checkpoint paths may not contain symlink, junction, or reparse hops"
+            )
 
 
 def _directory_entries(path: Path) -> list[Path]:
@@ -1057,12 +1532,8 @@ def _resolve_checkpoint(
     auto: bool,
     expected_manifests: Mapping[str, Mapping[str, object]],
     expected_lineage_id: str | None,
-) -> Path:
-    checkpoint_dir = (
-        source / "checkpoints"
-        if auto and source.name != "checkpoints"
-        else source if auto else source.parent
-    )
+) -> tuple[Path, dict[str, Any], str]:
+    checkpoint_dir = source / "checkpoints" if auto else source.parent
     _validate_checkpoint_dir(checkpoint_dir)
     run_metadata = _read_run_metadata(checkpoint_dir)
     expected_hashes = _manifest_hashes(expected_manifests)
@@ -1074,18 +1545,28 @@ def _resolve_checkpoint(
         if lineage_id != expected_lineage_id:
             raise ValueError("run metadata lineage mismatch")
     if not auto:
-        return source
+        payload = verify_checkpoint(
+            source,
+            expected_manifests=expected_manifests,
+            expected_lineage_id=lineage_id,
+        )
+        return source, payload, lineage_id
 
     pointer_path = checkpoint_dir / "latest.json"
+    if os.path.lexists(pointer_path):
+        _validate_regular_file(pointer_path, "latest pointer")
     try:
         pointer = _read_json(pointer_path, "latest pointer")
         _validate_pointer_document(pointer, run_metadata)
     except ValueError:
-        return _scan_compatible_checkpoints(
+        checkpoint_path, payload = _scan_compatible_checkpoints(
             checkpoint_dir,
             expected_manifests=expected_manifests,
             lineage_id=lineage_id,
         )
+        return checkpoint_path, payload, lineage_id
+    _recover_pruning(checkpoint_dir, pointer, run_metadata)
+    _recover_invalid_tombstones(checkpoint_dir, pointer, run_metadata)
     checkpoint_path = checkpoint_dir / pointer["checkpoint"]
     _require_contained(checkpoint_dir, checkpoint_path)
     payload = verify_checkpoint(
@@ -1094,15 +1575,18 @@ def _resolve_checkpoint(
         expected_lineage_id=lineage_id,
     )
     _validate_pointer_target(pointer, checkpoint_path, payload)
-    return checkpoint_path
+    return checkpoint_path, payload, lineage_id
 
 
 def _validate_previous_pointer(path: Path, lineage_id: str, step: int) -> None:
-    if not path.exists():
+    run_metadata = _read_run_metadata(path.parent)
+    if not os.path.lexists(path):
+        _recover_invalid_tombstones(path.parent, None, run_metadata)
         return
     pointer = _read_json(path, "latest pointer")
-    run_metadata = _read_run_metadata(path.parent)
     _validate_pointer_document(pointer, run_metadata)
+    _recover_pruning(path.parent, pointer, run_metadata)
+    _recover_invalid_tombstones(path.parent, pointer, run_metadata)
     checkpoint_path = path.parent / pointer["checkpoint"]
     payload = verify_checkpoint(
         checkpoint_path,
@@ -1119,10 +1603,7 @@ def _bind_run_metadata(
     path = checkpoint_dir / "run.json"
     if not path.exists():
         ambiguous = any(
-            item.name == "latest.json"
-            or _STEP_NAME.fullmatch(item.name)
-            or _SIDECAR_NAME.fullmatch(item.name)
-            for item in _directory_entries(checkpoint_dir)
+            item.name != ".run.lock" for item in _directory_entries(checkpoint_dir)
         )
         if ambiguous:
             raise ValueError("run metadata is missing from a non-empty checkpoint run")
@@ -1185,24 +1666,47 @@ def _scan_compatible_checkpoints(
     *,
     expected_manifests: Mapping[str, Mapping[str, object]],
     lineage_id: str,
-) -> Path:
-    candidates: list[tuple[int, Path]] = []
-    for path in _directory_entries(checkpoint_dir):
-        match = _STEP_NAME.fullmatch(path.name)
-        if match is not None and not _has_pruning_material(path):
-            candidates.append((int(match.group(1)), path))
+) -> tuple[Path, dict[str, Any]]:
+    candidates = [
+        (step, path)
+        for step, path in _bounded_checkpoint_candidates(checkpoint_dir)
+        if not _has_pruning_material(path)
+    ]
     for _, candidate in sorted(candidates, reverse=True):
         try:
             _require_contained(checkpoint_dir, candidate)
-            verify_checkpoint(
+            payload = verify_checkpoint(
                 candidate,
                 expected_manifests=expected_manifests,
                 expected_lineage_id=lineage_id,
             )
         except ValueError:
             continue
-        return candidate
+        return candidate, payload
     raise ValueError("no valid immutable checkpoint matches the trusted run metadata")
+
+
+def _bounded_checkpoint_candidates(checkpoint_dir: Path) -> list[tuple[int, Path]]:
+    candidates: list[tuple[int, Path]] = []
+    total_bytes = 0
+    for path in _directory_entries(checkpoint_dir):
+        match = _STEP_NAME.fullmatch(path.name)
+        if match is None:
+            continue
+        candidates.append((int(match.group(1)), path))
+        try:
+            total_bytes += path.lstat().st_size
+            sidecar = path.with_suffix(".json")
+            if sidecar.exists() or sidecar.is_symlink():
+                total_bytes += sidecar.lstat().st_size
+        except OSError as error:
+            raise ValueError("checkpoint candidate cannot be inspected") from error
+        if (
+            len(candidates) > PHASE0_MAX_SCAN_CANDIDATES
+            or total_bytes > PHASE0_MAX_SCAN_BYTES
+        ):
+            raise ValueError("checkpoint candidate scan exceeds the Phase 0 budget")
+    return candidates
 
 
 def _canonical_step(path: Path) -> int:
@@ -1248,6 +1752,63 @@ def _claim_file(staged: Path, canonical: Path) -> bool:
     return True
 
 
+def _recover_invalid_tombstones(
+    checkpoint_dir: Path,
+    pointer: Mapping[str, object] | None,
+    run_metadata: Mapping[str, object],
+) -> None:
+    tombstones = [
+        (match.group(1), path)
+        for path in _directory_entries(checkpoint_dir)
+        if (match := _INVALID_TOMBSTONE_NAME.fullmatch(path.name)) is not None
+    ]
+    pointer_names = (
+        {str(pointer["checkpoint"]), str(pointer["sidecar"])}
+        if pointer is not None
+        else set()
+    )
+    referenced: list[Path] = []
+    for canonical_name, tombstone in sorted(tombstones):
+        canonical = checkpoint_dir / canonical_name
+        _validate_regular_file(tombstone, "invalid checkpoint tombstone")
+        if canonical_name in pointer_names:
+            if canonical.exists():
+                _validate_regular_file(canonical, "pointer-referenced checkpoint material")
+                try:
+                    same_file = os.path.samefile(canonical, tombstone)
+                except OSError as error:
+                    raise ValueError("pointer invalid tombstone cannot be reconciled") from error
+                if not same_file:
+                    raise ValueError(
+                        "pointer invalid tombstone conflicts with its canonical file"
+                    )
+            elif not _claim_file(tombstone, canonical):
+                raise ValueError("pointer invalid tombstone restoration raced")
+            referenced.append(tombstone)
+            continue
+
+        if canonical.exists():
+            _validate_regular_file(canonical, "unreferenced checkpoint material")
+            try:
+                same_file = os.path.samefile(canonical, tombstone)
+            except OSError as error:
+                raise ValueError("invalid checkpoint tombstone cannot be reconciled") from error
+            if same_file:
+                canonical.unlink(missing_ok=True)
+                _fsync_directory(checkpoint_dir)
+        tombstone.unlink(missing_ok=True)
+        _fsync_directory(checkpoint_dir)
+
+    if referenced:
+        assert pointer is not None
+        checkpoint_path = checkpoint_dir / str(pointer["checkpoint"])
+        payload = _verify_against_run(checkpoint_path, run_metadata)
+        _validate_pointer_target(pointer, checkpoint_path, payload)
+        for tombstone in referenced:
+            tombstone.unlink(missing_ok=True)
+            _fsync_directory(checkpoint_dir)
+
+
 def _reclaim_unreferenced(
     paths: tuple[Path, ...], latest_path: Path, checkpoint_name: str
 ) -> None:
@@ -1256,17 +1817,25 @@ def _reclaim_unreferenced(
         if pointer.get("checkpoint") == checkpoint_name:
             raise ValueError("a pointer-referenced checkpoint cannot be reclaimed")
     for path in paths:
+        tombstone = path.parent / f".{path.name}.invalid"
+        if tombstone.exists():
+            _validate_regular_file(tombstone, "invalid checkpoint tombstone")
+            if path.exists():
+                _validate_regular_file(path, "invalid unreferenced checkpoint material")
+                try:
+                    same_file = os.path.samefile(path, tombstone)
+                except OSError as error:
+                    raise ValueError("invalid checkpoint reclamation raced") from error
+                if same_file:
+                    path.unlink(missing_ok=True)
+                    _fsync_directory(path.parent)
+            tombstone.unlink(missing_ok=True)
+            _fsync_directory(path.parent)
         if not path.exists():
             continue
         _validate_regular_file(path, "invalid unreferenced checkpoint material")
-        tombstone = path.parent / f".{path.name}.invalid"
         if not _claim_file(path, tombstone):
-            try:
-                same_file = os.path.samefile(path, tombstone)
-            except OSError as error:
-                raise ValueError("invalid checkpoint reclamation raced") from error
-            if not same_file:
-                raise ValueError("invalid checkpoint reclamation raced")
+            raise ValueError("invalid checkpoint reclamation raced")
         path.unlink(missing_ok=True)
         _fsync_directory(path.parent)
         tombstone.unlink(missing_ok=True)
@@ -1309,7 +1878,14 @@ def _publish_json_once(path: Path, value: Mapping[str, object]) -> None:
 
 def _values_equal(left: object, right: object) -> bool:
     if isinstance(left, Tensor):
-        return isinstance(right, Tensor) and torch.equal(left, right)
+        return (
+            isinstance(right, Tensor)
+            and left.shape == right.shape
+            and left.dtype == right.dtype
+            and left.device == right.device
+            and left.layout == right.layout
+            and torch.equal(left, right)
+        )
     if isinstance(left, Mapping):
         return (
             isinstance(right, Mapping)
@@ -1338,21 +1914,21 @@ def _prune_validated(checkpoint_dir: Path, keep: int) -> None:
     run_metadata = _read_run_metadata(checkpoint_dir)
     pointer = _read_json(checkpoint_dir / "latest.json", "latest pointer")
     _validate_pointer_document(pointer, run_metadata)
+    _recover_pruning(checkpoint_dir, pointer, run_metadata)
+    _recover_invalid_tombstones(checkpoint_dir, pointer, run_metadata)
     pointer_path = checkpoint_dir / pointer["checkpoint"]
     pointer_payload = _verify_against_run(pointer_path, run_metadata)
     _validate_pointer_target(pointer, pointer_path, pointer_payload)
-    _recover_pruning(checkpoint_dir, pointer["checkpoint"], run_metadata)
 
     compatible: list[tuple[int, Path]] = []
-    for candidate in _directory_entries(checkpoint_dir):
-        match = _STEP_NAME.fullmatch(candidate.name)
-        if match is None or _has_pruning_material(candidate):
+    for step, candidate in _bounded_checkpoint_candidates(checkpoint_dir):
+        if _has_pruning_material(candidate):
             continue
         try:
             _verify_against_run(candidate, run_metadata)
         except ValueError:
             continue
-        compatible.append((int(match.group(1)), candidate))
+        compatible.append((step, candidate))
     compatible.sort(reverse=True)
     retained = {path.name for _, path in compatible[:keep]}
     retained.add(pointer["checkpoint"])
@@ -1395,13 +1971,14 @@ def _prune_pair(checkpoint_path: Path) -> None:
     _fsync_directory(checkpoint_path.parent)
     sidecar_tombstone.unlink(missing_ok=True)
     checkpoint_tombstone.unlink(missing_ok=True)
+    _fsync_directory(checkpoint_path.parent)
     marker.unlink(missing_ok=True)
     _fsync_directory(checkpoint_path.parent)
 
 
 def _recover_pruning(
     checkpoint_dir: Path,
-    pointer_target: str,
+    pointer: Mapping[str, object],
     run_metadata: Mapping[str, object],
 ) -> None:
     markers = [
@@ -1422,19 +1999,36 @@ def _recover_pruning(
         }
         if marker_value != expected_marker:
             raise ValueError("checkpoint pruning marker is incompatible")
-        if checkpoint_path.name == pointer_target:
-            if not checkpoint_path.exists() and checkpoint_tombstone.exists():
-                _claim_file(checkpoint_tombstone, checkpoint_path)
-            if not sidecar_path.exists() and sidecar_tombstone.exists():
-                _claim_file(sidecar_tombstone, sidecar_path)
-            _verify_against_run(checkpoint_path, run_metadata)
+        if checkpoint_path.name == pointer["checkpoint"]:
+            _restore_tombstone(checkpoint_path, checkpoint_tombstone)
+            _restore_tombstone(sidecar_path, sidecar_tombstone)
+            payload = _verify_against_run(checkpoint_path, run_metadata)
+            _validate_pointer_target(pointer, checkpoint_path, payload)
         else:
             sidecar_path.unlink(missing_ok=True)
             checkpoint_path.unlink(missing_ok=True)
         sidecar_tombstone.unlink(missing_ok=True)
         checkpoint_tombstone.unlink(missing_ok=True)
+        _fsync_directory(checkpoint_dir)
         marker.unlink(missing_ok=True)
         _fsync_directory(checkpoint_dir)
+
+
+def _restore_tombstone(canonical: Path, tombstone: Path) -> None:
+    if tombstone.exists():
+        _validate_regular_file(tombstone, "checkpoint recovery tombstone")
+        if canonical.exists():
+            _validate_regular_file(canonical, "checkpoint recovery target")
+            try:
+                same_file = os.path.samefile(canonical, tombstone)
+            except OSError as error:
+                raise ValueError("checkpoint tombstone cannot be reconciled") from error
+            if not same_file:
+                raise ValueError("checkpoint tombstone conflicts with its canonical file")
+        elif not _claim_file(tombstone, canonical):
+            raise ValueError("checkpoint tombstone restoration raced")
+    elif not canonical.exists():
+        raise ValueError("checkpoint tombstone recovery is missing required material")
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:

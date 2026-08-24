@@ -1,3 +1,5 @@
+import json
+import multiprocessing
 import random
 import shutil
 import tomllib
@@ -10,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+import moira.checkpoint as checkpoint_module
 import moira.train as train_module
 from moira.config import (
     DataConfig,
@@ -20,7 +23,7 @@ from moira.config import (
     TrainingConfig,
 )
 from moira.model import MoiraModel
-from moira.synthetic import SyntheticStream
+from moira.synthetic import SYNTHETIC_CURSOR_KIND, DataCursor, SyntheticStream
 from moira.train import evaluate_smoke, train_until
 
 
@@ -66,6 +69,30 @@ def _config() -> TrainingConfig:
             keep_last_checkpoints=3,
         ),
     )
+
+
+def _blocked_resume_trainer(
+    run_dir: str,
+    ready: object,
+    release: object,
+    result_path: str,
+) -> None:
+    original_loss = train_module._masked_next_token_loss
+
+    def blocked_loss(*args: object, **kwargs: object) -> torch.Tensor:
+        ready.set()
+        if not release.wait(20):
+            raise RuntimeError("trainer lock test release timed out")
+        return original_loss(*args, **kwargs)
+
+    train_module._masked_next_token_loss = blocked_loss
+    try:
+        train_until(_config(), Path(run_dir), stop_at_step=2, resume="auto")
+    except Exception as error:
+        result = f"{type(error).__name__}:{error}"
+    else:
+        result = "ok"
+    Path(result_path).write_text(result, encoding="utf-8")
 
 
 def _assert_nested_equal(left: object, right: object) -> None:
@@ -174,6 +201,41 @@ def test_interrupted_resume_is_exact_with_dropout_optimizer_scheduler_and_rng(
     assert torch.equal(uninterrupted_next.targets, resumed_next.targets)
     assert torch.equal(uninterrupted_next.loss_mask, resumed_next.loss_mask)
     assert uninterrupted_cursor == resumed_cursor
+
+
+def test_run_lock_covers_resume_training_and_pointer_publication(
+    run_root: Path,
+) -> None:
+    config = _config()
+    run_dir = run_root / "writer-lifecycle"
+    train_until(config, run_dir, stop_at_step=1)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    result_path = run_root / "trainer-result.txt"
+    process = context.Process(
+        target=_blocked_resume_trainer,
+        args=(str(run_dir), ready, release, str(result_path)),
+    )
+    process.start()
+    try:
+        assert ready.wait(20), "resume trainer did not enter its training step"
+        with pytest.raises(ValueError, match="writer lock"):
+            train_until(config, run_dir, stop_at_step=3, resume="auto")
+    finally:
+        release.set()
+        process.join(20)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+    assert process.exitcode == 0
+    assert result_path.read_text(encoding="utf-8") == "ok"
+    final = train_until(config, run_dir, stop_at_step=3, resume="auto")
+    pointer = json.loads(
+        (run_dir / "checkpoints" / "latest.json").read_text(encoding="utf-8")
+    )
+    assert final.global_step == pointer["step"] == 3
 
 
 def test_evaluation_uses_fixed_eval_indices_without_training_rng_or_mode_mutation(
@@ -354,4 +416,23 @@ def test_m0_smoke_toml_matches_the_task_one_schema_and_parameter_ledger() -> Non
     assert config.model.dropout > 0.0
     assert config.run.checkpoint_every_steps == 2
     assert config.optimization.schedule_total_steps == 20
-    assert MoiraModel(config.model).parameter_ledger().total_trainable == 24478
+    model = MoiraModel(config.model)
+    assert model.parameter_ledger().total_trainable == 24478
+    stream = SyntheticStream(
+        config.data.seed,
+        config.model.vocab_size,
+        config.model.max_seq_len,
+    )
+    batch = stream.batch(
+        split=config.data.train_split,
+        cursor=DataCursor(SYNTHETIC_CURSOR_KIND, 0, 0, 0),
+        batch_size=2,
+    )[0]
+    output = model(batch.input_ids, mode=train_module.CognitiveMode.ATROPOS)
+    train_module._masked_next_token_loss(
+        output.logits, batch.targets, batch.loss_mask
+    ).backward()
+    inactive = {
+        name for name, parameter in model.named_parameters() if parameter.grad is None
+    }
+    assert inactive == checkpoint_module.PHASE0_INACTIVE_PARAMETER_ALIASES

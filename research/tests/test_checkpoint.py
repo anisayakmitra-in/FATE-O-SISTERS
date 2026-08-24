@@ -1,7 +1,12 @@
 import hashlib
 import json
+import math
+import multiprocessing
+import os
 import random
 import shutil
+import struct
+import subprocess
 import uuid
 import zipfile
 from copy import deepcopy
@@ -17,8 +22,10 @@ import torch
 import moira.checkpoint as checkpoint_module
 from moira.checkpoint import load_checkpoint, save_checkpoint, verify_checkpoint
 from moira.config import ModelConfig
+from moira.masks import CognitiveMode
 from moira.model import MoiraModel
-from moira.synthetic import SYNTHETIC_CURSOR_KIND, DataCursor
+from moira.synthetic import SYNTHETIC_CURSOR_KIND, DataCursor, SyntheticStream
+from moira.train import _masked_next_token_loss
 
 
 @pytest.fixture
@@ -57,9 +64,71 @@ def _components() -> tuple[
         model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False, fused=False
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: min(1.0, (step + 1) / 2)
+        optimizer, _test_learning_rate_factor
     )
     return model, optimizer, scheduler
+
+
+def _test_learning_rate_factor(step: int) -> float:
+    if step < 2:
+        return float(step + 1) / 2
+    progress = min(max((step - 2) / 8, 0.0), 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _advance_components(
+    model: MoiraModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    *,
+    steps: int,
+) -> DataCursor:
+    stream = SyntheticStream(seed=11, vocab_size=16, sequence_length=4)
+    cursor = DataCursor(SYNTHETIC_CURSOR_KIND, 0, 0, 0)
+    model.train()
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        batch, cursor = stream.batch(split=0, cursor=cursor, batch_size=2)
+        output = model(batch.input_ids, mode=CognitiveMode.ATROPOS)
+        loss = _masked_next_token_loss(output.logits, batch.targets, batch.loss_mask)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 1.0, error_if_nonfinite=True
+        )
+        optimizer.step()
+        scheduler.step()
+    return cursor
+
+
+def _blocked_step_writer(
+    run_dir: str,
+    ready: object,
+    release: object,
+    result_path: str,
+) -> None:
+    original_write = checkpoint_module._atomic_write_json
+
+    def blocked_pointer(path: Path, value: Mapping[str, object]) -> None:
+        if path.name == "latest.json" and value.get("step") == 2:
+            ready.set()
+            if not release.wait(20):
+                raise RuntimeError("writer test release timed out")
+        original_write(path, value)
+
+    checkpoint_module._atomic_write_json = blocked_pointer
+    try:
+        _save(Path(run_dir), step=2, keep=4)
+    except Exception as error:
+        result = f"{type(error).__name__}:{error}"
+    else:
+        result = "ok"
+    Path(result_path).write_text(result, encoding="utf-8")
+
+
+def _crash_while_holding_run_lock(run_dir: str, ready: object) -> None:
+    with checkpoint_module.checkpoint_run_lock(Path(run_dir)):
+        ready.set()
+        os._exit(0)
 
 
 def _manifests() -> dict[str, dict[str, object]]:
@@ -133,10 +202,8 @@ def _save(
     np.random.seed(32)
     torch.manual_seed(33)
     model, optimizer, scheduler = _components()
+    cursor = _advance_components(model, optimizer, scheduler, steps=step)
     selected_manifests = _manifests() if manifests is None else manifests
-    batch_size = int(selected_manifests["data"]["batch_size"])
-    sequence_length = int(selected_manifests["data"]["sequence_length"])
-    samples_seen = step * batch_size
     return save_checkpoint(
         run_dir,
         lineage_id=lineage_id,
@@ -145,12 +212,7 @@ def _save(
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=None,
-        data_cursor=DataCursor(
-            SYNTHETIC_CURSOR_KIND,
-            samples_seen,
-            samples_seen,
-            samples_seen * sequence_length,
-        ),
+        data_cursor=cursor,
         semantic_manifests=selected_manifests,
         provenance=(
             {
@@ -165,7 +227,10 @@ def _save(
         ),
         parameter_ledger=model.parameter_ledger(),
         counters={"optimizer_steps": step, "batches_seen": step},
-        last_metrics={"loss": 1.25, "learning_rate": 3e-4},
+        last_metrics={
+            "loss": 1.25,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        },
         keep_last_checkpoints=keep,
     )
 
@@ -210,6 +275,10 @@ def _copy_candidate(record, checkpoint_dir: Path, name: str) -> tuple[Path, Path
 def _assert_nested_equal(left: object, right: object) -> None:
     if isinstance(left, torch.Tensor):
         assert isinstance(right, torch.Tensor)
+        assert left.shape == right.shape
+        assert left.dtype == right.dtype
+        assert left.device == right.device
+        assert left.layout == right.layout
         assert torch.equal(left, right)
     elif isinstance(left, Mapping):
         assert isinstance(right, Mapping)
@@ -329,11 +398,14 @@ def test_load_restores_component_states_and_returns_the_cursor(run_dir: Path) ->
     assert loaded.global_step == 4
     assert loaded.lineage_id == "lineage-test"
     assert loaded.data_cursor == DataCursor(SYNTHETIC_CURSOR_KIND, 8, 8, 32)
-    assert loaded.last_metrics == {"loss": 1.25, "learning_rate": 3e-4}
+    assert loaded.last_metrics == {
+        "loss": 1.25,
+        "learning_rate": 3e-4 * _test_learning_rate_factor(4),
+    }
     for name, tensor in model.state_dict().items():
         assert torch.equal(tensor, payload["model_state"][name])
-    assert optimizer.state_dict() == payload["optimizer_state"]
-    assert scheduler.state_dict() == payload["scheduler_state"]
+    _assert_nested_equal(optimizer.state_dict(), payload["optimizer_state"])
+    _assert_nested_equal(scheduler.state_dict(), payload["scheduler_state"])
 
 
 @pytest.mark.parametrize(
@@ -429,6 +501,7 @@ def test_failed_temporary_save_keeps_the_previous_pointer_and_checkpoint(
     first = _save(run_dir, step=1)
     pointer_before = first.latest_path.read_bytes()
     model, optimizer, scheduler = _components()
+    cursor = _advance_components(model, optimizer, scheduler, steps=2)
 
     def fail_save(*args: object, **kwargs: object) -> None:
         raise OSError("injected save failure")
@@ -443,7 +516,7 @@ def test_failed_temporary_save_keeps_the_previous_pointer_and_checkpoint(
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=None,
-            data_cursor=DataCursor(SYNTHETIC_CURSOR_KIND, 4, 4, 16),
+            data_cursor=cursor,
             semantic_manifests=_manifests(),
             provenance={
                 "git": {
@@ -454,7 +527,10 @@ def test_failed_temporary_save_keeps_the_previous_pointer_and_checkpoint(
             },
             parameter_ledger=model.parameter_ledger(),
             counters={"optimizer_steps": 2, "batches_seen": 2},
-            last_metrics={"loss": 1.0},
+            last_metrics={
+                "loss": 1.0,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            },
             keep_last_checkpoints=2,
         )
 
@@ -625,6 +701,7 @@ def test_retry_never_adopts_a_different_same_step_payload(
             _save(run_dir, step=2, keep=3)
 
     model, optimizer, scheduler = _components()
+    cursor = _advance_components(model, optimizer, scheduler, steps=2)
     with torch.no_grad():
         next(model.parameters()).add_(1.0)
     with pytest.raises(ValueError, match="different|committed"):
@@ -636,7 +713,7 @@ def test_retry_never_adopts_a_different_same_step_payload(
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=None,
-            data_cursor=DataCursor(SYNTHETIC_CURSOR_KIND, 4, 4, 16),
+            data_cursor=cursor,
             semantic_manifests=_manifests(),
             provenance={
                 "git": {
@@ -647,7 +724,10 @@ def test_retry_never_adopts_a_different_same_step_payload(
             },
             parameter_ledger=model.parameter_ledger(),
             counters={"optimizer_steps": 2, "batches_seen": 2},
-            last_metrics={"loss": 1.0},
+            last_metrics={
+                "loss": 1.0,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            },
             keep_last_checkpoints=3,
         )
 
@@ -1175,6 +1255,45 @@ def test_retention_marker_finishes_cleanup_after_tombstone_unlink_failure(
     assert not (first.checkpoint_path.parent / ".step-000000001.pt.pruning").exists()
 
 
+def test_retention_syncs_tombstone_cleanup_before_removing_the_marker(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _save(run_dir, step=1, keep=3)
+    _save(run_dir, step=2, keep=3)
+    checkpoint_dir = first.checkpoint_path.parent
+    marker = checkpoint_dir / ".step-000000001.pruning.json"
+    checkpoint_tombstone = checkpoint_dir / ".step-000000001.pt.pruning"
+    sidecar_tombstone = checkpoint_dir / ".step-000000001.json.pruning"
+    original_fsync = checkpoint_module._fsync_directory
+    injected = False
+
+    def fail_cleanup_sync(path: Path) -> None:
+        nonlocal injected
+        original_fsync(path)
+        if (
+            marker.exists()
+            and not first.checkpoint_path.exists()
+            and not first.sidecar_path.exists()
+            and not checkpoint_tombstone.exists()
+            and not sidecar_tombstone.exists()
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected pruning cleanup sync failure")
+
+    with monkeypatch.context() as context:
+        context.setattr(checkpoint_module, "_fsync_directory", fail_cleanup_sync)
+        with pytest.raises(OSError, match="cleanup sync"):
+            _save(run_dir, step=3, keep=2)
+
+    assert injected
+    assert marker.exists()
+    retried = _save(run_dir, step=3, keep=2)
+    assert verify_checkpoint(retried.checkpoint_path)["global_step"] == 3
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize(
     "limit_name",
     (
@@ -1277,3 +1396,899 @@ def test_symlinked_checkpoint_paths_fail_closed(
 
     with pytest.raises(ValueError, match="symlink"):
         operation()
+
+
+def test_explicit_load_is_bound_to_the_trusted_run_lineage_without_mutation(
+    run_dir: Path,
+) -> None:
+    trusted = _save(run_dir / "trusted", step=1, lineage_id="trusted-lineage")
+    foreign = _save(run_dir / "foreign", step=2, lineage_id="foreign-lineage")
+    copied_checkpoint = trusted.checkpoint_path.parent / foreign.checkpoint_path.name
+    copied_sidecar = copied_checkpoint.with_suffix(".json")
+    shutil.copyfile(foreign.checkpoint_path, copied_checkpoint)
+    shutil.copyfile(foreign.sidecar_path, copied_sidecar)
+    model, optimizer, scheduler = _components()
+    before = (
+        deepcopy(model.state_dict()),
+        deepcopy(optimizer.state_dict()),
+        deepcopy(scheduler.state_dict()),
+    )
+    rng_before = _rng_snapshot()
+
+    with pytest.raises(ValueError, match="lineage"):
+        load_checkpoint(
+            copied_checkpoint,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_manifests=_manifests(),
+        )
+
+    _assert_nested_equal(before[0], model.state_dict())
+    _assert_nested_equal(before[1], optimizer.state_dict())
+    _assert_nested_equal(before[2], scheduler.state_dict())
+    _assert_rng_equal(rng_before, _rng_snapshot())
+
+
+@pytest.mark.parametrize("dtype", (torch.int64, torch.float32))
+def test_logically_huge_expanded_tensor_is_rejected_before_elementwise_work(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+) -> None:
+    record = _save(run_dir)
+
+    def mutate(payload: dict[str, object]) -> None:
+        optimizer_state = payload["optimizer_state"]
+        parameter = optimizer_state["param_groups"][0]["params"][0]
+        optimizer_state["state"][parameter]["exp_avg"] = torch.zeros(
+            1, dtype=dtype
+        ).expand(1_000_000, 1_000_000)
+
+    _rewrite_payload(record, mutate)
+    original_isfinite = checkpoint_module.torch.isfinite
+
+    def guarded_isfinite(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.numel() == 1_000_000_000_000:
+            raise AssertionError("elementwise validation reached the huge tensor")
+        return original_isfinite(tensor)
+
+    monkeypatch.setattr(checkpoint_module.torch, "isfinite", guarded_isfinite)
+    with pytest.raises(ValueError, match="logical|tensor|stride|bounds"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+def test_zero_stride_float_view_is_rejected_before_finiteness_probe(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir)
+
+    def mutate(payload: dict[str, object]) -> None:
+        optimizer_state = payload["optimizer_state"]
+        parameter = optimizer_state["param_groups"][0]["params"][0]
+        optimizer_state["state"][parameter]["exp_avg"] = torch.zeros(1).expand(
+            32, 32
+        )
+
+    _rewrite_payload(record, mutate)
+    original_isfinite = checkpoint_module.torch.isfinite
+
+    def guarded_isfinite(tensor: torch.Tensor) -> torch.Tensor:
+        expanded = any(
+            size > 1 and stride == 0
+            for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        if expanded:
+            raise AssertionError("finiteness probe reached an expanded tensor")
+        return original_isfinite(tensor)
+
+    monkeypatch.setattr(checkpoint_module.torch, "isfinite", guarded_isfinite)
+    with pytest.raises(ValueError, match="stride|tensor|bounds"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+@pytest.mark.parametrize(
+    "dtype", (torch.int16, torch.float16, torch.float64, torch.complex64), ids=str
+)
+def test_phase_zero_rejects_tensor_dtypes_outside_the_runtime_surface(
+    run_dir: Path,
+    dtype: torch.dtype,
+) -> None:
+    record = _save(run_dir)
+
+    def mutate(payload: dict[str, object]) -> None:
+        optimizer_state = payload["optimizer_state"]
+        parameter = optimizer_state["param_groups"][0]["params"][0]
+        original = optimizer_state["state"][parameter]["exp_avg"]
+        optimizer_state["state"][parameter]["exp_avg"] = torch.zeros(
+            original.shape, dtype=dtype
+        )
+
+    _rewrite_payload(record, mutate)
+    with pytest.raises(ValueError, match="tensor|dtype|Phase 0"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+def test_sidecar_integrity_is_checked_before_torch_load(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir)
+    _rewrite_sidecar(record, sha256="0" * 64)
+    called = False
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("torch.load ran before sidecar integrity")
+
+    monkeypatch.setattr(checkpoint_module.torch, "load", forbidden_load)
+    with pytest.raises(ValueError, match="sha256"):
+        verify_checkpoint(record.checkpoint_path)
+    assert not called
+
+
+def test_oversized_sidecar_declaration_is_rejected_before_hashing(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir)
+    with record.checkpoint_path.open("r+b") as handle:
+        handle.truncate(checkpoint_module.PHASE0_MAX_CHECKPOINT_BYTES + 1)
+    _rewrite_sidecar(
+        record,
+        sha256="0" * 64,
+        byte_size=record.checkpoint_path.stat().st_size,
+    )
+
+    def forbidden_hash(path: Path) -> str:
+        raise AssertionError("oversized artifact was hashed")
+
+    monkeypatch.setattr(checkpoint_module, "_sha256", forbidden_hash)
+    with pytest.raises(ValueError, match="size|budget|Phase 0"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+def test_zip_entry_budget_is_checked_before_zipfile_construction(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir)
+    with zipfile.ZipFile(
+        record.checkpoint_path, "w", compression=zipfile.ZIP_STORED
+    ) as archive:
+        for index in range(20_000):
+            archive.writestr(f"entry-{index:05d}", b"")
+    _rewrite_sidecar(
+        record,
+        sha256=_sha256(record.checkpoint_path),
+        byte_size=record.checkpoint_path.stat().st_size,
+    )
+
+    def forbidden_zipfile(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ZipFile was constructed before the EOCD budget check")
+
+    monkeypatch.setattr(checkpoint_module.zipfile, "ZipFile", forbidden_zipfile)
+    with pytest.raises(ValueError, match="central|entry|member|budget"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+def test_forged_small_eocd_count_is_rejected_before_zipfile_construction(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir)
+    with zipfile.ZipFile(
+        record.checkpoint_path, "w", compression=zipfile.ZIP_STORED
+    ) as archive:
+        for index in range(20_000):
+            archive.writestr(f"entry-{index:05d}", b"")
+    encoded = bytearray(record.checkpoint_path.read_bytes())
+    eocd = encoded.rfind(b"PK\x05\x06")
+    assert eocd >= 0
+    struct.pack_into("<H", encoded, eocd + 8, 1)
+    struct.pack_into("<H", encoded, eocd + 10, 1)
+    record.checkpoint_path.write_bytes(encoded)
+    _rewrite_sidecar(
+        record,
+        sha256=_sha256(record.checkpoint_path),
+        byte_size=record.checkpoint_path.stat().st_size,
+    )
+
+    def forbidden_zipfile(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ZipFile materialized a forged central directory")
+
+    monkeypatch.setattr(checkpoint_module.zipfile, "ZipFile", forbidden_zipfile)
+    with pytest.raises(ValueError, match="central|entry|member|budget"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("multi-disk", "classic-sentinel", "central-budget", "zip64-mismatch"),
+)
+def test_zip_trailer_mismatches_are_rejected_before_zipfile_construction(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    record = _save(run_dir)
+    encoded = bytearray(record.checkpoint_path.read_bytes())
+    eocd = encoded.rfind(b"PK\x05\x06")
+    zip64 = encoded.rfind(b"PK\x06\x06", 0, eocd)
+    assert eocd >= 0 and zip64 >= 0
+    if mutation == "multi-disk":
+        struct.pack_into("<H", encoded, eocd + 4, 1)
+    elif mutation == "classic-sentinel":
+        struct.pack_into("<H", encoded, eocd + 10, 0xFFFF)
+    elif mutation == "central-budget":
+        struct.pack_into(
+            "<L",
+            encoded,
+            eocd + 12,
+            checkpoint_module.PHASE0_MAX_CENTRAL_DIRECTORY_BYTES + 1,
+        )
+    else:
+        current_entries = struct.unpack_from("<Q", encoded, zip64 + 32)[0]
+        struct.pack_into("<Q", encoded, zip64 + 32, current_entries + 1)
+    record.checkpoint_path.write_bytes(encoded)
+    _rewrite_sidecar(
+        record,
+        sha256=_sha256(record.checkpoint_path),
+        byte_size=record.checkpoint_path.stat().st_size,
+    )
+
+    def forbidden_zipfile(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ZipFile was constructed before EOCD rejection")
+
+    monkeypatch.setattr(checkpoint_module.zipfile, "ZipFile", forbidden_zipfile)
+    with pytest.raises(ValueError, match="ZIP|central|entry|budget|disk|trailer"):
+        verify_checkpoint(record.checkpoint_path)
+
+
+@pytest.mark.parametrize("operation", ("auto", "retention"))
+def test_candidate_count_budget_includes_invalid_high_steps(
+    run_dir: Path,
+    operation: str,
+) -> None:
+    record = _save(run_dir, step=1, keep=100)
+    for step in range(100, 165):
+        (record.checkpoint_path.parent / f"step-{step:09d}.pt").write_bytes(b"x")
+
+    if operation == "auto":
+        record.latest_path.write_text("not-json", encoding="utf-8")
+        model, optimizer, scheduler = _components()
+        with pytest.raises(ValueError, match="candidate|scan|budget"):
+            load_checkpoint(
+                run_dir,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=None,
+                expected_manifests=_manifests(),
+                auto=True,
+            )
+    else:
+        with pytest.raises(ValueError, match="candidate|scan|budget"):
+            _save(run_dir, step=2, keep=100)
+
+
+@pytest.mark.parametrize("candidate_part", ("artifact", "sidecar"))
+def test_candidate_byte_budget_counts_incompatible_files(
+    run_dir: Path,
+    candidate_part: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir, step=1, keep=100)
+    base_size = record.checkpoint_path.stat().st_size + record.sidecar_path.stat().st_size
+    monkeypatch.setattr(checkpoint_module, "PHASE0_MAX_SCAN_BYTES", base_size + 30)
+    candidate_size = 11
+    for step in range(100, 103):
+        path = record.checkpoint_path.parent / f"step-{step:09d}.pt"
+        sized_path = path if candidate_part == "artifact" else path.with_suffix(".json")
+        path.write_bytes(b"x")
+        with sized_path.open("wb") as handle:
+            handle.seek(candidate_size - 1)
+            handle.write(b"\0")
+    record.latest_path.write_text("not-json", encoding="utf-8")
+    model, optimizer, scheduler = _components()
+
+    with pytest.raises(ValueError, match="candidate|scan|byte|budget"):
+        load_checkpoint(
+            run_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_manifests=_manifests(),
+            auto=True,
+        )
+
+
+def test_scan_budget_can_admit_one_maximum_artifact_and_sidecar() -> None:
+    assert checkpoint_module.PHASE0_MAX_SCAN_BYTES >= (
+        3
+        * (
+            checkpoint_module.PHASE0_MAX_CHECKPOINT_BYTES
+            + checkpoint_module.PHASE0_MAX_CONTROL_JSON_BYTES
+        )
+    )
+
+
+def _empty_optimizer_state(payload: dict[str, object]) -> None:
+    payload["optimizer_state"]["state"].clear()
+
+
+def _vector_optimizer_step(payload: dict[str, object]) -> None:
+    state = payload["optimizer_state"]["state"]
+    state[next(iter(state))]["step"] = torch.tensor([float(payload["global_step"])])
+
+
+def _stale_scheduler_progress(payload: dict[str, object]) -> None:
+    payload["scheduler_state"]["last_epoch"] = payload["global_step"] - 1
+
+
+def _wrong_adamw_betas(payload: dict[str, object]) -> None:
+    payload["optimizer_state"]["param_groups"][0]["betas"] = (0.8, 0.9)
+
+
+def _wrong_adamw_epsilon(payload: dict[str, object]) -> None:
+    payload["optimizer_state"]["param_groups"][0]["eps"] = 1e-7
+
+
+def _missing_active_optimizer_state(payload: dict[str, object]) -> None:
+    state = payload["optimizer_state"]["state"]
+    state.pop(next(iter(state)))
+
+
+def _wrong_scalar_optimizer_step(payload: dict[str, object]) -> None:
+    state = payload["optimizer_state"]["state"]
+    state[next(iter(state))]["step"] = torch.tensor(
+        float(payload["global_step"] - 1)
+    )
+
+
+def _stale_scheduler_step_count(payload: dict[str, object]) -> None:
+    payload["scheduler_state"]["_step_count"] = payload["global_step"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        _empty_optimizer_state,
+        _vector_optimizer_step,
+        _wrong_scalar_optimizer_step,
+        _missing_active_optimizer_state,
+        _wrong_adamw_betas,
+        _wrong_adamw_epsilon,
+        _stale_scheduler_progress,
+        _stale_scheduler_step_count,
+    ),
+    ids=(
+        "empty-optimizer",
+        "vector-step",
+        "wrong-scalar-step",
+        "missing-active-state",
+        "wrong-betas",
+        "wrong-epsilon",
+        "stale-scheduler",
+        "stale-scheduler-step-count",
+    ),
+)
+def test_phase_zero_progress_evidence_is_bound_to_global_step_without_mutation(
+    run_dir: Path,
+    mutation,
+) -> None:
+    record = _save(run_dir)
+    _rewrite_payload(record, mutation)
+    model, optimizer, scheduler = _components()
+    before = (
+        deepcopy(model.state_dict()),
+        deepcopy(optimizer.state_dict()),
+        deepcopy(scheduler.state_dict()),
+    )
+    rng_before = _rng_snapshot()
+
+    with pytest.raises(
+        ValueError, match="optimizer|scheduler|step|progress|AdamW|parameter|coverage"
+    ):
+        load_checkpoint(
+            record.checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_manifests=_manifests(),
+        )
+
+    _assert_nested_equal(before[0], model.state_dict())
+    _assert_nested_equal(before[1], optimizer.state_dict())
+    _assert_nested_equal(before[2], scheduler.state_dict())
+    _assert_rng_equal(rng_before, _rng_snapshot())
+
+
+def _ledger_extra_key(payload: dict[str, object]) -> None:
+    payload["parameter_ledger"]["unexpected"] = "value"
+
+
+def _ledger_missing_subsystem(payload: dict[str, object]) -> None:
+    payload["parameter_ledger"]["entries"][0].pop("subsystem")
+
+
+def _ledger_wrong_alias(payload: dict[str, object]) -> None:
+    payload["parameter_ledger"]["entries"][0]["aliases"] = ["unrelated.weight"]
+
+
+def _ledger_wrong_total(payload: dict[str, object]) -> None:
+    ledger = payload["parameter_ledger"]
+    ledger["entries"][0]["trainable_parameters"] += 1
+    ledger["total_trainable"] += 1
+
+
+def _ledger_extra_model_schema_key(payload: dict[str, object]) -> None:
+    schema = payload["parameter_ledger"]["model_state_schema"]
+    schema[next(iter(schema))]["unexpected"] = 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        _ledger_extra_key,
+        _ledger_missing_subsystem,
+        _ledger_wrong_alias,
+        _ledger_wrong_total,
+        _ledger_extra_model_schema_key,
+    ),
+    ids=(
+        "extra-key",
+        "missing-subsystem",
+        "wrong-alias",
+        "wrong-total",
+        "extra-model-schema-key",
+    ),
+)
+def test_parameter_ledger_is_exactly_bound_to_the_constructed_model_without_mutation(
+    run_dir: Path,
+    mutation,
+) -> None:
+    record = _save(run_dir)
+    _rewrite_payload(record, mutation)
+    model, optimizer, scheduler = _components()
+    before = (
+        deepcopy(model.state_dict()),
+        deepcopy(optimizer.state_dict()),
+        deepcopy(scheduler.state_dict()),
+    )
+    rng_before = _rng_snapshot()
+
+    with pytest.raises(ValueError, match="ledger|model-state|parameter"):
+        load_checkpoint(
+            record.checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_manifests=_manifests(),
+        )
+
+    _assert_nested_equal(before[0], model.state_dict())
+    _assert_nested_equal(before[1], optimizer.state_dict())
+    _assert_nested_equal(before[2], scheduler.state_dict())
+    _assert_rng_equal(rng_before, _rng_snapshot())
+
+
+def test_save_rejects_a_ledger_owned_by_another_model(run_dir: Path) -> None:
+    model, optimizer, scheduler = _components()
+    cursor = _advance_components(model, optimizer, scheduler, steps=1)
+    other_model = MoiraModel(_model_config())
+
+    with pytest.raises(ValueError, match="ledger|model"):
+        save_checkpoint(
+            run_dir,
+            lineage_id="lineage-test",
+            global_step=1,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            data_cursor=cursor,
+            semantic_manifests=_manifests(),
+            provenance={
+                "git": {"available": True, "revision": "abc123", "dirty": False}
+            },
+            parameter_ledger=other_model.parameter_ledger(),
+            counters={"optimizer_steps": 1, "batches_seen": 1},
+            last_metrics={
+                "loss": 1.0,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            },
+            keep_last_checkpoints=2,
+        )
+
+
+def test_tensor_equality_requires_metadata_as_well_as_values() -> None:
+    assert not checkpoint_module._values_equal(
+        torch.tensor([1], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.float32),
+    )
+
+
+@pytest.mark.parametrize("entrypoint", ("save", "auto", "retention"))
+def test_pointer_target_is_recovered_from_pruning_before_verification(
+    run_dir: Path,
+    entrypoint: str,
+) -> None:
+    record = _save(run_dir, step=1, keep=3)
+    checkpoint_dir = record.checkpoint_path.parent
+    run_metadata = json.loads((checkpoint_dir / "run.json").read_text(encoding="utf-8"))
+    marker = checkpoint_dir / f".{record.checkpoint_path.stem}.pruning.json"
+    checkpoint_tombstone = checkpoint_dir / f".{record.checkpoint_path.name}.pruning"
+    sidecar_tombstone = checkpoint_dir / f".{record.sidecar_path.name}.pruning"
+    marker.write_text(
+        json.dumps(
+            {
+                **run_metadata,
+                "checkpoint": record.checkpoint_path.name,
+                "sidecar": record.sidecar_path.name,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    os.link(record.checkpoint_path, checkpoint_tombstone)
+    os.link(record.sidecar_path, sidecar_tombstone)
+    record.checkpoint_path.unlink()
+    record.sidecar_path.unlink()
+
+    if entrypoint == "save":
+        result_path = _save(run_dir, step=2, keep=3).checkpoint_path
+    elif entrypoint == "auto":
+        model, optimizer, scheduler = _components()
+        result_path = load_checkpoint(
+            run_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_manifests=_manifests(),
+            auto=True,
+        ).checkpoint_path
+    else:
+        checkpoint_module._prune_validated(checkpoint_dir, 3)
+        result_path = record.checkpoint_path
+
+    expected_step = 2 if entrypoint == "save" else 1
+    assert verify_checkpoint(result_path)["global_step"] == expected_step
+    assert verify_checkpoint(record.checkpoint_path)["global_step"] == 1
+    assert not marker.exists()
+    assert not checkpoint_tombstone.exists()
+    assert not sidecar_tombstone.exists()
+
+
+def test_retry_reconciles_an_old_invalid_tombstone_and_new_canonical(
+    run_dir: Path,
+) -> None:
+    first = _save(run_dir, step=1, keep=3)
+    checkpoint = first.checkpoint_path.parent / "step-000000002.pt"
+    tombstone = checkpoint.parent / f".{checkpoint.name}.invalid"
+    checkpoint.write_bytes(b"old invalid generation")
+    os.link(checkpoint, tombstone)
+    checkpoint.unlink()
+    checkpoint.write_bytes(b"new invalid generation")
+
+    retried = _save(run_dir, step=2, keep=3)
+
+    assert verify_checkpoint(retried.checkpoint_path)["global_step"] == 2
+    assert not tombstone.exists()
+
+
+def test_pointer_referenced_invalid_tombstone_restores_a_missing_canonical(
+    run_dir: Path,
+) -> None:
+    first = _save(run_dir, step=1, keep=3)
+    tombstone = first.checkpoint_path.parent / f".{first.checkpoint_path.name}.invalid"
+    os.link(first.checkpoint_path, tombstone)
+    first.checkpoint_path.unlink()
+
+    second = _save(run_dir, step=2, keep=3)
+
+    assert verify_checkpoint(first.checkpoint_path)["global_step"] == 1
+    assert verify_checkpoint(second.checkpoint_path)["global_step"] == 2
+    assert not tombstone.exists()
+
+
+def test_pointer_referenced_invalid_tombstone_conflict_preserves_both_files(
+    run_dir: Path,
+) -> None:
+    record = _save(run_dir, step=1, keep=3)
+    tombstone = record.checkpoint_path.parent / f".{record.checkpoint_path.name}.invalid"
+    os.link(record.checkpoint_path, tombstone)
+    record.checkpoint_path.unlink()
+    record.checkpoint_path.write_bytes(b"different replacement")
+    canonical_before = record.checkpoint_path.read_bytes()
+    tombstone_before = tombstone.read_bytes()
+
+    with pytest.raises(ValueError, match="conflict|pointer|invalid"):
+        _save(run_dir, step=2, keep=3)
+
+    assert record.checkpoint_path.read_bytes() == canonical_before
+    assert tombstone.read_bytes() == tombstone_before
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "link",
+        "link-sync",
+        "canonical-unlink",
+        "canonical-sync",
+        "tombstone-unlink",
+        "tombstone-sync",
+    ),
+)
+def test_invalid_reclamation_retry_converges_after_every_filesystem_boundary(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    first = _save(run_dir, step=1, keep=3)
+    checkpoint = first.checkpoint_path.parent / "step-000000002.pt"
+    tombstone = checkpoint.parent / f".{checkpoint.name}.invalid"
+    checkpoint.write_bytes(b"invalid generation")
+    original_link = checkpoint_module.os.link
+    original_unlink = Path.unlink
+    original_fsync = checkpoint_module._fsync_directory
+    injected = False
+
+    def link_then_fail(source: object, target: object, *args: object, **kwargs: object):
+        nonlocal injected
+        result = original_link(source, target, *args, **kwargs)
+        if Path(target) == tombstone and boundary == "link" and not injected:
+            injected = True
+            raise OSError("injected invalid link failure")
+        return result
+
+    def unlink_then_fail(path: Path, *args: object, **kwargs: object):
+        nonlocal injected
+        result = original_unlink(path, *args, **kwargs)
+        target_boundary = (
+            "canonical-unlink" if path == checkpoint else "tombstone-unlink"
+        )
+        if path in (checkpoint, tombstone) and boundary == target_boundary and not injected:
+            injected = True
+            raise OSError(f"injected {boundary} failure")
+        return result
+
+    def fsync_then_fail(path: Path) -> None:
+        nonlocal injected
+        original_fsync(path)
+        same_inode = False
+        if checkpoint.exists() and tombstone.exists():
+            same_inode = os.path.samefile(checkpoint, tombstone)
+        observed = None
+        if same_inode:
+            observed = "link-sync"
+        elif tombstone.exists() and not checkpoint.exists():
+            observed = "canonical-sync"
+        elif not tombstone.exists() and not checkpoint.exists():
+            observed = "tombstone-sync"
+        if boundary == observed and not injected:
+            injected = True
+            raise OSError(f"injected {boundary} failure")
+
+    with monkeypatch.context() as context:
+        context.setattr(checkpoint_module.os, "link", link_then_fail)
+        context.setattr(Path, "unlink", unlink_then_fail)
+        context.setattr(checkpoint_module, "_fsync_directory", fsync_then_fail)
+        with pytest.raises(OSError, match="injected"):
+            _save(run_dir, step=2, keep=3)
+
+    assert injected
+    retried = _save(run_dir, step=2, keep=3)
+    assert verify_checkpoint(retried.checkpoint_path)["global_step"] == 2
+    assert not tombstone.exists()
+
+
+def test_different_step_process_writers_cannot_regress_the_pointer(
+    run_dir: Path,
+) -> None:
+    _save(run_dir, step=1, keep=4)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    result_path = run_dir / "writer-result.txt"
+    process = context.Process(
+        target=_blocked_step_writer,
+        args=(str(run_dir), ready, release, str(result_path)),
+    )
+    process.start()
+    try:
+        assert ready.wait(20), "step-2 writer did not reach the pointer boundary"
+        with pytest.raises(ValueError, match="writer lock"):
+            _save(run_dir, step=3, keep=4)
+    finally:
+        release.set()
+        process.join(20)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+    assert process.exitcode == 0
+    assert result_path.read_text(encoding="utf-8") == "ok"
+    latest = _save(run_dir, step=3, keep=4)
+    pointer = json.loads(latest.latest_path.read_text(encoding="utf-8"))
+    assert pointer["step"] == 3
+    assert verify_checkpoint(latest.checkpoint_path)["global_step"] == 3
+
+
+@pytest.mark.parametrize("run_name", ("experiment.pt", "checkpoints"))
+def test_run_directory_names_do_not_change_lock_or_artifact_placement(
+    run_dir: Path,
+    run_name: str,
+) -> None:
+    named_run = run_dir / run_name
+    record = _save(named_run, step=1)
+
+    assert record.checkpoint_path.parent == named_run / "checkpoints"
+    assert not (named_run.parent / "run.json").exists()
+    assert verify_checkpoint(record.checkpoint_path)["global_step"] == 1
+    model, optimizer, scheduler = _components()
+    loaded = load_checkpoint(
+        named_run,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        expected_manifests=_manifests(),
+        auto=True,
+    )
+    assert loaded.checkpoint_path == record.checkpoint_path
+
+
+@pytest.mark.parametrize(
+    "material_name",
+    (".step-000000001.pt.invalid", ".step-000000001.pt.pruning"),
+)
+def test_missing_run_metadata_cannot_rebind_a_tombstone_only_directory(
+    run_dir: Path,
+    material_name: str,
+) -> None:
+    named_run = run_dir / "tombstone-only"
+    checkpoint_dir = named_run / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    material = checkpoint_dir / material_name
+    material.write_bytes(b"pre-existing generation")
+
+    with pytest.raises(ValueError, match="run metadata|non-empty"):
+        _save(named_run, step=1)
+
+    assert material.read_bytes() == b"pre-existing generation"
+    assert not (checkpoint_dir / "run.json").exists()
+
+
+def test_auto_recovery_does_not_treat_a_nonregular_pointer_as_content_damage(
+    run_dir: Path,
+) -> None:
+    record = _save(run_dir, step=1)
+    record.latest_path.unlink()
+    record.latest_path.mkdir()
+    model, optimizer, scheduler = _components()
+
+    with pytest.raises(ValueError, match="regular|symlink|pointer|path"):
+        load_checkpoint(
+            run_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_manifests=_manifests(),
+            auto=True,
+        )
+
+
+def test_save_checks_a_dangling_pointer_entry_before_the_absence_branch(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _save(run_dir, step=1)
+    pointer_before = record.latest_path.read_bytes()
+    original_exists = Path.exists
+    original_is_symlink = Path.is_symlink
+
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda path: False if path == record.latest_path else original_exists(path),
+    )
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == record.latest_path or original_is_symlink(path),
+    )
+
+    with pytest.raises(ValueError, match="symlink|regular|pointer|path"):
+        _save(run_dir, step=2)
+
+    assert record.latest_path.read_bytes() == pointer_before
+
+
+def test_writer_lock_is_released_by_the_os_after_process_death(
+    run_dir: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(
+        target=_crash_while_holding_run_lock,
+        args=(str(run_dir), ready),
+    )
+    process.start()
+    try:
+        assert ready.wait(20), "crashing writer did not acquire the run lock"
+        process.join(20)
+        assert not process.is_alive(), "crashing writer did not exit"
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+    assert process.exitcode == 0
+    record = _save(run_dir, step=1)
+    assert verify_checkpoint(record.checkpoint_path)["global_step"] == 1
+    assert (record.checkpoint_path.parent / ".run.lock").is_file()
+
+
+def test_nonregular_writer_lock_fails_closed_before_publication(run_dir: Path) -> None:
+    named_run = run_dir / "nonregular-lock"
+    lock_path = named_run / "checkpoints" / ".run.lock"
+    lock_path.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="lock|regular|safely"):
+        _save(named_run, step=1)
+
+    assert not (lock_path.parent / "run.json").exists()
+
+
+def test_parent_symlink_is_rejected_before_checkpoint_directory_creation() -> None:
+    root = Path("research/runs")
+    target = root / f"task5-symlink-target-{uuid.uuid4().hex}"
+    link = root / f"task5-symlink-link-{uuid.uuid4().hex}"
+    target.mkdir(parents=True)
+    try:
+        try:
+            os.symlink(target.resolve(), link, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlink creation is unavailable: {error}")
+        with pytest.raises(ValueError, match="symlink|junction|reparse|indirection"):
+            _save(link / "external-run", step=1)
+        assert not (target / "external-run").exists()
+    finally:
+        if link.is_symlink():
+            link.unlink()
+        shutil.rmtree(target, ignore_errors=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction integration")
+def test_windows_junction_is_rejected_before_checkpoint_directory_creation() -> None:
+    root = Path("research/runs")
+    target = root / f"task5-junction-target-{uuid.uuid4().hex}"
+    junction = root / f"task5-junction-link-{uuid.uuid4().hex}"
+    target.mkdir(parents=True)
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target.resolve())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        shutil.rmtree(target, ignore_errors=True)
+        pytest.skip(f"junction creation is unavailable: {created.stderr.strip()}")
+    try:
+        with pytest.raises(ValueError, match="junction|reparse|indirection"):
+            _save(junction / "external-run", step=1)
+        assert not (target / "external-run").exists()
+    finally:
+        if junction.exists():
+            junction.rmdir()
+        shutil.rmtree(target, ignore_errors=True)
