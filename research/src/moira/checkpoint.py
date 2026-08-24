@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import pickletools
 import random
 import re
 import stat
@@ -15,10 +16,11 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from threading import Lock, RLock, local
-from typing import Any, Iterator, Mapping
+from types import FunctionType
+from typing import Any, BinaryIO, Iterator, Mapping
 
 import numpy as np
 import torch
@@ -26,6 +28,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
+from .config import ModelConfig, OptimizationConfig
 from .ledger import ParameterLedger, ParameterSubsystem
 from .model import MoiraModel
 from .synthetic import DataCursor
@@ -50,6 +53,12 @@ PHASE0_MAX_TENSOR_LOGICAL_BYTES = 256 * 1024 * 1024
 PHASE0_MAX_TOTAL_TENSOR_LOGICAL_BYTES = 256 * 1024 * 1024
 PHASE0_MAX_STRING_BYTES = 64 * 1024
 PHASE0_MAX_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
+PHASE0_MAX_PICKLE_BYTES = 8 * 1024 * 1024
+PHASE0_MAX_PICKLE_OPCODES = 100_000
+PHASE0_MAX_PICKLE_MEMO = 100_000
+PHASE0_MAX_PICKLE_MARK_DEPTH = PHASE0_MAX_STATE_DEPTH + 8
+PHASE0_MAX_PICKLE_STRING_BYTES = 1 * 1024 * 1024
+PHASE0_MAX_PICKLE_REDUCES = 16_384
 PHASE0_MAX_SCAN_CANDIDATES = 64
 PHASE0_MAX_SCAN_BYTES = 3 * (
     PHASE0_MAX_CHECKPOINT_BYTES + PHASE0_MAX_CONTROL_JSON_BYTES
@@ -71,12 +80,60 @@ _PHASE0_TENSOR_DTYPES = frozenset(
     }
 )
 _STEP_NAME = re.compile(r"step-([0-9]{9})\.pt\Z", re.ASCII)
-_SIDECAR_NAME = re.compile(r"step-[0-9]{9}\.json\Z", re.ASCII)
 _PRUNING_MARKER_NAME = re.compile(
     r"\.step-([0-9]{9})\.pruning\.json\Z", re.ASCII
 )
 _INVALID_TOMBSTONE_NAME = re.compile(
     r"\.(step-[0-9]{9}\.(?:pt|json))\.invalid\Z", re.ASCII
+)
+_STAGED_TEMP_NAME = re.compile(
+    r"\.(?:step-[0-9]{9}\.(?:pt|json)|run\.json|latest\.json|"
+    r"\.step-[0-9]{9}\.pruning\.json)\.[A-Za-z0-9_-]{6,64}\.tmp\Z",
+    re.ASCII,
+)
+_PICKLE_OPCODES = frozenset(
+    {
+        "APPEND",
+        "APPENDS",
+        "BINFLOAT",
+        "BINGET",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "BINPERSID",
+        "BINPUT",
+        "BINUNICODE",
+        "EMPTY_DICT",
+        "EMPTY_LIST",
+        "EMPTY_TUPLE",
+        "GLOBAL",
+        "LONG1",
+        "LONG_BINGET",
+        "LONG_BINPUT",
+        "MARK",
+        "NEWFALSE",
+        "NEWTRUE",
+        "NONE",
+        "PROTO",
+        "REDUCE",
+        "SETITEM",
+        "SETITEMS",
+        "STOP",
+        "TUPLE",
+        "TUPLE1",
+        "TUPLE2",
+        "TUPLE3",
+    }
+)
+_PICKLE_GLOBALS = frozenset(
+    {
+        "collections OrderedDict",
+        "torch._utils _rebuild_tensor_v2",
+        "torch BoolStorage",
+        "torch ByteStorage",
+        "torch FloatStorage",
+        "torch LongStorage",
+    }
 )
 _SIDECAR_KEYS = {
     "schema_version",
@@ -141,6 +198,23 @@ class LoadedCheckpoint:
     last_metrics: dict[str, float]
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedCheckpoint:
+    path: Path
+    payload: dict[str, Any]
+    sidecar: dict[str, Any]
+    source_status: os.stat_result
+    sidecar_status: os.stat_result
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointSnapshot:
+    handle: BinaryIO
+    source_status: os.stat_result
+    byte_size: int
+    sha256: str
+
+
 @contextmanager
 def checkpoint_run_lock(
     run_dir: str | os.PathLike[str],
@@ -163,7 +237,6 @@ def _checkpoint_directory_lock(checkpoint_dir: Path) -> Iterator[Path]:
         entry = held.get(key)
         if entry is not None:
             held[key] = (entry[0] + 1, entry[1])
-            _RUN_LOCK_LOCAL.held = held
             try:
                 yield checkpoint_dir
             finally:
@@ -172,6 +245,11 @@ def _checkpoint_directory_lock(checkpoint_dir: Path) -> Iterator[Path]:
             return
 
         descriptor = _acquire_run_lock(checkpoint_dir)
+        try:
+            _cleanup_staged_temps(checkpoint_dir)
+        except Exception:
+            _release_run_lock(descriptor)
+            raise
         held[key] = (1, descriptor)
         _RUN_LOCK_LOCAL.held = held
         try:
@@ -233,6 +311,20 @@ def _release_run_lock(descriptor: int) -> None:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
         os.close(descriptor)
+
+
+def _cleanup_staged_temps(checkpoint_dir: Path) -> None:
+    removed = False
+    for path in _directory_entries(checkpoint_dir):
+        if _STAGED_TEMP_NAME.fullmatch(path.name) is None:
+            continue
+        _validate_regular_file(path, "stale checkpoint staging file")
+        if path.parent != checkpoint_dir:
+            raise ValueError("stale checkpoint staging file escapes its run directory")
+        path.unlink()
+        removed = True
+    if removed:
+        _fsync_directory(checkpoint_dir)
 
 
 def save_checkpoint(
@@ -305,7 +397,7 @@ def save_checkpoint(
         "last_metrics": _normalize_metrics(last_metrics),
     }
     _validate_payload(payload, expected_manifests=manifests)
-    _validate_phase0_component_binding(model, optimizer, scheduler, payload, manifests)
+    _validate_phase0_resumability(model, optimizer, scheduler, payload, manifests)
 
     with checkpoint_run_lock(run_dir) as checkpoint_dir:
         return _commit_checkpoint(
@@ -353,12 +445,12 @@ def _commit_checkpoint(
             torch.save(payload, temporary)
             temporary.flush()
             os.fsync(temporary.fileno())
-        reopened = _load_payload(staged_path)
+        reopened, staged_size, staged_checksum = _load_payload_with_fingerprint(
+            staged_path
+        )
         _validate_payload(reopened, expected_manifests=manifests)
         if not _values_equal(payload, reopened):
             raise ValueError("staged checkpoint did not reopen exactly")
-        staged_size = staged_path.stat().st_size
-        staged_checksum = _sha256(staged_path)
         claimed = _claim_file(staged_path, checkpoint_path)
         if not claimed:
             try:
@@ -385,10 +477,18 @@ def _commit_checkpoint(
             except OSError:
                 pass
 
-    byte_size = checkpoint_path.stat().st_size
-    checksum = _sha256(checkpoint_path)
-    reopened = _load_payload(checkpoint_path)
-    _validate_payload(reopened, expected_manifests=manifests)
+    with _snapshot_checkpoint(checkpoint_path) as snapshot:
+        byte_size = snapshot.byte_size
+        checksum = snapshot.sha256
+        reopened = _load_payload_handle(snapshot.handle, snapshot.byte_size)
+        _validate_loaded_phase0(
+            reopened,
+            expected_manifests=manifests,
+            expected_lineage_id=lineage_id,
+        )
+        if not _same_checkpoint_state(payload, reopened):
+            raise ValueError("published checkpoint differs from the intended state")
+        source_status = snapshot.source_status
     sidecar = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint": checkpoint_path.name,
@@ -413,9 +513,26 @@ def _commit_checkpoint(
             elif existing_sidecar != sidecar:
                 raise ValueError("checkpoint sidecar has different committed content")
     _publish_json_once(sidecar_path, sidecar)
-    reopened_sidecar = _read_json(sidecar_path, "checkpoint sidecar")
-    _validate_sidecar_integrity(reopened_sidecar, checkpoint_path)
-    _validate_sidecar_binding(reopened_sidecar, checkpoint_path, reopened)
+    committed_sidecar, sidecar_status = _read_json_with_status(
+        sidecar_path, "checkpoint sidecar"
+    )
+    _validate_sidecar_integrity(
+        committed_sidecar,
+        checkpoint_path,
+        byte_size=byte_size,
+        sha256=checksum,
+    )
+    _validate_sidecar_binding(committed_sidecar, checkpoint_path, reopened)
+    _recheck_regular_identity(
+        checkpoint_path, source_status, "checkpoint artifact"
+    )
+    verified = _VerifiedCheckpoint(
+        path=checkpoint_path,
+        payload=reopened,
+        sidecar=committed_sidecar,
+        source_status=source_status,
+        sidecar_status=sidecar_status,
+    )
 
     pointer = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -431,6 +548,7 @@ def _commit_checkpoint(
     if latest_path.exists():
         existing_pointer = _read_json(latest_path, "latest pointer")
     if existing_pointer != pointer:
+        _recheck_verified_checkpoint(verified)
         _atomic_write_json(latest_path, pointer)
     if _read_json(latest_path, "latest pointer") != pointer:
         raise ValueError("latest pointer did not reopen exactly")
@@ -442,7 +560,9 @@ def _commit_checkpoint(
         step=global_step,
         lineage_id=lineage_id,
     )
-    _prune_validated(checkpoint_dir, keep_last_checkpoints)
+    _prune_validated(
+        checkpoint_dir, keep_last_checkpoints, pointer_record=verified
+    )
     return record
 
 
@@ -452,20 +572,12 @@ def verify_checkpoint(
     expected_manifests: Mapping[str, Mapping[str, object]] | None = None,
     expected_lineage_id: str | None = None,
 ) -> dict[str, Any]:
-    """Verify the immutable artifact, sidecar, schema, and semantic evidence."""
-    path = Path(checkpoint_path)
-    _validate_regular_file(path, "checkpoint artifact")
-    sidecar_path = path.with_suffix(".json")
-    sidecar = _read_json(sidecar_path, "checkpoint sidecar")
-    _validate_sidecar_integrity(sidecar, path)
-    payload = _load_payload(path)
-    _validate_payload(payload, expected_manifests=expected_manifests)
-    _validate_sidecar_binding(sidecar, path, payload)
-    if expected_lineage_id is not None:
-        _require_non_empty_string("expected_lineage_id", expected_lineage_id)
-        if payload["lineage_id"] != expected_lineage_id:
-            raise ValueError("checkpoint lineage mismatch")
-    return payload
+    """Verify that an immutable artifact is resumable by the exact Phase-0 stack."""
+    return _verify_checkpoint_record(
+        Path(checkpoint_path),
+        expected_manifests=expected_manifests,
+        expected_lineage_id=expected_lineage_id,
+    ).payload
 
 
 def load_checkpoint(
@@ -507,19 +619,18 @@ def _load_checkpoint_locked(
 ) -> LoadedCheckpoint:
     """Strictly restore components and restore process RNG state last."""
     normalized_expected = _normalize_manifests(expected_manifests)
-    checkpoint_path, payload, _ = _resolve_checkpoint(
+    verified = _resolve_checkpoint(
         Path(source),
         auto=auto,
         expected_manifests=normalized_expected,
         expected_lineage_id=expected_lineage_id,
     )
-    _validate_model_compatibility(model, payload)
+    payload = verified.payload
     if scaler is not None:
         raise ValueError("Phase 0 checkpoints require scaler=None")
-    _validate_phase0_component_binding(
+    _validate_phase0_resumability(
         model, optimizer, scheduler, payload, normalized_expected
     )
-    _preflight_components(model, optimizer, scheduler, payload)
     cursor = _cursor_from_payload(payload)
     counters = dict(payload["counters"])
     last_metrics = {
@@ -532,6 +643,7 @@ def _load_checkpoint_locked(
     )
     rng_before = _capture_rng_state()
     try:
+        _recheck_verified_checkpoint(verified)
         model.load_state_dict(payload["model_state"], strict=True)
         scheduler.load_state_dict(payload["scheduler_state"])
         optimizer.load_state_dict(payload["optimizer_state"])
@@ -543,7 +655,7 @@ def _load_checkpoint_locked(
         _restore_rng_state(rng_before)
         raise
     return LoadedCheckpoint(
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=verified.path,
         lineage_id=payload["lineage_id"],
         global_step=payload["global_step"],
         data_cursor=cursor,
@@ -760,7 +872,12 @@ def _validate_training_counters(
 
 def _cursor_from_payload(payload: Mapping[str, object]) -> DataCursor:
     value = payload.get("data_cursor")
-    if not isinstance(value, Mapping):
+    if not isinstance(value, Mapping) or set(value) != {
+        "kind",
+        "next_sample_index",
+        "samples_seen",
+        "tokens_seen",
+    }:
         raise ValueError("checkpoint data cursor must be a mapping")
     try:
         return DataCursor(
@@ -776,7 +893,11 @@ def _cursor_from_payload(payload: Mapping[str, object]) -> DataCursor:
 def _ledger_evidence(
     ledger: ParameterLedger, model_state: Mapping[str, Tensor]
 ) -> dict[str, object]:
+    model = ledger._model
+    if not isinstance(model, MoiraModel):
+        raise ValueError("Phase 0 parameter ledger must belong to a MoiraModel")
     return {
+        "model_config": asdict(model.config),
         "total_trainable": ledger.total_trainable,
         "entries": [
             {
@@ -804,7 +925,8 @@ def _validate_model_state_and_ledger(payload: Mapping[str, object]) -> None:
         not isinstance(state, dict)
         or not state
         or not isinstance(evidence, dict)
-        or set(evidence) != {"total_trainable", "entries", "model_state_schema"}
+        or set(evidence)
+        != {"model_config", "total_trainable", "entries", "model_state_schema"}
     ):
         raise ValueError("model state and parameter ledger must be mappings")
     schema = evidence.get("model_state_schema")
@@ -867,6 +989,13 @@ def _validate_model_compatibility(model: nn.Module, payload: Mapping[str, object
     actual_ledger = _ledger_evidence(model.parameter_ledger(), expected)
     if not _values_equal(actual_ledger, payload["parameter_ledger"]):
         raise ValueError("parameter ledger does not match the constructed model")
+    for entry in actual_ledger["entries"]:
+        aliases = entry["aliases"]
+        if len(aliases) < 2:
+            continue
+        first = observed[aliases[0]]
+        if any(not _values_equal(first, observed[alias]) for alias in aliases[1:]):
+            raise ValueError("tied model aliases contain divergent tensor values")
 
 
 def _validate_phase0_saved_progress(
@@ -987,12 +1116,98 @@ def _validate_phase0_saved_progress(
         raise ValueError("Phase 0 LambdaLR progress is inconsistent with global_step")
 
 
-def _validate_phase0_component_binding(
+def _phase0_configs(
+    manifests: Mapping[str, Mapping[str, object]],
+) -> tuple[ModelConfig, OptimizationConfig]:
+    try:
+        model_config = ModelConfig(**dict(manifests["model"]))
+        optimization_config = OptimizationConfig(**dict(manifests["optimization"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Phase 0 model or optimization manifest is invalid") from error
+    if not _values_equal(asdict(model_config), manifests["model"]):
+        raise ValueError("Phase 0 model manifest is not an exact ModelConfig")
+    if not _values_equal(asdict(optimization_config), manifests["optimization"]):
+        raise ValueError(
+            "Phase 0 optimization manifest is not an exact OptimizationConfig"
+        )
+    return model_config, optimization_config
+
+
+def _build_phase0_validation_components(
+    manifests: Mapping[str, Mapping[str, object]],
+) -> tuple[MoiraModel, AdamW, LambdaLR]:
+    model_config, optimization_config = _phase0_configs(manifests)
+    _validate_phase0_model_budget(model_config)
+    with torch.random.fork_rng(devices=[], enabled=True):
+        model = MoiraModel(model_config).to(device="cpu", dtype=torch.float32)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=optimization_config.learning_rate,
+        weight_decay=optimization_config.weight_decay,
+        foreach=False,
+        fused=False,
+    )
+    scheduler = LambdaLR(
+        optimizer,
+        lr_lambda=_phase0_schedule_lambda(
+            optimization_config.warmup_steps,
+            optimization_config.schedule_total_steps,
+        ),
+    )
+    return model, optimizer, scheduler
+
+
+def _validate_phase0_model_budget(config: ModelConfig) -> None:
+    if config.n_layers > PHASE0_MAX_STATE_DEPTH:
+        raise ValueError("Phase 0 model depth exceeds the checkpoint budget")
+    try:
+        with torch.device("meta"):
+            probe = MoiraModel(config)
+        parameters = tuple(probe.parameters())
+        total = sum(parameter.numel() for parameter in parameters)
+    except (RuntimeError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Phase 0 model dimensions exceed the checkpoint budget") from error
+    if (
+        total > PHASE0_MAX_TENSOR_NUMEL
+        or total * 4 > PHASE0_MAX_TENSOR_LOGICAL_BYTES
+        or any(
+            parameter.ndim > PHASE0_MAX_TENSOR_RANK
+            or parameter.numel() > PHASE0_MAX_TENSOR_NUMEL
+            or any(
+                dimension > PHASE0_MAX_TENSOR_DIMENSION
+                for dimension in parameter.shape
+            )
+            for parameter in parameters
+        )
+    ):
+        raise ValueError("Phase 0 model dimensions exceed the checkpoint budget")
+
+
+def _validate_phase0_resumability(
     model: nn.Module,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     payload: Mapping[str, object],
     manifests: Mapping[str, Mapping[str, object]],
+) -> None:
+    model_config, optimization_config = _phase0_configs(manifests)
+    if not isinstance(model, MoiraModel) or not _values_equal(
+        asdict(model.config), asdict(model_config)
+    ):
+        raise ValueError("live model config does not match the strict model manifest")
+    _validate_model_compatibility(model, payload)
+    _validate_phase0_component_binding(model, optimizer, scheduler, payload)
+    cloned_scheduler = _preflight_components(model, optimizer, scheduler, payload)
+    _validate_scheduler_callable(
+        cloned_scheduler, optimization_config, int(payload["global_step"])
+    )
+
+
+def _validate_phase0_component_binding(
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    payload: Mapping[str, object],
 ) -> None:
     if not isinstance(model, MoiraModel) or type(optimizer) is not AdamW:
         raise ValueError("Phase 0 requires MoiraModel with AdamW")
@@ -1039,54 +1254,113 @@ def _validate_phase0_component_binding(
     saved_state = optimizer_state["state"]
     if set(saved_state) != expected_active:
         raise ValueError("Phase 0 AdamW active parameter coverage is incomplete")
+    state_storages: set[tuple[int, int]] = set()
     for saved_id, parameter in zip(saved_group["params"], actual_parameters):
         if saved_id not in expected_active:
             continue
         parameter_state = saved_state[saved_id]
-        for name in ("exp_avg", "exp_avg_sq"):
+        for name in ("step", "exp_avg", "exp_avg_sq"):
             value = parameter_state[name]
-            if (
-                value.shape != parameter.shape
-                or value.dtype != parameter.dtype
-                or value.device.type != "cpu"
-                or value.layout is not torch.strided
+            if not isinstance(value, Tensor):
+                raise ValueError("AdamW tensor state must contain tensors")
+            if name != "step" and (
+                value.shape != parameter.shape or value.dtype != parameter.dtype
             ):
                 raise ValueError("AdamW tensor state does not match its model parameter")
+            storage = value.untyped_storage()
+            storage_key = (storage.data_ptr(), storage.nbytes())
+            if (
+                value.device.type != "cpu"
+                or value.layout is not torch.strided
+                or value.storage_offset() != 0
+                or not value.is_contiguous()
+                or storage.nbytes() != value.numel() * value.element_size()
+                or storage_key in state_storages
+            ):
+                raise ValueError("AdamW tensor state storage topology is unsafe")
+            state_storages.add(storage_key)
 
-    expected_lr, _, _ = _phase0_learning_rates(manifests, int(payload["global_step"]))
-    if not _same_float(saved_group["lr"], expected_lr):
-        raise ValueError("AdamW learning rate is inconsistent with the manifest")
+def _validate_scheduler_callable(
+    scheduler: LRScheduler,
+    optimization: OptimizationConfig,
+    step: int,
+) -> None:
+    if type(scheduler) is not LambdaLR or len(scheduler.lr_lambdas) != 1:
+        raise ValueError("Phase 0 LambdaLR callable schema is invalid")
+    function = scheduler.lr_lambdas[0]
+    expected_function = _phase0_schedule_lambda(
+        optimization.warmup_steps, optimization.schedule_total_steps
+    )
+    if (
+        not isinstance(function, FunctionType)
+        or function.__code__ is not expected_function.__code__
+        or function.__defaults__ is not None
+        or function.__kwdefaults__ is not None
+        or function.__globals__.get("_phase0_schedule_from_counts")
+        is not _phase0_schedule_from_counts
+        or function.__closure__ is None
+        or expected_function.__closure__ is None
+        or not _values_equal(
+            tuple(cell.cell_contents for cell in function.__closure__),
+            tuple(cell.cell_contents for cell in expected_function.__closure__),
+        )
+    ):
+        raise ValueError("Phase 0 LambdaLR callable is not the canonical schedule")
+    rng_before = _capture_rng_state()
+    try:
+        observed = [function(probe) for probe in (step, step + 1)]
+    except Exception as error:
+        raise ValueError("Phase 0 LambdaLR callable cannot be evaluated safely") from error
+    finally:
+        _restore_rng_state(rng_before)
+    expected = [
+        _phase0_schedule_factor(optimization, probe) for probe in (step, step + 1)
+    ]
+    if any(not _same_float(value, target) for value, target in zip(observed, expected)):
+        raise ValueError("Phase 0 LambdaLR callable diverges from the strict schedule")
 
 
 def _phase0_learning_rates(
     manifests: Mapping[str, Mapping[str, object]], step: int
 ) -> tuple[float, float, float]:
-    optimization = manifests["optimization"]
-    base_lr = optimization.get("learning_rate")
-    weight_decay = optimization.get("weight_decay")
-    warmup = optimization.get("warmup_steps")
-    total = optimization.get("schedule_total_steps")
-    if (
-        optimization.get("optimizer") != "adamw"
-        or optimization.get("schedule") != "cosine-with-warmup"
-        or optimization.get("precision") != "fp32"
-        or optimization.get("gradient_accumulation_steps") != 1
-        or not _is_finite_number(base_lr, positive=True)
-        or not _is_finite_number(weight_decay, non_negative=True)
-        or not isinstance(warmup, int)
-        or isinstance(warmup, bool)
-        or warmup < 0
-        or not _is_positive_integer(total)
-        or step > total
+    _, optimization = _phase0_configs(manifests)
+    if optimization.gradient_accumulation_steps != 1 or step > (
+        optimization.schedule_total_steps
     ):
         raise ValueError("Phase 0 optimization manifest is incompatible")
-    if warmup and step < warmup:
-        factor = float(step + 1) / warmup
+    factor = _phase0_schedule_factor(optimization, step)
+    return (
+        optimization.learning_rate * factor,
+        optimization.learning_rate,
+        optimization.weight_decay,
+    )
+
+
+def _phase0_schedule_factor(config: OptimizationConfig, step: int) -> float:
+    return _phase0_schedule_from_counts(
+        config.warmup_steps, config.schedule_total_steps, step
+    )
+
+
+def _phase0_schedule_lambda(
+    warmup_steps: int, schedule_total_steps: int
+) -> FunctionType:
+    return lambda step: _phase0_schedule_from_counts(
+        warmup_steps, schedule_total_steps, step
+    )
+
+
+def _phase0_schedule_from_counts(
+    warmup_steps: int, schedule_total_steps: int, step: int
+) -> float:
+    if warmup_steps and step < warmup_steps:
+        return float(step + 1) / warmup_steps
     else:
-        progress = (step - warmup) / max(1, total - warmup)
+        progress = (step - warmup_steps) / max(
+            1, schedule_total_steps - warmup_steps
+        )
         progress = min(max(progress, 0.0), 1.0)
-        factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return float(base_lr) * factor, float(base_lr), float(weight_decay)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def _single_matching_float(value: object, expected: float) -> bool:
@@ -1189,13 +1463,14 @@ def _preflight_components(
     optimizer: Optimizer,
     scheduler: LRScheduler,
     payload: Mapping[str, object],
-) -> None:
+) -> LRScheduler:
     cloned_model, cloned_optimizer, cloned_scheduler = deepcopy(
         (model, optimizer, scheduler)
     )
     cloned_model.load_state_dict(payload["model_state"], strict=True)
     cloned_scheduler.load_state_dict(payload["scheduler_state"])
     cloned_optimizer.load_state_dict(payload["optimizer_state"])
+    return cloned_scheduler
 
 
 def _validate_rng_state(state: object) -> None:
@@ -1273,22 +1548,26 @@ def _validate_rng_state(state: object) -> None:
 
 
 def _normalize_counters(counters: object) -> dict[str, int]:
-    if not isinstance(counters, Mapping):
-        raise ValueError("counters must be a mapping")
+    if not isinstance(counters, Mapping) or set(counters) != {
+        "optimizer_steps",
+        "batches_seen",
+    }:
+        raise ValueError("checkpoint counters must contain the exact Phase 0 keys")
     normalized: dict[str, int] = {}
     for name, value in counters.items():
         if not isinstance(name, str) or not name:
             raise ValueError("counter names must be non-empty strings")
         _require_non_negative_integer(f"counter {name}", value)
         normalized[name] = int(value)
-    if not {"optimizer_steps", "batches_seen"} <= normalized.keys():
-        raise ValueError("checkpoint counters are incomplete")
     return normalized
 
 
 def _normalize_metrics(metrics: object) -> dict[str, float]:
-    if not isinstance(metrics, Mapping):
-        raise ValueError("last_metrics must be a mapping")
+    if not isinstance(metrics, Mapping) or set(metrics) != {
+        "loss",
+        "learning_rate",
+    }:
+        raise ValueError("checkpoint metrics must contain the exact Phase 0 keys")
     normalized: dict[str, float] = {}
     for name, value in metrics.items():
         if not isinstance(name, str) or not name:
@@ -1303,7 +1582,13 @@ def _normalize_metrics(metrics: object) -> dict[str, float]:
     return normalized
 
 
-def _validate_sidecar_integrity(sidecar: Mapping[str, object], path: Path) -> None:
+def _validate_sidecar_integrity(
+    sidecar: Mapping[str, object],
+    path: Path,
+    *,
+    byte_size: int,
+    sha256: str,
+) -> None:
     if set(sidecar) != _SIDECAR_KEYS:
         raise ValueError("checkpoint sidecar schema is invalid")
     if sidecar.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -1314,9 +1599,9 @@ def _validate_sidecar_integrity(sidecar: Mapping[str, object], path: Path) -> No
     _validate_sha256(sidecar.get("sha256"), "checkpoint sidecar")
     if sidecar["byte_size"] > PHASE0_MAX_CHECKPOINT_BYTES:
         raise ValueError("checkpoint exceeds the Phase 0 artifact size budget")
-    if sidecar.get("byte_size") != path.stat().st_size:
+    if sidecar.get("byte_size") != byte_size:
         raise ValueError("checkpoint byte size mismatch")
-    if sidecar.get("sha256") != _sha256(path):
+    if sidecar.get("sha256") != sha256:
         raise ValueError("checkpoint sha256 mismatch")
 
 
@@ -1334,19 +1619,23 @@ def _validate_sidecar_binding(
         raise ValueError("checkpoint sidecar manifest mismatch")
 
 
-def _preflight_archive(path: Path) -> None:
-    _validate_regular_file(path, "checkpoint artifact")
-    size = path.stat().st_size
+def _preflight_archive(handle: BinaryIO, size: int) -> None:
     if not 0 < size <= PHASE0_MAX_CHECKPOINT_BYTES:
         raise ValueError("checkpoint exceeds the Phase 0 artifact size budget")
-    expected_members = _preflight_zip_eocd(path, size)
+    expected_members = _preflight_zip_eocd(handle, size)
     try:
-        with zipfile.ZipFile(path) as archive:
+        handle.seek(0)
+        with zipfile.ZipFile(handle) as archive:
             members = archive.infolist()
+            if len(members) != expected_members:
+                raise ValueError("checkpoint archive member budget is invalid")
+            _validate_archive_members(members)
+            _preflight_pickle(archive, members)
     except (OSError, zipfile.BadZipFile) as error:
         raise ValueError("checkpoint artifact is not a valid ZIP archive") from error
-    if len(members) != expected_members:
-        raise ValueError("checkpoint archive member budget is invalid")
+
+
+def _validate_archive_members(members: list[zipfile.ZipInfo]) -> None:
     names: set[str] = set()
     uncompressed = 0
     for member in members:
@@ -1373,12 +1662,11 @@ def _preflight_archive(path: Path) -> None:
             raise ValueError("checkpoint archive exceeds the uncompressed budget")
 
 
-def _preflight_zip_eocd(path: Path, size: int) -> int:
+def _preflight_zip_eocd(handle: BinaryIO, size: int) -> int:
     tail_size = min(size, 22 + 65_535 + 76)
     try:
-        with path.open("rb") as handle:
-            handle.seek(size - tail_size)
-            tail = handle.read(tail_size)
+        handle.seek(size - tail_size)
+        tail = handle.read(tail_size)
     except OSError as error:
         raise ValueError("checkpoint ZIP trailer cannot be read") from error
     signature = b"PK\x05\x06"
@@ -1440,9 +1728,8 @@ def _preflight_zip_eocd(path: Path, size: int) -> int:
             raise ValueError("checkpoint ZIP64 compatibility trailer is inconsistent")
 
     try:
-        with path.open("rb") as handle:
-            handle.seek(central_offset)
-            central = handle.read(central_size)
+        handle.seek(central_offset)
+        central = handle.read(central_size)
     except OSError as error:
         raise ValueError("checkpoint ZIP central directory cannot be read") from error
     position = entries = 0
@@ -1459,6 +1746,233 @@ def _preflight_zip_eocd(path: Path, size: int) -> int:
     if position != len(central) or entries != total_entries:
         raise ValueError("checkpoint ZIP central-directory entry count is invalid")
     return total_entries
+
+
+class _BoundedPickleReader:
+    def __init__(self, handle: BinaryIO, size: int) -> None:
+        self._handle = handle
+        self._size = size
+        self._position = 0
+
+    def read(self, size: int) -> bytes:
+        if size < 0 or size > PHASE0_MAX_STRING_BYTES:
+            raise ValueError("checkpoint pickle argument exceeds the Phase 0 budget")
+        value = self._handle.read(size)
+        self._position += len(value)
+        if self._position > self._size:
+            raise ValueError("checkpoint pickle exceeds its declared size")
+        return value
+
+    def readline(self) -> bytes:
+        value = self._handle.readline(PHASE0_MAX_STRING_BYTES + 1)
+        self._position += len(value)
+        if len(value) > PHASE0_MAX_STRING_BYTES or self._position > self._size:
+            raise ValueError("checkpoint pickle line exceeds the Phase 0 budget")
+        return value
+
+    def tell(self) -> int:
+        return self._position
+
+
+def _preflight_pickle(
+    archive: zipfile.ZipFile, members: list[zipfile.ZipInfo]
+) -> None:
+    candidates = [
+        member
+        for member in members
+        if PurePosixPath(member.filename).name == "data.pkl"
+    ]
+    if len(candidates) != 1 or not 0 < candidates[0].file_size <= PHASE0_MAX_PICKLE_BYTES:
+        raise ValueError("checkpoint must contain one bounded data.pkl member")
+    info = candidates[0]
+    memo_count = mark_depth = string_bytes = persistent_ids = reduces = 0
+    opcodes = 0
+    globals_seen: set[str] = set()
+    mark_closers = {"APPENDS", "SETITEMS", "TUPLE"}
+    try:
+        with archive.open(info) as member:
+            reader = _BoundedPickleReader(member, info.file_size)
+            stopped = False
+            for opcode, argument, _ in pickletools.genops(reader):
+                opcodes += 1
+                name = opcode.name
+                if opcodes > PHASE0_MAX_PICKLE_OPCODES or name not in _PICKLE_OPCODES:
+                    raise ValueError("checkpoint pickle opcode budget is invalid")
+                if opcodes == 1 and (name != "PROTO" or argument != 2):
+                    raise ValueError("checkpoint pickle protocol must be exactly 2")
+                if name == "PROTO" and opcodes != 1:
+                    raise ValueError("checkpoint pickle contains a second protocol")
+                if name in {"BINPUT", "LONG_BINPUT"}:
+                    if argument != memo_count or memo_count >= PHASE0_MAX_PICKLE_MEMO:
+                        raise ValueError("checkpoint pickle memo is sparse or oversized")
+                    memo_count += 1
+                elif name in {"BINGET", "LONG_BINGET"} and (
+                    not isinstance(argument, int) or not 0 <= argument < memo_count
+                ):
+                    raise ValueError("checkpoint pickle memo reference is invalid")
+                if name == "MARK":
+                    mark_depth += 1
+                    if mark_depth > PHASE0_MAX_PICKLE_MARK_DEPTH:
+                        raise ValueError("checkpoint pickle nesting exceeds the Phase 0 budget")
+                elif name in mark_closers:
+                    mark_depth -= 1
+                    if mark_depth < 0:
+                        raise ValueError("checkpoint pickle MARK stack is invalid")
+                if name == "BINUNICODE":
+                    encoded_size = len(argument.encode("utf-8"))
+                    string_bytes += encoded_size
+                    if (
+                        encoded_size > PHASE0_MAX_STRING_BYTES
+                        or string_bytes > PHASE0_MAX_PICKLE_STRING_BYTES
+                    ):
+                        raise ValueError("checkpoint pickle strings exceed the Phase 0 budget")
+                elif name == "GLOBAL":
+                    if argument not in _PICKLE_GLOBALS or argument in globals_seen:
+                        raise ValueError(
+                            "checkpoint tensor dtype GLOBAL is not approved for Phase 0"
+                        )
+                    globals_seen.add(argument)
+                elif name == "BINPERSID":
+                    persistent_ids += 1
+                    if persistent_ids > PHASE0_MAX_TENSORS:
+                        raise ValueError("checkpoint pickle tensor references exceed the budget")
+                elif name == "REDUCE":
+                    reduces += 1
+                    if reduces > PHASE0_MAX_PICKLE_REDUCES:
+                        raise ValueError("checkpoint pickle reductions exceed the budget")
+                elif name in {"BININT", "BININT1", "BININT2", "LONG1"}:
+                    if not isinstance(argument, int) or argument.bit_length() > 64:
+                        raise ValueError("checkpoint pickle integer exceeds the Phase 0 budget")
+                elif name == "BINFLOAT" and not math.isfinite(argument):
+                    raise ValueError("checkpoint pickle float must be finite")
+                if name == "STOP":
+                    if mark_depth != 0 or reader.tell() != info.file_size:
+                        raise ValueError("checkpoint pickle has trailing or unclosed data")
+                    if reader.read(1) != b"":
+                        raise ValueError("checkpoint pickle has trailing data")
+                    stopped = True
+            if not stopped:
+                raise ValueError("checkpoint pickle STOP is missing")
+    except (EOFError, UnicodeError, ValueError) as error:
+        if isinstance(error, ValueError) and str(error).startswith("checkpoint "):
+            raise
+        raise ValueError("checkpoint pickle structure is invalid") from error
+
+
+@contextmanager
+def _open_stable_regular(
+    path: Path, label: str
+) -> Iterator[tuple[BinaryIO, os.stat_result]]:
+    _reject_symlink_hops(path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if os.name != "nt":
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{label} cannot be opened safely") from error
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            _reject_symlink_hops(path)
+            named = path.lstat()
+        except OSError as error:
+            raise ValueError(f"{label} identity cannot be inspected") from error
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(opened, named):
+            raise ValueError(f"{label} is not a stable regular file")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            yield handle, named
+            _recheck_open_identity(path, handle, opened, label)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _recheck_open_identity(
+    path: Path,
+    handle: BinaryIO,
+    expected: os.stat_result,
+    label: str,
+) -> None:
+    try:
+        opened = os.fstat(handle.fileno())
+        _reject_symlink_hops(path)
+        named = path.lstat()
+    except OSError as error:
+        raise ValueError(f"{label} identity cannot be rechecked") from error
+    if (
+        not os.path.samestat(expected, opened)
+        or not os.path.samestat(opened, named)
+        or _status_changed(expected, opened, include_ctime=True)
+        or _status_changed(expected, named)
+    ):
+        raise ValueError(f"{label} identity changed while being verified")
+
+
+def _recheck_regular_identity(
+    path: Path, expected: os.stat_result, label: str
+) -> None:
+    _reject_symlink_hops(path)
+    try:
+        observed = path.lstat()
+    except OSError as error:
+        raise ValueError(f"{label} identity cannot be rechecked") from error
+    if not stat.S_ISREG(observed.st_mode) or not os.path.samestat(
+        expected, observed
+    ) or _status_changed(expected, observed, include_ctime=True):
+        raise ValueError(f"{label} identity changed after verification")
+
+
+def _status_changed(
+    left: os.stat_result,
+    right: os.stat_result,
+    *,
+    include_ctime: bool = False,
+) -> bool:
+    names = ("st_size", "st_mtime_ns", "st_ctime_ns") if include_ctime else (
+        "st_size",
+        "st_mtime_ns",
+    )
+    return any(
+        getattr(left, name, None) != getattr(right, name, None)
+        for name in names
+    )
+
+
+@contextmanager
+def _snapshot_checkpoint(path: Path) -> Iterator[_CheckpointSnapshot]:
+    with _open_stable_regular(path, "checkpoint artifact") as (source, status):
+        size = status.st_size
+        if not 0 < size <= PHASE0_MAX_CHECKPOINT_BYTES:
+            raise ValueError("checkpoint exceeds the Phase 0 artifact size budget")
+        with tempfile.TemporaryFile(mode="w+b") as snapshot:
+            digest = _copy_checkpoint_snapshot(source, snapshot, size)
+            snapshot.seek(0)
+            yield _CheckpointSnapshot(snapshot, status, size, digest)
+
+
+def _copy_checkpoint_snapshot(
+    source: BinaryIO,
+    snapshot: BinaryIO,
+    expected_size: int,
+) -> str:
+    digest = hashlib.sha256()
+    copied = 0
+    while copied < expected_size:
+        chunk = source.read(min(1024 * 1024, expected_size - copied))
+        if not chunk:
+            raise ValueError("checkpoint changed while being snapshotted")
+        copied += len(chunk)
+        digest.update(chunk)
+        if snapshot.write(chunk) != len(chunk):
+            raise ValueError("checkpoint snapshot write was incomplete")
+    if source.read(1) != b"":
+        raise ValueError("checkpoint grew while being snapshotted")
+    snapshot.flush()
+    if snapshot.tell() != expected_size:
+        raise ValueError("checkpoint snapshot size is inconsistent")
+    return digest.hexdigest()
 
 
 def _validate_regular_file(path: Path, label: str) -> None:
@@ -1487,7 +2001,8 @@ def _reject_symlink_hops(path: Path) -> None:
             raise ValueError("checkpoint path components cannot be inspected") from error
         is_junction = getattr(candidate, "is_junction", None)
         if (
-            stat.S_ISLNK(status.st_mode)
+            candidate.is_symlink()
+            or stat.S_ISLNK(status.st_mode)
             or bool(
                 getattr(status, "st_file_attributes", 0)
                 & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -1511,19 +2026,105 @@ def _directory_entries(path: Path) -> list[Path]:
 
 
 def _load_payload(path: Path) -> dict[str, Any]:
+    return _load_payload_with_fingerprint(path)[0]
+
+
+def _load_payload_with_fingerprint(
+    path: Path,
+) -> tuple[dict[str, Any], int, str]:
+    with _snapshot_checkpoint(path) as snapshot:
+        return (
+            _load_payload_handle(snapshot.handle, snapshot.byte_size),
+            snapshot.byte_size,
+            snapshot.sha256,
+        )
+
+
+def _load_payload_handle(handle: BinaryIO, byte_size: int) -> dict[str, Any]:
     def cpu_only(storage: object, location: str) -> object:
         if location != "cpu":
             raise ValueError("Phase 0 checkpoints may contain only CPU tensors")
         return storage
 
-    _preflight_archive(path)
+    _preflight_archive(handle, byte_size)
     try:
-        payload = torch.load(path, map_location=cpu_only, weights_only=True)
+        handle.seek(0)
+        payload = torch.load(handle, map_location=cpu_only, weights_only=True)
     except Exception as error:
         raise ValueError("checkpoint artifact cannot be loaded safely") from error
     if not isinstance(payload, dict):
         raise ValueError("checkpoint payload must be a mapping")
     return payload
+
+
+def _verify_checkpoint_record(
+    path: Path,
+    *,
+    expected_manifests: Mapping[str, Mapping[str, object]] | None,
+    expected_lineage_id: str | None,
+    expected_manifest_hashes: Mapping[str, str] | None = None,
+) -> _VerifiedCheckpoint:
+    sidecar_path = path.with_suffix(".json")
+    sidecar, sidecar_status = _read_json_with_status(
+        sidecar_path, "checkpoint sidecar"
+    )
+    with _snapshot_checkpoint(path) as snapshot:
+        _validate_sidecar_integrity(
+            sidecar,
+            path,
+            byte_size=snapshot.byte_size,
+            sha256=snapshot.sha256,
+        )
+        payload = _load_payload_handle(snapshot.handle, snapshot.byte_size)
+        _validate_loaded_phase0(
+            payload,
+            expected_manifests=expected_manifests,
+            expected_lineage_id=expected_lineage_id,
+            expected_manifest_hashes=expected_manifest_hashes,
+        )
+        _validate_sidecar_binding(sidecar, path, payload)
+        source_status = snapshot.source_status
+    _recheck_regular_identity(sidecar_path, sidecar_status, "checkpoint sidecar")
+    return _VerifiedCheckpoint(
+        path=path,
+        payload=payload,
+        sidecar=sidecar,
+        source_status=source_status,
+        sidecar_status=sidecar_status,
+    )
+
+
+def _validate_loaded_phase0(
+    payload: Mapping[str, object],
+    *,
+    expected_manifests: Mapping[str, Mapping[str, object]] | None,
+    expected_lineage_id: str | None,
+    expected_manifest_hashes: Mapping[str, str] | None = None,
+) -> None:
+    _validate_payload(payload, expected_manifests=expected_manifests)
+    if (
+        expected_manifest_hashes is not None
+        and payload["manifest_hashes"] != expected_manifest_hashes
+    ):
+        raise ValueError("checkpoint strict manifest mismatch")
+    manifests = _normalize_manifests(payload["semantic_manifests"])
+    model, optimizer, scheduler = _build_phase0_validation_components(manifests)
+    _validate_phase0_resumability(model, optimizer, scheduler, payload, manifests)
+    if expected_lineage_id is not None:
+        _require_non_empty_string("expected_lineage_id", expected_lineage_id)
+        if payload["lineage_id"] != expected_lineage_id:
+            raise ValueError("checkpoint lineage mismatch")
+
+
+def _recheck_verified_checkpoint(verified: _VerifiedCheckpoint) -> None:
+    _recheck_regular_identity(
+        verified.path, verified.source_status, "checkpoint artifact"
+    )
+    _recheck_regular_identity(
+        verified.path.with_suffix(".json"),
+        verified.sidecar_status,
+        "checkpoint sidecar",
+    )
 
 
 def _resolve_checkpoint(
@@ -1532,7 +2133,7 @@ def _resolve_checkpoint(
     auto: bool,
     expected_manifests: Mapping[str, Mapping[str, object]],
     expected_lineage_id: str | None,
-) -> tuple[Path, dict[str, Any], str]:
+) -> _VerifiedCheckpoint:
     checkpoint_dir = source / "checkpoints" if auto else source.parent
     _validate_checkpoint_dir(checkpoint_dir)
     run_metadata = _read_run_metadata(checkpoint_dir)
@@ -1545,12 +2146,11 @@ def _resolve_checkpoint(
         if lineage_id != expected_lineage_id:
             raise ValueError("run metadata lineage mismatch")
     if not auto:
-        payload = verify_checkpoint(
+        return _verify_checkpoint_record(
             source,
             expected_manifests=expected_manifests,
             expected_lineage_id=lineage_id,
         )
-        return source, payload, lineage_id
 
     pointer_path = checkpoint_dir / "latest.json"
     if os.path.lexists(pointer_path):
@@ -1559,23 +2159,34 @@ def _resolve_checkpoint(
         pointer = _read_json(pointer_path, "latest pointer")
         _validate_pointer_document(pointer, run_metadata)
     except ValueError:
-        checkpoint_path, payload = _scan_compatible_checkpoints(
+        verified = _scan_compatible_checkpoints(
             checkpoint_dir,
             expected_manifests=expected_manifests,
             lineage_id=lineage_id,
         )
-        return checkpoint_path, payload, lineage_id
+        repaired = {**verified.sidecar, "sidecar": verified.path.with_suffix(".json").name}
+        _validate_pointer_document(repaired, run_metadata)
+        _validate_pointer_target(
+            repaired, verified.payload, verified.sidecar
+        )
+        _recheck_verified_checkpoint(verified)
+        _atomic_write_json(pointer_path, repaired)
+        if _read_json(pointer_path, "latest pointer") != repaired:
+            raise ValueError("repaired latest pointer did not reopen exactly")
+        return verified
     _recover_pruning(checkpoint_dir, pointer, run_metadata)
     _recover_invalid_tombstones(checkpoint_dir, pointer, run_metadata)
     checkpoint_path = checkpoint_dir / pointer["checkpoint"]
     _require_contained(checkpoint_dir, checkpoint_path)
-    payload = verify_checkpoint(
+    verified = _verify_checkpoint_record(
         checkpoint_path,
         expected_manifests=expected_manifests,
         expected_lineage_id=lineage_id,
     )
-    _validate_pointer_target(pointer, checkpoint_path, payload)
-    return checkpoint_path, payload, lineage_id
+    _validate_pointer_target(
+        pointer, verified.payload, verified.sidecar
+    )
+    return verified
 
 
 def _validate_previous_pointer(path: Path, lineage_id: str, step: int) -> None:
@@ -1588,11 +2199,15 @@ def _validate_previous_pointer(path: Path, lineage_id: str, step: int) -> None:
     _recover_pruning(path.parent, pointer, run_metadata)
     _recover_invalid_tombstones(path.parent, pointer, run_metadata)
     checkpoint_path = path.parent / pointer["checkpoint"]
-    payload = verify_checkpoint(
+    verified = _verify_checkpoint_record(
         checkpoint_path,
+        expected_manifests=None,
         expected_lineage_id=lineage_id,
+        expected_manifest_hashes=run_metadata["manifest_hashes"],
     )
-    _validate_pointer_target(pointer, checkpoint_path, payload)
+    _validate_pointer_target(
+        pointer, verified.payload, verified.sidecar
+    )
     if pointer["step"] > step:
         raise ValueError("new checkpoint step must advance the lineage")
 
@@ -1648,9 +2263,10 @@ def _validate_pointer_document(
 
 
 def _validate_pointer_target(
-    pointer: Mapping[str, object], path: Path, payload: Mapping[str, object]
+    pointer: Mapping[str, object],
+    payload: Mapping[str, object],
+    sidecar: Mapping[str, object],
 ) -> None:
-    sidecar = _read_json(path.with_suffix(".json"), "checkpoint sidecar")
     if any(pointer[name] != sidecar[name] for name in _SIDECAR_KEYS):
         raise ValueError("latest pointer does not match its sidecar")
     if (
@@ -1666,7 +2282,7 @@ def _scan_compatible_checkpoints(
     *,
     expected_manifests: Mapping[str, Mapping[str, object]],
     lineage_id: str,
-) -> tuple[Path, dict[str, Any]]:
+) -> _VerifiedCheckpoint:
     candidates = [
         (step, path)
         for step, path in _bounded_checkpoint_candidates(checkpoint_dir)
@@ -1675,14 +2291,14 @@ def _scan_compatible_checkpoints(
     for _, candidate in sorted(candidates, reverse=True):
         try:
             _require_contained(checkpoint_dir, candidate)
-            payload = verify_checkpoint(
+            verified = _verify_checkpoint_record(
                 candidate,
                 expected_manifests=expected_manifests,
                 expected_lineage_id=lineage_id,
             )
         except ValueError:
             continue
-        return candidate, payload
+        return verified
     raise ValueError("no valid immutable checkpoint matches the trusted run metadata")
 
 
@@ -1802,8 +2418,10 @@ def _recover_invalid_tombstones(
     if referenced:
         assert pointer is not None
         checkpoint_path = checkpoint_dir / str(pointer["checkpoint"])
-        payload = _verify_against_run(checkpoint_path, run_metadata)
-        _validate_pointer_target(pointer, checkpoint_path, payload)
+        verified = _verify_against_run(checkpoint_path, run_metadata)
+        _validate_pointer_target(
+            pointer, verified.payload, verified.sidecar
+        )
         for tombstone in referenced:
             tombstone.unlink(missing_ok=True)
             _fsync_directory(checkpoint_dir)
@@ -1910,19 +2528,36 @@ def _same_checkpoint_state(
     )
 
 
-def _prune_validated(checkpoint_dir: Path, keep: int) -> None:
+def _prune_validated(
+    checkpoint_dir: Path,
+    keep: int,
+    *,
+    pointer_record: _VerifiedCheckpoint | None = None,
+) -> None:
     run_metadata = _read_run_metadata(checkpoint_dir)
     pointer = _read_json(checkpoint_dir / "latest.json", "latest pointer")
     _validate_pointer_document(pointer, run_metadata)
     _recover_pruning(checkpoint_dir, pointer, run_metadata)
     _recover_invalid_tombstones(checkpoint_dir, pointer, run_metadata)
     pointer_path = checkpoint_dir / pointer["checkpoint"]
-    pointer_payload = _verify_against_run(pointer_path, run_metadata)
-    _validate_pointer_target(pointer, pointer_path, pointer_payload)
+    if pointer_record is None:
+        pointer_record = _verify_against_run(pointer_path, run_metadata)
+    else:
+        _recheck_verified_checkpoint(pointer_record)
+        if (
+            pointer_record.path != pointer_path
+            or pointer_record.payload["lineage_id"] != run_metadata["lineage_id"]
+            or pointer_record.payload["manifest_hashes"]
+            != run_metadata["manifest_hashes"]
+        ):
+            raise ValueError("provided pointer checkpoint conflicts with the run")
+    _validate_pointer_target(
+        pointer, pointer_record.payload, pointer_record.sidecar
+    )
 
     compatible: list[tuple[int, Path]] = []
     for step, candidate in _bounded_checkpoint_candidates(checkpoint_dir):
-        if _has_pruning_material(candidate):
+        if candidate == pointer_path or _has_pruning_material(candidate):
             continue
         try:
             _verify_against_run(candidate, run_metadata)
@@ -1930,7 +2565,7 @@ def _prune_validated(checkpoint_dir: Path, keep: int) -> None:
             continue
         compatible.append((step, candidate))
     compatible.sort(reverse=True)
-    retained = {path.name for _, path in compatible[:keep]}
+    retained = {path.name for _, path in compatible[: max(0, keep - 1)]}
     retained.add(pointer["checkpoint"])
     for _, candidate in compatible:
         if candidate.name not in retained:
@@ -1939,14 +2574,14 @@ def _prune_validated(checkpoint_dir: Path, keep: int) -> None:
 
 def _verify_against_run(
     candidate: Path, run_metadata: Mapping[str, object]
-) -> dict[str, Any]:
-    payload = verify_checkpoint(
+) -> _VerifiedCheckpoint:
+    verified = _verify_checkpoint_record(
         candidate,
+        expected_manifests=None,
         expected_lineage_id=run_metadata["lineage_id"],
+        expected_manifest_hashes=run_metadata["manifest_hashes"],
     )
-    if payload["manifest_hashes"] != run_metadata["manifest_hashes"]:
-        raise ValueError("checkpoint is incompatible with the trusted run metadata")
-    return payload
+    return verified
 
 
 def _prune_pair(checkpoint_path: Path) -> None:
@@ -2002,8 +2637,10 @@ def _recover_pruning(
         if checkpoint_path.name == pointer["checkpoint"]:
             _restore_tombstone(checkpoint_path, checkpoint_tombstone)
             _restore_tombstone(sidecar_path, sidecar_tombstone)
-            payload = _verify_against_run(checkpoint_path, run_metadata)
-            _validate_pointer_target(pointer, checkpoint_path, payload)
+            verified = _verify_against_run(checkpoint_path, run_metadata)
+            _validate_pointer_target(
+                pointer, verified.payload, verified.sidecar
+            )
         else:
             sidecar_path.unlink(missing_ok=True)
             checkpoint_path.unlink(missing_ok=True)
@@ -2038,30 +2675,32 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
-    _validate_regular_file(path, label)
+    return _read_json_with_status(path, label)[0]
+
+
+def _read_json_with_status(
+    path: Path, label: str
+) -> tuple[dict[str, Any], os.stat_result]:
     try:
-        size = path.stat().st_size
-        if not 0 < size <= PHASE0_MAX_CONTROL_JSON_BYTES:
-            raise ValueError(f"{label} exceeds the Phase 0 JSON size budget")
-        encoded = path.read_bytes()
-        if len(encoded) != size:
-            raise ValueError(f"{label} changed while being read")
+        with _open_stable_regular(path, label) as (handle, status):
+            size = status.st_size
+            if not 0 < size <= PHASE0_MAX_CONTROL_JSON_BYTES:
+                raise ValueError(f"{label} exceeds the Phase 0 JSON size budget")
+            encoded = handle.read(size)
+            if len(encoded) != size or handle.read(1) != b"":
+                raise ValueError(f"{label} changed while being read")
         value = json.loads(encoded.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError(f"{label} cannot be read") from error
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
     _validate_state_tree(value)
-    return value
+    return value, status
 
 
 def _sha256(path: Path) -> str:
-    _validate_regular_file(path, "checkpoint file")
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with _snapshot_checkpoint(path) as snapshot:
+        return snapshot.sha256
 
 
 def _fsync_directory(path: Path) -> None:

@@ -9,6 +9,7 @@ from moira.synthetic import (
     SYNTHETIC_CURSOR_KIND,
     DataCursor,
     SyntheticStream,
+    _splitmix64,
 )
 
 
@@ -229,6 +230,38 @@ def test_splitmix64_address_boundaries_are_explicit() -> None:
         stream.sample(split=1 << 64, index=0)
     with pytest.raises(ValueError, match="index"):
         stream.sample(split=0, index=1 << 64)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (0, 0xE220A8397B1DCDAF),
+        (1, 0x910A2DEC89025CC1),
+        ((1 << 64) - 1, 0xE4D971771B652C20),
+    ),
+)
+def test_splitmix64_known_answer_vectors(value: int, expected: int) -> None:
+    assert _splitmix64(value) == expected
+
+
+def test_consuming_the_maximum_address_returns_only_the_exhausted_sentinel() -> None:
+    maximum = (1 << 64) - 1
+    stream = SyntheticStream(seed=1, vocab_size=8, sequence_length=4)
+    cursor = DataCursor(
+        SYNTHETIC_CURSOR_KIND,
+        maximum,
+        maximum,
+        maximum * stream.sequence_length,
+    )
+
+    batch, exhausted = stream.batch(split=0, cursor=cursor, batch_size=1)
+
+    assert batch.start_index == maximum
+    assert exhausted.next_sample_index == 1 << 64
+    with pytest.raises(ValueError, match="address"):
+        stream.batch(split=0, cursor=exhausted, batch_size=1)
+    with pytest.raises(ValueError, match="cursor"):
+        DataCursor(SYNTHETIC_CURSOR_KIND, (1 << 64) + 1, (1 << 64) + 1, 0)
 
 
 def test_batch_address_overflow_fails_before_sample_generation(

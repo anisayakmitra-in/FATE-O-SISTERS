@@ -20,7 +20,12 @@ from torch.nn import functional as F
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
-from .checkpoint import checkpoint_run_lock, load_checkpoint, save_checkpoint
+from .checkpoint import (
+    _phase0_schedule_lambda,
+    checkpoint_run_lock,
+    load_checkpoint,
+    save_checkpoint,
+)
 from .config import TrainingConfig
 from .masks import CognitiveMode
 from .model import MoiraModel
@@ -262,19 +267,12 @@ def _build_components(
     )
     scheduler = LambdaLR(
         optimizer,
-        lr_lambda=lambda step: _learning_rate_factor(config, step),
+        lr_lambda=_phase0_schedule_lambda(
+            config.optimization.warmup_steps,
+            config.optimization.schedule_total_steps,
+        ),
     )
     return model, optimizer, scheduler
-
-
-def _learning_rate_factor(config: TrainingConfig, step: int) -> float:
-    warmup = config.optimization.warmup_steps
-    total = config.optimization.schedule_total_steps
-    if warmup and step < warmup:
-        return float(step + 1) / warmup
-    progress = (step - warmup) / max(1, total - warmup)
-    progress = min(max(progress, 0.0), 1.0)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def _masked_next_token_loss(

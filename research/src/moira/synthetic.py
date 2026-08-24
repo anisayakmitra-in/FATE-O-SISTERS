@@ -31,6 +31,8 @@ class SyntheticBatch:
 
 @dataclass(frozen=True, slots=True)
 class DataCursor:
+    """Stream position; ``2**64`` is the exhausted one-past-end sentinel."""
+
     kind: str
     next_sample_index: int
     samples_seen: int
@@ -47,6 +49,8 @@ class DataCursor:
             _require_non_negative_integer(f"cursor {name}", value)
         if self.next_sample_index != self.samples_seen:
             raise ValueError("cursor sample counters must agree")
+        if self.next_sample_index > _UINT64_MASK + 1:
+            raise ValueError("cursor sample address exceeds the 64-bit stream domain")
 
 
 class SyntheticStream:

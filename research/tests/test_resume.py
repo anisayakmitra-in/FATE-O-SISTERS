@@ -203,6 +203,67 @@ def test_interrupted_resume_is_exact_with_dropout_optimizer_scheduler_and_rng(
     assert uninterrupted_cursor == resumed_cursor
 
 
+def test_damaged_pointer_auto_resume_repairs_and_continues_exactly(
+    run_root: Path,
+) -> None:
+    config = _config()
+    baseline = train_until(config, run_root / "pointer-baseline", stop_at_step=3)
+    interrupted = train_until(config, run_root / "pointer-repair", stop_at_step=1)
+    latest_path = interrupted.checkpoint_path.parent / "latest.json"
+    latest_path.write_text("damaged-pointer", encoding="utf-8")
+
+    resumed = train_until(
+        config,
+        run_root / "pointer-repair",
+        stop_at_step=3,
+        resume="auto",
+    )
+
+    pointer = json.loads(latest_path.read_text(encoding="utf-8"))
+    assert pointer["step"] == resumed.global_step == 3
+    assert resumed.losses == baseline.losses[1:]
+    assert resumed.data_cursor == baseline.data_cursor
+    _assert_nested_equal(resumed.model.state_dict(), baseline.model.state_dict())
+    _assert_nested_equal(
+        resumed.optimizer.state_dict(), baseline.optimizer.state_dict()
+    )
+    _assert_nested_equal(
+        resumed.scheduler.state_dict(), baseline.scheduler.state_dict()
+    )
+
+
+def test_equal_step_resume_does_not_publish_or_advance_state(run_root: Path) -> None:
+    config = _config()
+    first = train_until(config, run_root / "equal-step", stop_at_step=1)
+    checkpoint_before = first.checkpoint_path.read_bytes()
+    pointer_path = first.checkpoint_path.parent / "latest.json"
+    pointer_before = pointer_path.read_bytes()
+    entries_before = sorted(path.name for path in pointer_path.parent.iterdir())
+
+    resumed = train_until(
+        config,
+        run_root / "equal-step",
+        stop_at_step=1,
+        resume="auto",
+    )
+
+    assert resumed.global_step == 1
+    assert resumed.losses == ()
+    assert resumed.data_cursor == first.data_cursor
+    assert resumed.counters == first.counters
+    _assert_nested_equal(resumed.model.state_dict(), first.model.state_dict())
+    _assert_nested_equal(
+        resumed.optimizer.state_dict(), first.optimizer.state_dict()
+    )
+    _assert_nested_equal(
+        resumed.scheduler.state_dict(), first.scheduler.state_dict()
+    )
+    assert resumed.checkpoint_path == first.checkpoint_path
+    assert resumed.checkpoint_path.read_bytes() == checkpoint_before
+    assert pointer_path.read_bytes() == pointer_before
+    assert sorted(path.name for path in pointer_path.parent.iterdir()) == entries_before
+
+
 def test_run_lock_covers_resume_training_and_pointer_publication(
     run_root: Path,
 ) -> None:
