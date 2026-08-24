@@ -57,6 +57,8 @@ class CapabilityCapsule:
 
         _require_floating_matrix("latent", self.latent)
         slots, width = self.latent.shape
+        if slots <= 0:
+            raise ValueError("latent slots must be nonempty")
         if width != expected_width:
             raise ValueError("latent width does not match expected_width")
         _require_int64_vector("slot_type_ids", self.slot_type_ids, slots)
@@ -68,7 +70,7 @@ class CapabilityCapsule:
         _require_same_device(self.latent, self.slot_type_ids, self.uncertainty)
         if self.coordinates is not None:
             _require_floating_matrix("coordinates", self.coordinates)
-            if self.coordinates.shape[0] != slots:
+            if self.coordinates.shape[0] != slots or self.coordinates.shape[1] <= 0:
                 raise ValueError("coordinates slots must match latent slots")
             _require_same_device(self.latent, self.coordinates)
 
@@ -85,7 +87,7 @@ def validate_capsule(
     if not isinstance(capsule, CapabilityCapsule):
         raise ValueError("capsule must be a CapabilityCapsule")
     _require_nonempty("expected_task_id", expected_task_id)
-    if not allowed_scope_ids:
+    if isinstance(allowed_scope_ids, (str, bytes)) or not allowed_scope_ids:
         raise ValueError("allowed_scope_ids must be nonempty")
     if any(not isinstance(scope_id, str) or not scope_id.strip() for scope_id in allowed_scope_ids):
         raise ValueError("allowed_scope_ids must contain nonempty strings")

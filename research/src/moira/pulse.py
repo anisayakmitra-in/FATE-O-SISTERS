@@ -65,6 +65,9 @@ class Pulse(nn.Module):
             raise ValueError("device must be a torch.device")
         if not torch.empty((), dtype=dtype).is_floating_point():
             raise ValueError("dtype must be floating")
+        parameter = next(self.parameters())
+        if device != parameter.device or dtype != parameter.dtype:
+            raise ValueError("initial state must match Pulse device and dtype")
         return PulseState(
             fast=torch.zeros((batch_size, len(FAST_AXES)), device=device, dtype=dtype),
             slow=torch.zeros((batch_size, len(SLOW_AXES)), device=device, dtype=dtype),

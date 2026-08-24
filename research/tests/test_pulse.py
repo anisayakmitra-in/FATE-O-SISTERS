@@ -26,6 +26,18 @@ def test_pulse_exposes_the_fixed_affect_axes_and_zero_initial_state() -> None:
     assert torch.equal(state.slow, torch.zeros((2, 6)))
 
 
+@pytest.mark.parametrize(
+    ("device", "dtype"),
+    [(torch.device("cpu"), torch.float64), (torch.device("meta"), torch.float32)],
+)
+def test_initial_state_rejects_device_or_dtype_outside_pulse_parameters(
+    device: torch.device, dtype: torch.dtype
+) -> None:
+    """Catches state allocation that later cannot enter Pulse's learned layers."""
+    with pytest.raises(ValueError, match="Pulse device and dtype"):
+        Pulse(d_model=4).initial_state(2, device=device, dtype=dtype)
+
+
 def test_appraise_returns_bounded_fast_values_on_the_summary_device_and_dtype() -> None:
     """Catches an appraisal path that leaks outside fast-state bounds."""
     pulse = Pulse(d_model=4)
@@ -158,3 +170,31 @@ def test_pulse_rejects_invalid_decay_configuration() -> None:
         Pulse(d_model=4, fast_decay=1.1)
     with pytest.raises(ValueError, match="decay"):
         Pulse(d_model=4, slow_decay=-0.1)
+
+
+def test_pulse_path_backpropagates_through_every_parameter_without_mutating_inputs() -> None:
+    """Catches a disconnected Pulse parameter or in-place mutation of caller state."""
+    torch.manual_seed(19)
+    pulse = Pulse(d_model=4)
+    state = pulse.initial_state(2, device=torch.device("cpu"), dtype=torch.float32)
+    summary = torch.randn((2, 4), requires_grad=True)
+    hidden = torch.randn((2, 3, 4), requires_grad=True)
+    mask = torch.tensor([True, True])
+    state_before = (state.fast.clone(), state.slow.clone())
+    input_before = (summary.detach().clone(), hidden.detach().clone())
+    versions = (state.fast._version, state.slow._version, summary._version, hidden._version)
+
+    appraisal = pulse.appraise(summary)
+    next_state = pulse.step(state, appraisal, update_mask=mask)
+    output = pulse.modulate(hidden, next_state)
+    output.square().mean().backward()
+
+    for name, parameter in pulse.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert torch.count_nonzero(parameter.grad) > 0, name
+    assert torch.equal(state.fast, state_before[0])
+    assert torch.equal(state.slow, state_before[1])
+    assert torch.equal(summary.detach(), input_before[0])
+    assert torch.equal(hidden.detach(), input_before[1])
+    assert (state.fast._version, state.slow._version, summary._version, hidden._version) == versions
