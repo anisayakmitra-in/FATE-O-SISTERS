@@ -51,7 +51,7 @@ def test_initial_state_canonicalizes_the_cpu_alias_before_matching_parameters() 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_initial_state_canonicalizes_the_cuda_alias_before_matching_parameters() -> None:
     """Catches rejecting cuda when its allocation resolves to the module's cuda:0."""
-    pulse = Pulse(d_model=4).to(device=torch.device("cuda:0"))
+    pulse = Pulse(d_model=4).to(device=torch.device("cuda"))
 
     state = pulse.initial_state(2, device=torch.device("cuda"), dtype=torch.float32)
 
