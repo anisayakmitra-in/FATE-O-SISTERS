@@ -9,3 +9,9 @@
 .DS_Store
 Thumbs.db
 
+.venv/
+__pycache__/
+.pytest_cache/
+research/runs/
+*.pt
+*.pt.tmp
