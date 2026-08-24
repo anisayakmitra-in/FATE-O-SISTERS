@@ -52,8 +52,10 @@ class CapabilityCapsule:
             raise ValueError("n_slot_types must be positive")
         if expected_task_id is not None and self.task_id != expected_task_id:
             raise ValueError("task_id does not match the expected task")
-        if allowed_scope_ids is not None and self.scope_id not in allowed_scope_ids:
-            raise ValueError("scope_id is not allowed")
+        if allowed_scope_ids is not None:
+            _validate_allowed_scope_ids(allowed_scope_ids)
+            if self.scope_id not in allowed_scope_ids:
+                raise ValueError("scope_id is not allowed")
 
         _require_floating_matrix("latent", self.latent)
         slots, width = self.latent.shape
@@ -87,10 +89,7 @@ def validate_capsule(
     if not isinstance(capsule, CapabilityCapsule):
         raise ValueError("capsule must be a CapabilityCapsule")
     _require_nonempty("expected_task_id", expected_task_id)
-    if isinstance(allowed_scope_ids, (str, bytes)) or not allowed_scope_ids:
-        raise ValueError("allowed_scope_ids must be nonempty")
-    if any(not isinstance(scope_id, str) or not scope_id.strip() for scope_id in allowed_scope_ids):
-        raise ValueError("allowed_scope_ids must contain nonempty strings")
+    _validate_allowed_scope_ids(allowed_scope_ids)
     capsule.validate(
         expected_task_id=expected_task_id,
         allowed_scope_ids=allowed_scope_ids,
@@ -115,6 +114,13 @@ def capsule_digest(capsule: CapabilityCapsule) -> str:
 def _require_nonempty(name: str, value: object) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a nonempty string")
+
+
+def _validate_allowed_scope_ids(allowed_scope_ids: Collection[str]) -> None:
+    if isinstance(allowed_scope_ids, (str, bytes)) or not allowed_scope_ids:
+        raise ValueError("allowed_scope_ids must be a nonempty collection")
+    if any(not isinstance(scope_id, str) or not scope_id.strip() for scope_id in allowed_scope_ids):
+        raise ValueError("allowed_scope_ids must contain nonempty strings")
 
 
 def _require_tensor(name: str, value: object) -> Tensor:

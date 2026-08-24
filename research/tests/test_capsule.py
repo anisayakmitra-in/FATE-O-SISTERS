@@ -80,7 +80,9 @@ def test_capsule_rejects_task_and_scope_outside_the_call_contract() -> None:
         )
 
 
-@pytest.mark.parametrize("allowed_scope_ids", ["owner:anis", b"owner:anis"])
+@pytest.mark.parametrize(
+    "allowed_scope_ids", ["prefix-owner:anis-suffix", b"owner:anis"]
+)
 def test_capsule_rejects_string_like_scope_allowlists(
     allowed_scope_ids: object,
 ) -> None:
@@ -92,6 +94,21 @@ def test_capsule_rejects_string_like_scope_allowlists(
             allowed_scope_ids=allowed_scope_ids,  # type: ignore[arg-type]
             expected_width=3,
             n_slot_types=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "allowed_scope_ids", ["prefix-owner:anis-suffix", b"owner:anis"]
+)
+def test_capsule_direct_validation_rejects_string_like_scope_allowlists(
+    allowed_scope_ids: object,
+) -> None:
+    """Catches direct validation bypassing the wrapper's scope allowlist guard."""
+    with pytest.raises(ValueError, match="allowed_scope_ids"):
+        make_capsule().validate(
+            expected_width=3,
+            n_slot_types=3,
+            allowed_scope_ids=allowed_scope_ids,  # type: ignore[arg-type]
         )
 
 
@@ -230,6 +247,23 @@ def test_capsule_digest_is_equal_for_noncontiguous_equal_values_and_bfloat16() -
     )
     assert capsule_digest(bfloat) == capsule_digest(
         replace(bfloat, latent=bfloat.latent.clone())
+    )
+
+
+def test_capsule_digest_includes_tensor_dtype_and_shape_descriptors() -> None:
+    """Catches equal storage bytes masking a changed tensor dtype or shape."""
+    capsule = make_capsule()
+    changed_dtype = capsule.latent.view(torch.int32)
+    changed_shape = capsule.latent.reshape(3, 2)
+
+    assert changed_dtype.element_size() == capsule.latent.element_size()
+    assert changed_dtype.numel() == capsule.latent.numel()
+    assert changed_shape.numel() == capsule.latent.numel()
+    assert capsule_digest(capsule) != capsule_digest(
+        replace(capsule, latent=changed_dtype)
+    )
+    assert capsule_digest(capsule) != capsule_digest(
+        replace(capsule, latent=changed_shape)
     )
 
 

@@ -38,6 +38,35 @@ def test_initial_state_rejects_device_or_dtype_outside_pulse_parameters(
         Pulse(d_model=4).initial_state(2, device=device, dtype=dtype)
 
 
+def test_initial_state_canonicalizes_the_cpu_alias_before_matching_parameters() -> None:
+    """Catches rejecting cpu:0 even though allocation canonicalizes it to CPU."""
+    pulse = Pulse(d_model=4)
+
+    state = pulse.initial_state(2, device=torch.device("cpu:0"), dtype=torch.float32)
+
+    assert state.fast.device == next(pulse.parameters()).device
+    assert state.slow.device == next(pulse.parameters()).device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_initial_state_canonicalizes_the_cuda_alias_before_matching_parameters() -> None:
+    """Catches rejecting cuda when its allocation resolves to the module's cuda:0."""
+    pulse = Pulse(d_model=4).to(device=torch.device("cuda:0"))
+
+    state = pulse.initial_state(2, device=torch.device("cuda"), dtype=torch.float32)
+
+    assert state.fast.device == next(pulse.parameters()).device
+    assert state.slow.device == next(pulse.parameters()).device
+
+
+def test_initial_state_rejects_a_dtype_that_is_not_a_torch_dtype() -> None:
+    """Catches a low-level allocation TypeError escaping Pulse's public boundary."""
+    with pytest.raises(ValueError, match="dtype"):
+        Pulse(d_model=4).initial_state(
+            2, device=torch.device("cpu"), dtype="float32"  # type: ignore[arg-type]
+        )
+
+
 def test_appraise_returns_bounded_fast_values_on_the_summary_device_and_dtype() -> None:
     """Catches an appraisal path that leaks outside fast-state bounds."""
     pulse = Pulse(d_model=4)
@@ -182,9 +211,18 @@ def test_pulse_path_backpropagates_through_every_parameter_without_mutating_inpu
     mask = torch.tensor([True, True])
     state_before = (state.fast.clone(), state.slow.clone())
     input_before = (summary.detach().clone(), hidden.detach().clone())
-    versions = (state.fast._version, state.slow._version, summary._version, hidden._version)
 
     appraisal = pulse.appraise(summary)
+    appraisal_before = appraisal.detach().clone()
+    mask_before = mask.clone()
+    versions = (
+        state.fast._version,
+        state.slow._version,
+        summary._version,
+        hidden._version,
+        appraisal._version,
+        mask._version,
+    )
     next_state = pulse.step(state, appraisal, update_mask=mask)
     output = pulse.modulate(hidden, next_state)
     output.square().mean().backward()
@@ -197,4 +235,13 @@ def test_pulse_path_backpropagates_through_every_parameter_without_mutating_inpu
     assert torch.equal(state.slow, state_before[1])
     assert torch.equal(summary.detach(), input_before[0])
     assert torch.equal(hidden.detach(), input_before[1])
-    assert (state.fast._version, state.slow._version, summary._version, hidden._version) == versions
+    assert torch.equal(appraisal.detach(), appraisal_before)
+    assert torch.equal(mask, mask_before)
+    assert (
+        state.fast._version,
+        state.slow._version,
+        summary._version,
+        hidden._version,
+        appraisal._version,
+        mask._version,
+    ) == versions

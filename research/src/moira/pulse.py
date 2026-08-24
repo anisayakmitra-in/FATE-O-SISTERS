@@ -63,14 +63,15 @@ class Pulse(nn.Module):
             raise ValueError("batch_size must be positive")
         if not isinstance(device, torch.device):
             raise ValueError("device must be a torch.device")
-        if not torch.empty((), dtype=dtype).is_floating_point():
+        if not isinstance(dtype, torch.dtype) or not torch.empty((), dtype=dtype).is_floating_point():
             raise ValueError("dtype must be floating")
+        allocated = torch.empty((0,), device=device, dtype=dtype)
         parameter = next(self.parameters())
-        if device != parameter.device or dtype != parameter.dtype:
+        if allocated.device != parameter.device or allocated.dtype != parameter.dtype:
             raise ValueError("initial state must match Pulse device and dtype")
         return PulseState(
-            fast=torch.zeros((batch_size, len(FAST_AXES)), device=device, dtype=dtype),
-            slow=torch.zeros((batch_size, len(SLOW_AXES)), device=device, dtype=dtype),
+            fast=torch.zeros((batch_size, len(FAST_AXES)), device=allocated.device, dtype=dtype),
+            slow=torch.zeros((batch_size, len(SLOW_AXES)), device=allocated.device, dtype=dtype),
         )
 
     def appraise(self, summary: Tensor) -> Tensor:
