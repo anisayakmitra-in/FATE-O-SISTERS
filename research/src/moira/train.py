@@ -71,6 +71,7 @@ def train_until(
     model, optimizer, scheduler = _build_components(config)
     scaler = None
     manifests = _semantic_manifests(config)
+    provenance = {"git": _git_provenance()}
     ledger = model.parameter_ledger()
     stream = SyntheticStream(
         config.data.seed,
@@ -149,6 +150,7 @@ def train_until(
                 scaler=scaler,
                 data_cursor=cursor,
                 semantic_manifests=manifests,
+                provenance=provenance,
                 parameter_ledger=ledger,
                 counters=counters,
                 last_metrics={
@@ -198,7 +200,7 @@ def evaluate_smoke(
     cursor = DataCursor(SYNTHETIC_CURSOR_KIND, 0, 0, 0)
     weighted_loss = 0.0
     token_count = 0
-    was_training = model.training
+    module_modes = tuple((module, module.training) for module in model.modules())
     model.eval()
     try:
         with torch.no_grad():
@@ -212,11 +214,15 @@ def evaluate_smoke(
                 loss = _masked_next_token_loss(
                     output.logits, batch.targets, batch.loss_mask
                 )
+                loss_value = float(loss.item())
+                if not math.isfinite(loss_value):
+                    raise ValueError("evaluation loss became non-finite")
                 current_tokens = int(batch.loss_mask.sum().item())
-                weighted_loss += float(loss.item()) * current_tokens
+                weighted_loss += loss_value * current_tokens
                 token_count += current_tokens
     finally:
-        model.train(was_training)
+        for module, training in module_modes:
+            module.training = training
     return EvaluationResult(
         loss=weighted_loss / token_count,
         batches=batches,
@@ -299,11 +305,14 @@ def _semantic_manifests(config: TrainingConfig) -> dict[str, dict[str, Any]]:
 
 def _source_manifest() -> dict[str, Any]:
     package_dir = Path(__file__).resolve().parent
-    repository = package_dir.parents[2]
-    files = {
+    return {
         f"research/src/moira/{path.name}": _file_sha256(path)
         for path in sorted(package_dir.glob("*.py"), key=lambda item: item.name)
     }
+
+
+def _git_provenance() -> dict[str, Any]:
+    repository = Path(__file__).resolve().parent.parents[2]
     try:
         revision = subprocess.run(
             ["git", "-c", "safe.directory=*", "-C", str(repository), "rev-parse", "HEAD"],
@@ -335,7 +344,11 @@ def _source_manifest() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError):
         revision = None
         dirty = None
-    return {"git_revision": revision, "git_dirty": dirty, "files": files}
+    return {
+        "available": revision is not None,
+        "revision": revision,
+        "dirty": dirty,
+    }
 
 
 def _runtime_manifest() -> dict[str, Any]:

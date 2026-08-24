@@ -198,6 +198,38 @@ def test_evaluation_uses_fixed_eval_indices_without_training_rng_or_mode_mutatio
     _assert_rng_equal(rng_before, _rng_snapshot())
 
 
+def test_evaluation_restores_every_descendant_training_flag() -> None:
+    config = _config()
+    model = MoiraModel(config.model)
+    model.train()
+    model.blocks[0].residual_dropout.eval()
+    modes_before = tuple(module.training for module in model.modules())
+
+    evaluate_smoke(config, model, batches=1)
+
+    assert tuple(module.training for module in model.modules()) == modes_before
+
+
+def test_evaluation_rejects_non_finite_loss_and_restores_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    model = MoiraModel(config.model)
+    model.train()
+    model.blocks[0].residual_dropout.eval()
+    modes_before = tuple(module.training for module in model.modules())
+
+    monkeypatch.setattr(
+        train_module,
+        "_masked_next_token_loss",
+        lambda *args, **kwargs: torch.tensor(float("nan")),
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        evaluate_smoke(config, model, batches=1)
+
+    assert tuple(module.training for module in model.modules()) == modes_before
+
+
 def test_resume_rejects_a_target_behind_the_loaded_step(run_root: Path) -> None:
     config = _config()
     trained = train_until(config, run_root / "behind", stop_at_step=4)
@@ -227,7 +259,7 @@ def test_operational_stop_always_commits_without_changing_the_semantic_schedule(
     ] == 8
     assert "stop_at_step" not in payload["semantic_manifests"]["optimization"]
     package_files = sorted(Path("research/src/moira").glob("*.py"))
-    assert set(payload["semantic_manifests"]["source"]["files"]) == {
+    assert set(payload["semantic_manifests"]["source"]) == {
         path.as_posix() for path in package_files
     }
     assert payload["semantic_manifests"]["runtime"]["device"] == "cpu"
@@ -244,11 +276,53 @@ def test_source_hashes_survive_missing_git_metadata(
 
     monkeypatch.setattr(train_module.subprocess, "run", missing_git)
     source = train_module._source_manifest()
+    provenance = train_module._git_provenance()
 
-    assert source["git_revision"] is None
-    assert source["git_dirty"] is None
-    assert source["files"]
-    assert all(len(digest) == 64 for digest in source["files"].values())
+    assert provenance == {"available": False, "revision": None, "dirty": None}
+    assert source
+    assert all(len(digest) == 64 for digest in source.values())
+
+
+def test_git_context_changes_do_not_change_strict_source_identity(
+    run_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = {"revision": "revision-a", "dirty": False}
+
+    def git_result(args: list[str], **kwargs: object) -> object:
+        stdout = (
+            f"{context['revision']}\n"
+            if "rev-parse" in args
+            else (" M unrelated\n" if context["dirty"] else "")
+        )
+        return type("GitResult", (), {"stdout": stdout})()
+
+    monkeypatch.setattr(train_module.subprocess, "run", git_result)
+    config = _config()
+    first = train_until(config, run_root / "git-context", stop_at_step=1)
+
+    context.update(revision="revision-b", dirty=True)
+    resumed = train_until(
+        config,
+        run_root / "git-context",
+        stop_at_step=2,
+        resume=first.checkpoint_path,
+    )
+    payload = torch.load(
+        first.checkpoint_path, map_location="cpu", weights_only=True
+    )
+
+    assert resumed.global_step == 2
+    assert payload["semantic_manifests"]["source"]
+    assert all(
+        len(digest) == 64
+        for digest in payload["semantic_manifests"]["source"].values()
+    )
+    assert payload["provenance"]["git"] == {
+        "available": True,
+        "revision": "revision-a",
+        "dirty": False,
+    }
 
 
 def test_phase_zero_rejects_gradient_accumulation_and_non_cpu_targets(

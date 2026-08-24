@@ -59,8 +59,8 @@ class SyntheticStream:
         sequence_length: int,
         version: int = 1,
     ) -> None:
-        _require_non_negative_integer("seed", seed)
-        _require_positive_integer("version", version)
+        _require_uint64("seed", seed)
+        _require_uint64("version", version, positive=True)
         _require_positive_integer("vocab_size", vocab_size)
         _require_positive_integer("sequence_length", sequence_length)
         if vocab_size < 4:
@@ -73,8 +73,8 @@ class SyntheticStream:
         self.version = version
 
     def sample(self, *, split: int, index: int) -> SyntheticSample:
-        _require_non_negative_integer("split", split)
-        _require_non_negative_integer("index", index)
+        _require_uint64("split", split)
+        _require_uint64("index", index)
         generator = torch.Generator(device="cpu")
         generator.manual_seed(self._sample_seed(split, index))
         pattern_length = min(8, max(2, self.sequence_length // 2))
@@ -113,12 +113,17 @@ class SyntheticStream:
         cursor: DataCursor,
         batch_size: int,
     ) -> tuple[SyntheticBatch, DataCursor]:
-        _require_non_negative_integer("split", split)
+        _require_uint64("split", split)
         _require_positive_integer("batch_size", batch_size)
         if not isinstance(cursor, DataCursor):
             raise ValueError("cursor must be a DataCursor")
         if cursor.tokens_seen != cursor.samples_seen * self.sequence_length:
             raise ValueError("cursor token counter does not match the stream")
+        if (
+            cursor.next_sample_index > _UINT64_MASK
+            or batch_size - 1 > _UINT64_MASK - cursor.next_sample_index
+        ):
+            raise ValueError("batch address exceeds the 64-bit stream domain")
 
         samples = tuple(
             self.sample(split=split, index=cursor.next_sample_index + offset)
@@ -162,3 +167,14 @@ def _require_non_negative_integer(name: str, value: object) -> None:
 def _require_positive_integer(name: str, value: object) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _require_uint64(name: str, value: object, *, positive: bool = False) -> None:
+    minimum = 1 if positive else 0
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not minimum <= value <= _UINT64_MASK
+    ):
+        qualifier = "positive " if positive else ""
+        raise ValueError(f"{name} must be a {qualifier}64-bit unsigned integer")

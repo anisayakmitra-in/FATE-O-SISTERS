@@ -204,3 +204,55 @@ def test_batch_rejects_invalid_batch_sizes(batch_size: object) -> None:
     cursor = DataCursor(SYNTHETIC_CURSOR_KIND, 0, 0, 0)
     with pytest.raises(ValueError, match="batch_size"):
         stream.batch(split=0, cursor=cursor, batch_size=batch_size)
+
+
+def test_splitmix64_address_boundaries_are_explicit() -> None:
+    maximum = (1 << 64) - 1
+    stream = SyntheticStream(
+        seed=maximum,
+        vocab_size=8,
+        sequence_length=4,
+        version=maximum,
+    )
+
+    sample = stream.sample(split=maximum, index=maximum)
+
+    assert sample.split == maximum
+    assert sample.index == maximum
+    with pytest.raises(ValueError, match="seed"):
+        SyntheticStream(seed=1 << 64, vocab_size=8, sequence_length=4)
+    with pytest.raises(ValueError, match="version"):
+        SyntheticStream(
+            seed=1, vocab_size=8, sequence_length=4, version=1 << 64
+        )
+    with pytest.raises(ValueError, match="split"):
+        stream.sample(split=1 << 64, index=0)
+    with pytest.raises(ValueError, match="index"):
+        stream.sample(split=0, index=1 << 64)
+
+
+def test_batch_address_overflow_fails_before_sample_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    maximum = (1 << 64) - 1
+    stream = SyntheticStream(seed=1, vocab_size=8, sequence_length=4)
+    cursor = DataCursor(
+        SYNTHETIC_CURSOR_KIND,
+        maximum,
+        maximum,
+        maximum * stream.sequence_length,
+    )
+    calls = 0
+    original_sample = stream.sample
+
+    def observed_sample(*, split: int, index: int):
+        nonlocal calls
+        calls += 1
+        return original_sample(split=split, index=index)
+
+    monkeypatch.setattr(stream, "sample", observed_sample)
+    with pytest.raises(ValueError, match="address"):
+        stream.batch(split=0, cursor=cursor, batch_size=2)
+
+    assert calls == 0
+    assert cursor.next_sample_index == maximum
