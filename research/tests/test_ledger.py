@@ -13,6 +13,11 @@ class TiedModel(nn.Module):
         self.output.weight = self.token.weight
 
 
+def test_parameter_subsystems_classify_pulse_separately() -> None:
+    """Catches affect parameters being folded into an unrelated subsystem."""
+    assert ParameterSubsystem.PULSE.value == "pulse"
+
+
 def test_ledger_counts_tied_storage_once() -> None:
     ledger = build_parameter_ledger(
         TiedModel(),

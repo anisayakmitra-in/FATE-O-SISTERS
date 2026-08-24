@@ -12,6 +12,7 @@ class ParameterSubsystem(str, Enum):
     SPOOL = "spool"
     KNOT = "knot"
     CAPSULE = "capsule"
+    PULSE = "pulse"
 
 
 @dataclass(frozen=True, slots=True)
