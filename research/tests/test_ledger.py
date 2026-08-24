@@ -38,6 +38,32 @@ def test_ledger_uses_the_longest_matching_prefix() -> None:
     assert ledger.entries[0].subsystem is ParameterSubsystem.TOKEN_IO
 
 
+def test_ledger_rejects_ambiguous_equal_length_prefix_rules() -> None:
+    model = nn.Module()
+    model.token = nn.Linear(2, 2, bias=False)
+    with pytest.raises(ValueError, match="ambiguous"):
+        build_parameter_ledger(
+            model,
+            prefix_rules=(
+                ("token", ParameterSubsystem.TOKEN_IO),
+                ("token", ParameterSubsystem.THREAD),
+            ),
+        )
+
+
+def test_ledger_allows_duplicate_equal_length_prefix_rules_with_the_same_subsystem() -> None:
+    model = nn.Module()
+    model.token = nn.Linear(2, 2, bias=False)
+    ledger = build_parameter_ledger(
+        model,
+        prefix_rules=(
+            ("token", ParameterSubsystem.TOKEN_IO),
+            ("token", ParameterSubsystem.TOKEN_IO),
+        ),
+    )
+    assert ledger.entries[0].subsystem is ParameterSubsystem.TOKEN_IO
+
+
 def test_ledger_rejects_unclassified_parameters() -> None:
     with pytest.raises(ValueError, match="unclassified"):
         build_parameter_ledger(nn.Linear(2, 2), prefix_rules=())

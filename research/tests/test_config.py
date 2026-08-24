@@ -44,10 +44,25 @@ def test_config_rejects_misaligned_heads() -> None:
 def test_training_m0_has_the_approved_cpu_defaults() -> None:
     config = TrainingConfig.m0_cpu()
     assert config.schema_version == 1
-    assert config.data == DataConfig()
-    assert config.optimization == OptimizationConfig()
-    assert config.reproducibility == ReproducibilityConfig()
-    assert config.run == RunConfig()
+    assert config.data.kind == "synthetic-indexed-v1"
+    assert config.data.seed == 13031997
+    assert config.data.train_split == 0
+    assert config.data.eval_split == 1
+    assert config.data.batch_size == 8
+    assert config.optimization.optimizer == "adamw"
+    assert config.optimization.learning_rate == 3e-4
+    assert config.optimization.weight_decay == 0.01
+    assert config.optimization.gradient_accumulation_steps == 1
+    assert config.optimization.schedule == "cosine-with-warmup"
+    assert config.optimization.warmup_steps == 2
+    assert config.optimization.schedule_total_steps == 20
+    assert config.optimization.precision == "fp32"
+    assert config.optimization.clip_grad_norm == 1.0
+    assert config.reproducibility.seed == 20260824
+    assert config.reproducibility.deterministic == "strict"
+    assert config.run.log_every_steps == 1
+    assert config.run.checkpoint_every_steps == 2
+    assert config.run.keep_last_checkpoints == 2
 
 
 def test_training_config_rejects_invalid_cross_field_values() -> None:

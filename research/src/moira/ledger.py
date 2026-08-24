@@ -88,7 +88,15 @@ def _classify(
     ]
     if not matches:
         return None
-    return max(matches, key=lambda match: len(match[0]))[1]
+    longest_prefix = max(len(prefix) for prefix, _ in matches)
+    subsystems = {
+        subsystem
+        for prefix, subsystem in matches
+        if len(prefix) == longest_prefix
+    }
+    if len(subsystems) != 1:
+        raise ValueError(f"ambiguous parameter classification for {name}")
+    return subsystems.pop()
 
 
 def _unique_trainable_parameter_count(model: nn.Module) -> int:
