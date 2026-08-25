@@ -302,24 +302,39 @@ class TSKBlock(nn.Module):
         mode: CognitiveMode,
         source_lengths: Tensor | None = None,
         state: SpoolState | None = None,
+        ablate: frozenset[str] = frozenset(),
     ) -> tuple[Tensor, SpoolState]:
-        thread_output = self.thread(self.thread_norm(hidden), visibility)
-        hidden = hidden + self.residual_dropout(thread_output)
-        spool_output, next_state = self.spool(
-            self.spool_norm(hidden), state, valid_tokens=valid_tokens
-        )
-        hidden = hidden + self.residual_dropout(spool_output)
-        normalized = self.knot_norm(hidden)
-        landmarks, type_ids, _, landmark_visibility = self.sequence_landmarks(
-            normalized,
-            valid_tokens,
-            mode=mode,
-            source_lengths=source_lengths,
-        )
-        hidden = hidden + self.residual_dropout(
-            self.knot(normalized, landmarks, type_ids, landmark_visibility)
-        )
+        if "thread" not in ablate:
+            thread_output = self.thread(self.thread_norm(hidden), visibility)
+            hidden = hidden + self.residual_dropout(thread_output)
+        if "spool" not in ablate:
+            spool_output, next_state = self.spool(
+                self.spool_norm(hidden), state, valid_tokens=valid_tokens
+            )
+            hidden = hidden + self.residual_dropout(spool_output)
+        else:
+            next_state = self._preserve_spool_state(hidden, state)
+        if "knot" not in ablate:
+            normalized = self.knot_norm(hidden)
+            landmarks, type_ids, _, landmark_visibility = self.sequence_landmarks(
+                normalized,
+                valid_tokens,
+                mode=mode,
+                source_lengths=source_lengths,
+            )
+            hidden = hidden + self.residual_dropout(
+                self.knot(normalized, landmarks, type_ids, landmark_visibility)
+            )
         return hidden, next_state
+
+    def _preserve_spool_state(
+        self, hidden: Tensor, state: SpoolState | None
+    ) -> SpoolState:
+        if state is None:
+            return SpoolState(
+                hidden.new_zeros((hidden.shape[0], self.spool.rank, self.spool.d_model))
+            )
+        return SpoolState(self.spool._validate_state(state, hidden.shape[0], hidden))
 
     def sequence_landmarks(
         self,
@@ -441,10 +456,17 @@ class MoiraModel(nn.Module):
         valid_tokens: Tensor | None = None,
         source_lengths: Tensor | None = None,
         state: MoiraState | None = None,
+        ablate: frozenset[str] | None = None,
     ) -> MoiraOutput:
         batch, length = self._validate_tokens(tokens)
         if not isinstance(mode, CognitiveMode):
             raise ValueError("mode must be a CognitiveMode")
+        if ablate is None:
+            ablate = frozenset()
+        if not isinstance(ablate, frozenset) or not ablate.issubset(
+            {"thread", "spool", "knot"}
+        ):
+            raise ValueError("ablate must be a subset of thread, spool, and knot")
         if valid_tokens is None:
             valid_tokens = torch.ones(
                 (batch, length), dtype=torch.bool, device=tokens.device
@@ -501,6 +523,7 @@ class MoiraModel(nn.Module):
                 mode=mode,
                 source_lengths=source_lengths,
                 state=spool_state,
+                ablate=ablate,
             )
             next_spools.append(next_spool)
 

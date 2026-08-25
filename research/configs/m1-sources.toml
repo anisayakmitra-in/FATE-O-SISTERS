@@ -1,0 +1,241 @@
+schema_version = 1
+
+[[sources]]
+source_id = "zai-longcite-45k"
+kind = "hf-dataset"
+uri = "hf://datasets/zai-org/LongCite-45k"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/datasets/zai-org/LongCite-45k"
+modality = "text"
+purpose = "citation-supervised-fine-tuning"
+revision = "f9b67d90fe89464caafdaad1f620cb2ca891e121"
+config = "default"
+split = "train"
+row_count = 39695
+byte_count = 2522206553
+license_verified = true
+notes = "Dataset Viewer checked 2026-08-25; the endpoint reports a partial size estimate."
+
+[[sources]]
+source_id = "deepseek-r1-openr1-math-220k"
+kind = "hf-dataset"
+uri = "hf://datasets/open-r1/OpenR1-Math-220k"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/datasets/open-r1/OpenR1-Math-220k"
+modality = "text"
+purpose = "mathematical-reasoning-supervised-fine-tuning"
+revision = "main"
+config = "default"
+split = "train"
+row_count = 93733
+byte_count = 2149897914
+license_verified = true
+upstream = "DeepSeek-R1"
+notes = "DeepSeek-R1 teacher-generated records maintained by open-r1; not a DeepSeek-owned dataset."
+
+[[sources]]
+source_id = "chartqa"
+kind = "hf-dataset"
+uri = "hf://datasets/HuggingFaceM4/ChartQA"
+license = "GPL-3.0"
+license_url = "https://huggingface.co/datasets/HuggingFaceM4/ChartQA"
+modality = "vision-text"
+purpose = "chart-question-answering-evaluation"
+revision = "b605b6e"
+config = "default"
+split = "train"
+row_count = 28299
+byte_count = 844971622
+license_verified = true
+notes = "GPL-3.0 requires a separate commercial and redistribution review before enterprise use."
+
+[[sources]]
+source_id = "huggingface-smol-smoltalk"
+kind = "hf-dataset"
+uri = "hf://datasets/HuggingFaceTB/smol-smoltalk"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk"
+modality = "text"
+purpose = "compact-instruction-supervised-fine-tuning"
+revision = "main"
+config = "default"
+split = "train"
+row_count = 460341
+byte_count = 922475727
+license_verified = true
+notes = "Dataset Viewer checked 2026-08-25; train split is 460341 rows and the test split is held out."
+
+[[sources]]
+source_id = "nvidia-opencode-reasoning"
+kind = "hf-dataset"
+uri = "hf://datasets/nvidia/OpenCodeReasoning"
+license = "CC-BY-4.0"
+license_url = "https://huggingface.co/datasets/nvidia/OpenCodeReasoning"
+modality = "code"
+purpose = "code-generation-and-verification-supervised-fine-tuning"
+revision = "main"
+config = "split_0"
+split = "split_0"
+row_count = 170361
+byte_count = 2184191067
+license_verified = true
+upstream = "DeepSeek-R1"
+notes = "Selected split_0 has 170361 rows in the Dataset Viewer size response; the NVIDIA card reports 735255 samples across both configs. Preserve each row license field."
+
+[[sources]]
+source_id = "polyai-minds14"
+kind = "hf-dataset"
+uri = "hf://datasets/PolyAI/minds14"
+license = "CC-BY-4.0"
+license_url = "https://huggingface.co/datasets/PolyAI/minds14"
+modality = "audio"
+purpose = "multilingual-speech-intent-and-transcription"
+revision = "main"
+config = "all"
+split = "train"
+row_count = 8168
+byte_count = 566674935
+license_verified = true
+notes = "Dataset Viewer exposes 14 language configurations; the all configuration is cataloged for a bounded audio adapter."
+
+[[sources]]
+source_id = "spawning-pd12m"
+kind = "hf-dataset"
+uri = "hf://datasets/Spawning/PD12M"
+license = "CDLA-Permissive-2.0"
+license_url = "https://cdla.dev/permissive-2-0/"
+modality = "vision-text"
+purpose = "public-domain-image-text-pretraining"
+revision = "main"
+config = "default"
+split = "train"
+row_count = 12400094
+byte_count = 2341900582
+license_verified = true
+notes = "Catalog only; use a deterministic slice. Each row carries an image license URL and the full dataset is multi-million scale."
+
+[[sources]]
+source_id = "lerobot-pusht"
+kind = "hf-dataset"
+uri = "hf://datasets/lerobot/pusht"
+license = "MIT"
+license_url = "https://huggingface.co/datasets/lerobot/pusht"
+modality = "robotics"
+purpose = "visuomotor-action-and-time-series-adaptation"
+revision = "main"
+config = "default"
+split = "train"
+row_count = 25650
+byte_count = 674393
+license_verified = true
+notes = "Dataset Viewer checked 2026-08-25; rows contain observation.state, action, reward, and episode metadata."
+
+[[sources]]
+source_id = "zai-glm-4.1v-9b-thinking"
+kind = "hf-model"
+uri = "hf://models/zai-org/GLM-4.1V-9B-Thinking"
+license = "MIT"
+license_url = "https://huggingface.co/zai-org/GLM-4.1V-9B-Thinking"
+modality = "teacher"
+purpose = "vision-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Teacher reference only; do not download into the M1 repository or require it for local training."
+
+[[sources]]
+source_id = "deepseek-r1-distill-qwen-1.5b"
+kind = "hf-model"
+uri = "hf://models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+license = "MIT-with-base-model-terms"
+license_url = "https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+modality = "teacher"
+purpose = "reasoning-teacher-reference"
+revision = "main"
+license_verified = true
+upstream = "Qwen"
+notes = "Distilled teacher reference; inspect both DeepSeek and Qwen terms before redistribution."
+
+[[sources]]
+source_id = "xiaomi-mimo-vl-7b-sft"
+kind = "hf-model"
+uri = "hf://models/XiaomiMiMo/MiMo-VL-7B-SFT"
+license = "Apache-2.0-repository"
+license_url = "https://github.com/XiaomiMiMo/MiMo-VL"
+modality = "teacher"
+purpose = "vision-and-video-teacher-reference"
+revision = "main"
+license_verified = false
+notes = "Official repository is Apache-2.0; verify the weight terms on the exact model card before use."
+
+[[sources]]
+source_id = "xiaomi-mimo-audio-7b-base"
+kind = "hf-model"
+uri = "hf://models/XiaomiMiMo/MiMo-Audio-7B-Base"
+license = "MIT"
+license_url = "https://huggingface.co/XiaomiMiMo/MiMo-Audio-7B-Base"
+modality = "teacher"
+purpose = "audio-and-speech-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Optional teacher reference; M1 uses the local audio capsule adapter and does not require these weights."
+
+[[sources]]
+source_id = "xiaomi-mimo-embodied-eval"
+kind = "github"
+uri = "https://github.com/XiaomiMiMo/MiMo-Embodied"
+license = "Apache-2.0-repository"
+license_url = "https://github.com/XiaomiMiMo/MiMo-Embodied"
+modality = "evaluation"
+purpose = "embodied-evaluation-reference"
+revision = "main"
+license_verified = true
+notes = "Official repository is evaluation-focused; no public Hugging Face training dataset was found under this name."
+
+[[sources]]
+source_id = "qwen3-0.6b"
+kind = "hf-model"
+uri = "hf://models/Qwen/Qwen3-0.6B"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/Qwen/Qwen3-0.6B"
+modality = "teacher"
+purpose = "compact-reasoning-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Small optional text teacher for consumer-scale experiments; not part of MOIRA's parameter count."
+
+[[sources]]
+source_id = "mistral-7b-v0.3"
+kind = "hf-model"
+uri = "hf://models/mistralai/Mistral-7B-v0.3"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/mistralai/Mistral-7B-v0.3"
+modality = "teacher"
+purpose = "text-baseline-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Open-weight baseline reference; do not bundle weights with the repository."
+
+[[sources]]
+source_id = "ai2-olmo2-7b"
+kind = "hf-model"
+uri = "hf://models/allenai/OLMo-2-1124-7B"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/allenai/OLMo-2-1124-7B"
+modality = "teacher"
+purpose = "fully-open-training-reference"
+revision = "main"
+license_verified = true
+notes = "Ai2 publishes model, code, and training details; use as a research reference, not as a local M1 dependency."
+
+[[sources]]
+source_id = "huggingface-smollm2-1.7b-instruct"
+kind = "hf-model"
+uri = "hf://models/HuggingFaceTB/SmolLM2-1.7B-Instruct"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct"
+modality = "teacher"
+purpose = "compact-instruction-teacher-reference"
+revision = "main"
+license_verified = true
+upstream = "HuggingFaceTB/smol-smoltalk"
+notes = "Compact open teacher aligned with the cataloged SmolTalk data."

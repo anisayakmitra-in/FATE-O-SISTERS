@@ -49,6 +49,23 @@ class ModelConfig:
     def m0_cpu(cls) -> "ModelConfig":
         return cls(64, 32, 2, 4, 64, 3, 8, 4, 16, 32)
 
+    @classmethod
+    def m1_cpu(cls) -> "ModelConfig":
+        """The fixed 33M M1 reference surface for local shape and ablation checks."""
+        return cls(
+            vocab_size=8_192,
+            d_model=512,
+            n_layers=12,
+            n_heads=8,
+            ffn_dim=1_024,
+            thread_radius=8,
+            spool_rank=32,
+            knot_slots=16,
+            capsule_width=64,
+            max_seq_len=512,
+            expected_trainable_parameters=33_032_562,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:

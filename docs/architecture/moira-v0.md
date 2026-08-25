@@ -104,17 +104,23 @@ The Phase 0 capsule contract is:
 ```python
 @dataclass(frozen=True)
 class CapabilityCapsule:
+    abi_version: int
     task_id: str
-    capsule_type: CapsuleType
+    scope_id: str
+    capsule_type: str
     source_modality: str
-    payload: Tensor
-    uncertainty: float
-    evidence_status: EvidenceStatus
+    latent: Tensor
+    slot_type_ids: Tensor
+    uncertainty: Tensor
+    evidence_status: str
     source_hashes: tuple[str, ...]
-    scope: str
+    coordinates: Tensor | None
 ```
 
-Validation requires a non-empty task ID, a two-dimensional finite payload, uncertainty in `[0, 1]`, an explicit evidence status, and a non-empty scope. Capsules expose an integrity digest computed from their metadata and payload bytes.
+Validation requires a non-empty task ID and scope, a two-dimensional finite
+latent matrix, in-range slot types, uncertainty in `[0, 1]`, an explicit
+evidence status, and non-empty source hashes. Capsules expose an integrity
+digest computed from their metadata and tensor bytes.
 
 The initial organ map is:
 
@@ -129,6 +135,13 @@ The initial organ map is:
 | Graph model | Molecules, networks, dependency graphs |
 | Time-series model | Forecast capsules with intervals and provenance |
 | Deterministic solver | Code, mathematics, schema, and constraint verification |
+
+The M1 capability loom implements the boundary without bundling specialist
+weights. `VisionPatchEncoder` emits bounded spatial capsules, while
+`FeatureCapsuleEncoder` accepts audio, time-series, graph, structured, and
+robotics feature sequences. `CapsuleProjector` maps a validated capsule to the
+MOIRA hidden width. The source catalog records optional GLM, DeepSeek, Xiaomi,
+Qwen, Mistral, OLMo, and SmolLM teacher references separately from datasets.
 
 RAG supplies current and private evidence. LoRA and other PEFT methods adapt stable behavior. Neither belongs inside the exact core parameter sequence.
 
@@ -239,12 +252,13 @@ Smaller milestones are research models. They never enter the canonical `3B -> 9B
 
 Promotion requires architecture, learning, capability, governance, and systems gates. A quality gain does not excuse a causal leak, privacy failure, broken checkpoint, or false parameter claim.
 
-## 12. Phase 0 executable contract
+## 12. Phase 0 executable contract and M1 foundation
 
 Phase 0 builds the following Python interfaces:
 
 ```python
 TrainingConfig.m0_cpu() -> TrainingConfig
+ModelConfig.m1_cpu() -> ModelConfig
 build_parameter_ledger(...) -> ParameterLedger
 build_visibility_mask(...) -> Tensor
 validate_capsule(...) -> None
@@ -258,13 +272,26 @@ save_checkpoint(...) -> None
 load_checkpoint(...) -> CheckpointState
 train_until(...) -> TrainingState
 evaluate_smoke(...) -> dict[str, float]
+SourceCatalog.from_toml(...) -> SourceCatalog
+iter_jsonl_examples(...) -> Iterator[DatasetExample]
+VisionPatchEncoder(...) -> tuple[CapabilityCapsule, ...]
+FeatureCapsuleEncoder(...) -> tuple[CapabilityCapsule, ...]
+CapsuleProjector(...) -> Tensor
+train_m1_jsonl(...) -> M1TrainingResult
 ```
 
 The reference package lives under `research/src/moira`. CPU tests use tiny dimensions and deterministic seeds. A synthetic next-token task provides the first smoke-training command. Kaggle uses the same command and writes resumable checkpoints containing model, optimizer, scheduler, random-number-generator, data-cursor, configuration, and manifest state.
 
+The M1 JSONL path reads caller-owned text or code records through the source
+catalog, uses a deterministic UTF-8 byte tokenizer, and runs a bounded
+in-memory step. It writes no checkpoint. `python -m moira m1 inspect` verifies
+the fixed 33,032,562-parameter surface on the meta device and checks that
+Thread, Spool, and Knot leave-one-out ablations keep the same parameter count.
+
 Phase 0 excludes:
 
 - 3B pretraining;
+- stable M1 learning curves and checkpoint resume;
 - canonical ternary materialization;
 - autonomous adapter or core promotion;
 - production deployment switching;

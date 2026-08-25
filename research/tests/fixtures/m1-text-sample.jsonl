@@ -1,0 +1,1 @@
+{"id":"m1-sample-1","prompt":"Explain a small recursive update.","response":"A bounded update records the next state and verifies its budget."}

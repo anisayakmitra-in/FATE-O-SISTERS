@@ -3,13 +3,14 @@
 This guide runs the deterministic Phase 0 model on Kaggle CPU. The checked-in
 configuration has 24,478 trainable parameters and uses indexed synthetic data.
 It tests the model, checkpoint, verification, evaluation, and exact-resume code
-paths. The 1M to 10M M0 research milestone and the exact 3B root model remain
-later work.
+paths. The repository also provides a separate M1 catalog and bounded JSONL
+smoke path; that path does not write a checkpoint.
 
 Phase 0 runs in FP32 on CPU. LoRA, PEFT, 8-bit weights, MoE routing, RAG, RLHF,
-real-corpus ingestion, GPU execution, recursive training, deployment switching,
-and 3x parameter growth remain unimplemented. The reported loss is a code-path
-check on fixed synthetic samples, without a benchmark or capability claim.
+checkpointed real-corpus training, recursive training, deployment switching,
+and 3x parameter growth remain outside this guide. The reported M0 loss is a
+code-path check on fixed synthetic samples, without a benchmark or capability
+claim.
 
 ## Prepare the notebook
 
@@ -148,6 +149,44 @@ python -m moira evaluate \
   --device cpu \
   --batches 2
 ```
+
+## Inspect the M1 surface and a local data slice
+
+Kaggle inputs are read-only. Add a small, licensed JSONL slice and the
+repository catalog as inputs, then validate both without downloading a Hub
+dataset or model:
+
+```bash
+%%bash
+set -euo pipefail
+source /kaggle/working/moira-m0-env.sh
+
+python -m moira dataset validate \
+  --catalog "$REPO/research/configs/m1-sources.toml"
+python -m moira m1 inspect
+```
+
+For a text or code source, run one bounded in-memory step. Replace the path
+with the read-only Kaggle input path for the slice:
+
+```bash
+%%bash
+set -euo pipefail
+source /kaggle/working/moira-m0-env.sh
+
+python -m moira m1 train-jsonl \
+  --catalog "$REPO/research/configs/m1-sources.toml" \
+  --source zai-longcite-45k \
+  --path /kaggle/input/moira-m1-slice/longcite-slice.jsonl \
+  --steps 1 \
+  --batch-size 1 \
+  --device cpu
+```
+
+The command reports loss, token count, and the 33,032,562-parameter surface.
+It keeps the model in memory and writes no checkpoint. Vision, audio,
+robotics, and time-series rows have typed adapters, but this causal command
+accepts text and code only.
 
 ## Continue the run
 

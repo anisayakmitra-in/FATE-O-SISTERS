@@ -90,6 +90,24 @@ def test_doctor_reports_the_exact_m0_cpu_surface(cli_root: Path) -> None:
     assert run_dir.is_dir()
 
 
+def test_m1_inspect_and_catalog_validation_are_read_only() -> None:
+    inspected = _output_json(_run_cli("m1", "inspect"))
+    assert inspected["phase"] == "M1"
+    assert inspected["trainable_parameters"] == 33_032_562
+    assert inspected["weights_downloaded"] is False
+
+    catalog = _output_json(
+        _run_cli(
+            "dataset",
+            "validate",
+            "--catalog",
+            REPOSITORY_ROOT / "research" / "configs" / "m1-sources.toml",
+        )
+    )
+    assert catalog["source_count"] == 17
+    assert catalog["weights_or_datasets_downloaded"] is False
+
+
 def test_train_verify_evaluate_and_auto_resume_cli(cli_root: Path) -> None:
     run_dir = cli_root / "training-run"
     trained = _run_cli(

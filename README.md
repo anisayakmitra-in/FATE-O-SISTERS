@@ -1,6 +1,6 @@
 # MOIRA
 
-MOIRA is an experimental sequence-model research project. The executable Phase 0 reference lives in `research/` and supports deterministic FP32 training and evaluation on CPU. The checked-in smoke configuration has 24,478 trainable parameters and trains on indexed synthetic samples.
+MOIRA is an experimental sequence-model research project. The executable Phase 0 reference lives in `research/` and supports deterministic FP32 training and evaluation on CPU. The repository also contains the M1 data and capability foundation: a manifest-first source catalog, bounded record adapters, a capability loom, and a 33,032,562-parameter inspection surface.
 
 The repository does not contain a trained checkpoint or a 3B model. It does not establish AGI, recursive self-improvement, benchmark gains, speedups, quantization, GPU execution, or production deployment. Each of those claims requires a later implementation and measured evidence.
 
@@ -15,6 +15,10 @@ The Python reference contains:
 - Pulse state with 12 fast affect components and 6 slow affect components;
 - an exact trainable-parameter ledger checked against the model;
 - deterministic synthetic data, training, evaluation, and resume tests;
+- a manifest-first M1 catalog for text, code, vision-text, audio, robotics, and teacher references;
+- bounded JSONL normalization with source revisions, licenses, split assignment, and record hashes;
+- pure-PyTorch vision and feature capsule encoders for image, audio, time-series, structured, graph, and robotics inputs;
+- an M1 meta-device parameter check, equal-parameter component ablations, and a bounded in-memory JSONL training path;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -68,6 +72,31 @@ python -m moira deployment describe enterprise
 
 The profile commands describe planned defaults. They do not switch the model, allocate hardware, or grant permissions in Phase 0.
 
+## Inspect and exercise M1
+
+Validate the source catalog and count the M1 model without downloading a dataset
+or a teacher checkpoint:
+
+```powershell
+python -m moira dataset validate --catalog research/configs/m1-sources.toml
+python -m moira m1 inspect
+```
+
+For a caller-owned text or code JSONL slice, run one bounded in-memory step:
+
+```powershell
+python -m moira m1 train-jsonl `
+  --catalog research/configs/m1-sources.toml `
+  --source zai-longcite-45k `
+  --path C:\data\longcite-slice.jsonl `
+  --steps 1 `
+  --batch-size 1 `
+  --device cpu
+```
+
+This path writes no checkpoint. It is a data-to-loss smoke path; M1 checkpoint
+resume, held-out curves, and GPU precision remain exit gates.
+
 Successful commands write one compact JSON object to standard output. Expected argument, configuration, filesystem, and checkpoint failures write an error to standard error and exit with status 2. Keep the complete run directory for automatic recovery and resume; a checkpoint tensor file by itself is not the whole run state.
 
 Run the research tests with pytest's cache disabled:
@@ -83,13 +112,15 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/src/moira/` | Executable PyTorch CPU reference and CLI |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
+| `research/configs/m1-sources.toml` | M1 dataset, model, and evaluation source catalog |
 | `docs/architecture/moira-v0.md` | Architecture, scope boundaries, and milestone gates |
 | `docs/guides/kaggle-m0.md` | Cell-by-cell Kaggle workflow and artifact rules |
+| `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 
 ## Research boundary
 
-The architecture document records proposals for an exact 3B root model, governed threefold growth, consumer and enterprise placement, specialist capability fields, adapters, retrieval, quantization, and later GPU work. None of those proposals are implemented by the current smoke model. The next model-size milestone is a measured 1M to 10M parameter reference, followed by the evaluation gates in the architecture document.
+The architecture document records proposals for an exact 3B root model, governed threefold growth, consumer and enterprise placement, specialist capability fields, adapters, retrieval, quantization, and later GPU work. The current M1 work covers source contracts, capability boundaries, a fixed 33M parameter surface, equal-parameter ablations, and a bounded in-memory training path. It does not establish stable M1 learning, a checkpointed M1 run, or any 3B lineage.
 
 For a hosted notebook run, follow the [Kaggle M0 guide](docs/guides/kaggle-m0.md). For the model contract and milestone criteria, read the [MOIRA v0 architecture](docs/architecture/moira-v0.md).
 

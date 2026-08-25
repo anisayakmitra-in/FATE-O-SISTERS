@@ -26,6 +26,7 @@ from .checkpoint import (
     load_checkpoint,
     verify_checkpoint,
 )
+from .ablation import assert_equal_parameter_surface
 from .config import (
     DataConfig,
     ModelConfig,
@@ -34,7 +35,9 @@ from .config import (
     RunConfig,
     TrainingConfig,
 )
+from .dataset import SourceCatalog, iter_jsonl_examples
 from .model import MoiraModel
+from .m1_train import train_m1_jsonl
 from .synthetic import SyntheticStream
 from .train import (
     _build_components,
@@ -82,7 +85,7 @@ _ConfigSection = TypeVar(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m moira",
-        description="MOIRA Phase 0 deterministic CPU research commands.",
+        description="MOIRA M0 deterministic CPU and M1 inspection commands.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -96,6 +99,45 @@ def _build_parser() -> argparse.ArgumentParser:
         "describe", help="Describe a deployment profile without changing state."
     )
     describe.add_argument("profile", choices=("consumer", "enterprise"))
+
+    m1 = commands.add_parser(
+        "m1", help="Inspect the fixed M1 model surface without downloading weights."
+    )
+    m1_commands = m1.add_subparsers(dest="m1_command", required=True)
+    m1_inspect = m1_commands.add_parser(
+        "inspect", help="Count the M1 reference parameters on meta or CPU."
+    )
+    m1_inspect.add_argument("--device", choices=("meta", "cpu"), default="meta")
+    m1_train = m1_commands.add_parser(
+        "train-jsonl", help="Run bounded in-memory M1 training on local text/code JSONL."
+    )
+    m1_train.add_argument("--catalog", required=True, type=Path)
+    m1_train.add_argument("--source", required=True)
+    m1_train.add_argument("--path", required=True, type=Path)
+    m1_train.add_argument("--steps", default=1, type=int)
+    m1_train.add_argument("--batch-size", default=1, type=int)
+    m1_train.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+
+    dataset = commands.add_parser(
+        "dataset", help="Validate manifest-first local dataset metadata and samples."
+    )
+    dataset_commands = dataset.add_subparsers(
+        dest="dataset_command", required=True
+    )
+    dataset_validate = dataset_commands.add_parser(
+        "validate", help="Validate a source catalog without network access."
+    )
+    dataset_validate.add_argument("--catalog", required=True, type=Path)
+    dataset_sample = dataset_commands.add_parser(
+        "sample", help="Normalize a bounded local JSONL sample."
+    )
+    dataset_sample.add_argument("--catalog", required=True, type=Path)
+    dataset_sample.add_argument("--source", required=True)
+    dataset_sample.add_argument("--path", required=True, type=Path)
+    dataset_sample.add_argument("--split", default="train")
+    dataset_sample.add_argument("--preprocess-version", default="m1-v1")
+    dataset_sample.add_argument("--split-seed", default=0, type=int)
+    dataset_sample.add_argument("--max-records", default=5, type=int)
 
     doctor = commands.add_parser(
         "doctor", help="Validate an M0 config and local CPU run directory."
@@ -310,6 +352,114 @@ def _meta_trainable_parameters(config: ModelConfig) -> int:
     with torch.device("meta"):
         probe = MoiraModel(config)
     return probe.parameter_ledger().total_trainable
+
+
+def _m1_inspect(device: str) -> dict[str, object]:
+    if device not in {"meta", "cpu"}:
+        raise ValueError("M1 inspection device must be meta or cpu")
+    config = ModelConfig.m1_cpu()
+    if device == "meta":
+        with torch.device("meta"):
+            model = MoiraModel(config)
+    else:
+        model = MoiraModel(config)
+    count = model.parameter_ledger().total_trainable
+    if count != config.expected_trainable_parameters:
+        raise ValueError("M1 reference parameter count does not match its contract")
+    assert_equal_parameter_surface(model)
+    return {
+        "ablation_parameter_surface": "equal",
+        "device": device,
+        "expected_trainable_parameters": config.expected_trainable_parameters,
+        "max_trainable_parameters": 50_000_000,
+        "min_trainable_parameters": 30_000_000,
+        "model": "MOIRA",
+        "phase": "M1",
+        "trainable_parameters": count,
+        "weights_downloaded": False,
+    }
+
+
+def _m1_train(
+    catalog_path: Path,
+    source_id: str,
+    jsonl_path: Path,
+    steps: int,
+    batch_size: int,
+    device: str,
+) -> dict[str, object]:
+    result = train_m1_jsonl(
+        catalog_path,
+        jsonl_path,
+        source_id=source_id,
+        steps=steps,
+        batch_size=batch_size,
+        device=device,
+    )
+    return {
+        "device": device,
+        "final_loss": result.final_loss,
+        "phase": "M1",
+        "samples": result.samples,
+        "steps": result.steps,
+        "tokens": result.tokens,
+        "trainable_parameters": result.trainable_parameters,
+        "checkpoint_written": False,
+    }
+
+
+def _dataset_validate(catalog_path: Path) -> dict[str, object]:
+    catalog = SourceCatalog.from_toml(catalog_path)
+    by_kind: dict[str, int] = {}
+    by_modality: dict[str, int] = {}
+    verified = 0
+    for source in catalog.sources:
+        by_kind[source.kind] = by_kind.get(source.kind, 0) + 1
+        by_modality[source.modality] = by_modality.get(source.modality, 0) + 1
+        verified += int(source.license_verified)
+    return {
+        "catalog": str(catalog_path.resolve()),
+        "license_verified_sources": verified,
+        "modalities": dict(sorted(by_modality.items())),
+        "schema_version": catalog.schema_version,
+        "source_count": len(catalog.sources),
+        "source_kinds": dict(sorted(by_kind.items())),
+        "weights_or_datasets_downloaded": False,
+    }
+
+
+def _dataset_sample(
+    catalog_path: Path,
+    source_id: str,
+    path: Path,
+    split: str,
+    preprocess_version: str,
+    split_seed: int,
+    max_records: int,
+) -> dict[str, object]:
+    catalog = SourceCatalog.from_toml(catalog_path)
+    source = catalog.by_id(source_id)
+    if source.kind != "hf-dataset":
+        raise ValueError("dataset sample requires an hf-dataset catalog source")
+    policy = (("train", 8), ("eval", 2)) if split == "auto" else None
+    examples = tuple(
+        iter_jsonl_examples(
+            path,
+            source_id=source_id,
+            split=split,
+            preprocess_version=preprocess_version,
+            split_seed=split_seed,
+            split_policy=policy,
+            max_records=max_records,
+        )
+    )
+    return {
+        "modalities": sorted({example.modality for example in examples}),
+        "record_ids": [example.record_id for example in examples],
+        "records": len(examples),
+        "source_id": source_id,
+        "weights_or_datasets_downloaded": False,
+    }
 
 
 def _validate_operation_work(
@@ -572,6 +722,33 @@ def _evaluate(
 def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
     if arguments.command == "deployment":
         return _describe_deployment(arguments.profile)
+    if arguments.command == "m1":
+        if arguments.m1_command == "inspect":
+            return _m1_inspect(arguments.device)
+        if arguments.m1_command == "train-jsonl":
+            return _m1_train(
+                arguments.catalog,
+                arguments.source,
+                arguments.path,
+                arguments.steps,
+                arguments.batch_size,
+                arguments.device,
+            )
+        raise ValueError("unknown M1 command")
+    if arguments.command == "dataset":
+        if arguments.dataset_command == "validate":
+            return _dataset_validate(arguments.catalog)
+        if arguments.dataset_command == "sample":
+            return _dataset_sample(
+                arguments.catalog,
+                arguments.source,
+                arguments.path,
+                arguments.split,
+                arguments.preprocess_version,
+                arguments.split_seed,
+                arguments.max_records,
+            )
+        raise ValueError("unknown dataset command")
     if arguments.command == "doctor":
         return _doctor(arguments.config, arguments.run_dir, arguments.device)
     if arguments.command == "train":
@@ -599,7 +776,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     try:
         output = _dispatch(parser.parse_args(argv))
-    except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
+    except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(
