@@ -1,0 +1,617 @@
+"""Command-line interface for the MOIRA Phase 0 research package."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from dataclasses import MISSING, fields
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import stat
+import sys
+import tempfile
+import tomllib
+from types import NoneType
+from typing import TypeVar, get_args
+
+import numpy as np
+import torch
+
+from .checkpoint import (
+    LoadedCheckpoint,
+    _validate_phase0_model_budget,
+    load_checkpoint,
+    verify_checkpoint,
+)
+from .config import (
+    DataConfig,
+    ModelConfig,
+    OptimizationConfig,
+    ReproducibilityConfig,
+    RunConfig,
+    TrainingConfig,
+)
+from .model import MoiraModel
+from .synthetic import SyntheticStream
+from .train import (
+    _build_components,
+    _seed_strict,
+    _semantic_manifests,
+    _validate_phase_zero,
+    evaluate_smoke,
+    train_until,
+)
+
+
+_CONFIG_SECTIONS = {
+    "schema_version",
+    "model",
+    "data",
+    "optimization",
+    "reproducibility",
+    "run",
+}
+_MAX_CONFIG_BYTES = 1024 * 1024
+_MAX_M0_TRAINABLE_PARAMETERS = 10_000_000
+_MAX_M0_LAYERS = 32
+_MAX_M0_BATCH_SIZE = 4_096
+_MAX_M0_SEQUENCE_LENGTH = 8_192
+_MAX_M0_BATCH_TOKENS = 262_144
+_MAX_M0_LOGIT_ELEMENTS = 16_777_216
+_MAX_M0_ATTENTION_ELEMENTS = 16_777_216
+_MAX_M0_HIDDEN_ELEMENTS = 16_777_216
+_MAX_M0_SPOOL_ELEMENTS = 16_777_216
+_MAX_M0_SCHEDULE_STEPS = 100_000
+_MAX_M0_RETAINED_CHECKPOINTS = 8
+_MAX_EVALUATION_BATCHES = 10_000
+_MAX_M0_TRAINING_WORK = 100_000_000_000
+_MAX_M0_EVALUATION_WORK = 10_000_000_000
+_ConfigSection = TypeVar(
+    "_ConfigSection",
+    ModelConfig,
+    DataConfig,
+    OptimizationConfig,
+    ReproducibilityConfig,
+    RunConfig,
+)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m moira",
+        description="MOIRA Phase 0 deterministic CPU research commands.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    deployment = commands.add_parser(
+        "deployment", help="Inspect future deployment profile contracts."
+    )
+    deployment_commands = deployment.add_subparsers(
+        dest="deployment_command", required=True
+    )
+    describe = deployment_commands.add_parser(
+        "describe", help="Describe a deployment profile without changing state."
+    )
+    describe.add_argument("profile", choices=("consumer", "enterprise"))
+
+    doctor = commands.add_parser(
+        "doctor", help="Validate an M0 config and local CPU run directory."
+    )
+    _add_config_argument(doctor)
+    _add_run_dir_argument(doctor)
+    _add_device_argument(doctor)
+
+    train = commands.add_parser(
+        "train", help="Run deterministic synthetic M0 training."
+    )
+    _add_config_argument(train)
+    _add_run_dir_argument(train)
+    _add_device_argument(train)
+    train.add_argument("--stop-at-step", required=True, type=int)
+    train.add_argument(
+        "--resume",
+        required=True,
+        help="Use none, auto, or an explicit checkpoint path.",
+    )
+
+    checkpoint = commands.add_parser(
+        "checkpoint", help="Operate on deterministic M0 checkpoints."
+    )
+    checkpoint_commands = checkpoint.add_subparsers(
+        dest="checkpoint_command", required=True
+    )
+    verify = checkpoint_commands.add_parser(
+        "verify", help="Fully verify and load an M0 checkpoint."
+    )
+    _add_config_argument(verify)
+    _add_checkpoint_source_arguments(verify)
+
+    evaluate = commands.add_parser(
+        "evaluate", help="Evaluate a verified M0 checkpoint on fixed samples."
+    )
+    _add_config_argument(evaluate)
+    _add_checkpoint_source_arguments(evaluate)
+    _add_device_argument(evaluate)
+    evaluate.add_argument("--batches", default=2, type=int)
+    return parser
+
+
+def _add_config_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", required=True, type=Path)
+
+
+def _add_run_dir_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--run-dir", required=True, type=Path)
+
+
+def _add_device_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--device", required=True)
+
+
+def _add_checkpoint_source_arguments(parser: argparse.ArgumentParser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--run-dir", type=Path)
+    source.add_argument("--checkpoint", type=Path)
+
+
+def _load_config(path: Path) -> TrainingConfig:
+    raw = tomllib.loads(_read_config_bytes(path).decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("config must be a TOML table")
+    actual_sections = set(raw)
+    if actual_sections != _CONFIG_SECTIONS:
+        missing = sorted(_CONFIG_SECTIONS - actual_sections)
+        unknown = sorted(actual_sections - _CONFIG_SECTIONS)
+        raise ValueError(
+            "config sections must match the Phase 0 schema "
+            f"(missing={missing}, unknown={unknown})"
+        )
+    if type(raw["schema_version"]) is not int:
+        raise ValueError("schema_version must be an integer")
+    config = TrainingConfig(
+        schema_version=raw["schema_version"],
+        model=_build_config_section("model", ModelConfig, raw["model"]),
+        data=_build_config_section("data", DataConfig, raw["data"]),
+        optimization=_build_config_section(
+            "optimization", OptimizationConfig, raw["optimization"]
+        ),
+        reproducibility=_build_config_section(
+            "reproducibility", ReproducibilityConfig, raw["reproducibility"]
+        ),
+        run=_build_config_section("run", RunConfig, raw["run"]),
+    )
+    _validate_config_resource_budget(config)
+    return config
+
+
+def _read_config_bytes(path: Path) -> bytes:
+    initial = path.lstat()
+    if not stat.S_ISREG(initial.st_mode):
+        raise ValueError("config must be a regular file")
+    if initial.st_size > _MAX_CONFIG_BYTES:
+        raise ValueError("config exceeds the 1 MiB Phase 0 limit")
+
+    flags = os.O_RDONLY
+    for name in ("O_BINARY", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= int(getattr(os, name, 0))
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(
+            initial, opened
+        ):
+            raise ValueError("config file identity changed before reading")
+        content = handle.read(_MAX_CONFIG_BYTES + 1)
+        handle.seek(0)
+        if handle.read(_MAX_CONFIG_BYTES + 1) != content:
+            raise ValueError("config file changed while reading")
+        finished = os.fstat(handle.fileno())
+
+    final = path.lstat()
+    if (
+        _file_status_signature(initial) != _file_status_signature(opened)
+        or _file_status_signature(opened) != _file_status_signature(finished)
+        or _file_status_signature(finished) != _file_status_signature(final)
+    ):
+        raise ValueError("config file changed while reading")
+    if len(content) > _MAX_CONFIG_BYTES:
+        raise ValueError("config exceeds the 1 MiB Phase 0 limit")
+    return content
+
+
+def _file_status_signature(status: os.stat_result) -> tuple[int, ...]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_mode,
+        status.st_size,
+        status.st_mtime_ns,
+    )
+
+
+def _validate_config_resource_budget(config: TrainingConfig) -> None:
+    if any(
+        value > (1 << 64) - 1
+        for value in (
+            config.data.seed,
+            config.data.train_split,
+            config.data.eval_split,
+        )
+    ):
+        raise ValueError("data seeds and splits exceed the Phase 0 limit")
+    if config.reproducibility.seed > (1 << 32) - 1:
+        raise ValueError("reproducibility seed exceeds the Phase 0 limit")
+    if config.model.n_layers > _MAX_M0_LAYERS:
+        raise ValueError("n_layers exceeds the Phase 0 M0 resource budget")
+    if config.model.vocab_size < 4:
+        raise ValueError("vocab_size must be at least 4")
+    if config.model.max_seq_len < 2:
+        raise ValueError("max_seq_len must be at least 2")
+    if config.data.batch_size > _MAX_M0_BATCH_SIZE:
+        raise ValueError("batch_size exceeds the Phase 0 M0 resource budget")
+    if config.model.max_seq_len > _MAX_M0_SEQUENCE_LENGTH:
+        raise ValueError("max_seq_len exceeds the Phase 0 M0 resource budget")
+    (
+        batch_tokens,
+        logit_elements,
+        attention_elements,
+        hidden_elements,
+        spool_elements,
+    ) = _resource_products(config)
+    if batch_tokens > _MAX_M0_BATCH_TOKENS:
+        raise ValueError("batch token count exceeds the Phase 0 M0 resource budget")
+    if logit_elements > _MAX_M0_LOGIT_ELEMENTS:
+        raise ValueError("logit tensor exceeds the Phase 0 M0 resource budget")
+    if attention_elements > _MAX_M0_ATTENTION_ELEMENTS:
+        raise ValueError("attention tensor exceeds the Phase 0 M0 resource budget")
+    if hidden_elements > _MAX_M0_HIDDEN_ELEMENTS:
+        raise ValueError("hidden activations exceed the Phase 0 M0 resource budget")
+    if spool_elements > _MAX_M0_SPOOL_ELEMENTS:
+        raise ValueError("Spool recurrence exceeds the Phase 0 M0 resource budget")
+    if config.optimization.schedule_total_steps > _MAX_M0_SCHEDULE_STEPS:
+        raise ValueError("training schedule exceeds the Phase 0 M0 resource budget")
+    if config.run.keep_last_checkpoints > _MAX_M0_RETAINED_CHECKPOINTS:
+        raise ValueError("checkpoint retention exceeds the Phase 0 M0 resource budget")
+    if any(
+        value > _MAX_M0_SCHEDULE_STEPS
+        for value in (
+            config.run.log_every_steps,
+            config.run.checkpoint_every_steps,
+        )
+    ):
+        raise ValueError("run counts exceed the Phase 0 M0 resource budget")
+
+    total_trainable = _meta_trainable_parameters(config.model)
+    if total_trainable > _MAX_M0_TRAINABLE_PARAMETERS:
+        raise ValueError("model exceeds the 10M-parameter Phase 0 M0 budget")
+
+
+def _resource_products(
+    config: TrainingConfig,
+) -> tuple[int, int, int, int, int]:
+    batch = config.data.batch_size
+    layers = config.model.n_layers
+    length = config.model.max_seq_len
+    batch_tokens = batch * length
+    hidden_elements = batch * layers * length * config.model.d_model
+    return (
+        batch_tokens,
+        batch_tokens * config.model.vocab_size,
+        batch * layers * config.model.n_heads * length * length,
+        hidden_elements,
+        hidden_elements * config.model.spool_rank,
+    )
+
+
+def _meta_trainable_parameters(config: ModelConfig) -> int:
+    _validate_phase0_model_budget(config)
+    with torch.device("meta"):
+        probe = MoiraModel(config)
+    return probe.parameter_ledger().total_trainable
+
+
+def _validate_operation_work(
+    config: TrainingConfig,
+    *,
+    units: int,
+    limit: int,
+    operation: str,
+) -> None:
+    batch_tokens, logit, attention, hidden, spool = _resource_products(config)
+    per_unit = (
+        _meta_trainable_parameters(config.model) * batch_tokens
+        + logit
+        + attention
+        + hidden
+        + spool
+    )
+    if units * per_unit > limit:
+        raise ValueError(f"{operation} request exceeds the Phase 0 M0 work budget")
+
+
+def _build_config_section(
+    name: str,
+    section_type: type[_ConfigSection],
+    raw: object,
+) -> _ConfigSection:
+    if not isinstance(raw, dict):
+        raise ValueError(f"config section {name!r} must be a table")
+    section_fields = {field.name: field for field in fields(section_type)}
+    unknown = sorted(set(raw) - set(section_fields))
+    missing = sorted(
+        field.name
+        for field in section_fields.values()
+        if field.default is MISSING
+        and field.default_factory is MISSING
+        and field.name not in raw
+    )
+    if unknown or missing:
+        raise ValueError(
+            f"config section {name!r} has invalid fields "
+            f"(missing={missing}, unknown={unknown})"
+        )
+    for field_name, value in raw.items():
+        annotation = section_fields[field_name].type
+        if not _matches_annotation(value, annotation):
+            raise ValueError(
+                f"config field {name}.{field_name} has the wrong TOML type"
+            )
+        if type(value) is float and not math.isfinite(value):
+            raise ValueError(f"config field {name}.{field_name} must be finite")
+    return section_type(**raw)
+
+
+def _matches_annotation(value: object, annotation: object) -> bool:
+    alternatives = get_args(annotation)
+    if alternatives:
+        return any(_matches_annotation(value, item) for item in alternatives)
+    if annotation is None or annotation is NoneType:
+        return value is None
+    return isinstance(annotation, type) and type(value) is annotation
+
+
+def _describe_deployment(profile: str) -> dict[str, object]:
+    descriptions = {
+        "consumer": (
+            "One resident field, sequential support fields, local encrypted "
+            "memory, lazy organs, and zero paid compute by default."
+        ),
+        "enterprise": (
+            "A future profile with distributed placement, parallel fields, "
+            "tenant isolation, audit sinks, training queues, and explicit cost budgets."
+        ),
+    }
+    return {
+        "implemented_in_phase_0": False,
+        "model": "MOIRA",
+        "profile": profile,
+        "profile_changes_model_identity": False,
+        "status": "architecture contract only",
+        "description": descriptions[profile],
+        "switch_command_available": False,
+    }
+
+
+def _doctor(config_path: Path, run_dir: Path, device: str) -> dict[str, object]:
+    config = _load_config(config_path)
+    _validate_phase_zero(config, stop_at_step=1, device=device)
+    _seed_strict(config.reproducibility.seed)
+    model, _, _ = _build_components(config)
+    ledger = model.parameter_ledger()
+    ledger.assert_matches()
+    SyntheticStream(
+        config.data.seed,
+        config.model.vocab_size,
+        config.model.max_seq_len,
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=run_dir, prefix=".moira-write-check-", delete=True
+    ) as handle:
+        handle.write(b"ok")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return {
+        "cuda_available": torch.cuda.is_available(),
+        "device": device,
+        "expected_trainable_parameters": config.model.expected_trainable_parameters,
+        "numpy": np.__version__,
+        "ok": True,
+        "phase": "M0",
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "pytorch": torch.__version__,
+        "run_dir": str(run_dir.resolve()),
+        "run_dir_writable": True,
+        "synthetic_data": config.data.kind == "synthetic-indexed-v1",
+        "trainable_parameters": ledger.total_trainable,
+    }
+
+
+def _train(
+    config_path: Path,
+    run_dir: Path,
+    device: str,
+    stop_at_step: int,
+    resume: str,
+) -> dict[str, object]:
+    config = _load_config(config_path)
+    _validate_phase_zero(config, stop_at_step=stop_at_step, device=device)
+    _validate_operation_work(
+        config,
+        units=stop_at_step,
+        limit=_MAX_M0_TRAINING_WORK,
+        operation="training",
+    )
+    resume_source: str | Path | None
+    if resume == "none":
+        resume_source = None
+    elif resume == "auto":
+        resume_source = "auto"
+    else:
+        resume_source = Path(resume)
+    result = train_until(
+        config,
+        run_dir,
+        stop_at_step=stop_at_step,
+        resume=resume_source,
+        device=device,
+    )
+    return {
+        "checkpoint": str(result.checkpoint_path.resolve()),
+        "global_step": result.global_step,
+        "lineage_id": result.lineage_id,
+        "samples_seen": result.samples_seen,
+        "steps_run": len(result.losses),
+        "tokens_seen": result.tokens_seen,
+    }
+
+
+def _load_disposable_checkpoint(
+    config: TrainingConfig,
+    *,
+    run_dir: Path | None,
+    checkpoint: Path | None,
+    device: str,
+) -> tuple[MoiraModel, LoadedCheckpoint]:
+    _validate_phase_zero(config, stop_at_step=1, device=device)
+    _seed_strict(config.reproducibility.seed)
+    model, optimizer, scheduler = _build_components(config)
+    manifests = _semantic_manifests(config)
+    source = run_dir if run_dir is not None else checkpoint
+    if source is None:
+        raise ValueError("a run directory or checkpoint is required")
+    loaded = load_checkpoint(
+        source,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        expected_manifests=manifests,
+        auto=run_dir is not None,
+    )
+    return model, loaded
+
+
+def _verify(
+    config_path: Path,
+    run_dir: Path | None,
+    checkpoint: Path | None,
+) -> dict[str, object]:
+    config = _load_config(config_path)
+    if checkpoint is not None:
+        _validate_phase_zero(config, stop_at_step=1, device="cpu")
+        _seed_strict(config.reproducibility.seed)
+        payload = verify_checkpoint(
+            checkpoint,
+            expected_manifests=_semantic_manifests(config),
+        )
+        cursor = payload["data_cursor"]
+        return {
+            "checkpoint": str(checkpoint.resolve()),
+            "global_step": payload["global_step"],
+            "lineage_id": payload["lineage_id"],
+            "samples_seen": cursor["samples_seen"],
+            "tokens_seen": cursor["tokens_seen"],
+            "verified": True,
+        }
+    _, loaded = _load_disposable_checkpoint(
+        config,
+        run_dir=run_dir,
+        checkpoint=None,
+        device="cpu",
+    )
+    return {
+        "checkpoint": str(loaded.checkpoint_path.resolve()),
+        "global_step": loaded.global_step,
+        "lineage_id": loaded.lineage_id,
+        "samples_seen": loaded.data_cursor.samples_seen,
+        "tokens_seen": loaded.data_cursor.tokens_seen,
+        "verified": True,
+    }
+
+
+def _evaluate(
+    config_path: Path,
+    run_dir: Path | None,
+    checkpoint: Path | None,
+    device: str,
+    batches: int,
+) -> dict[str, object]:
+    if batches <= 0:
+        raise ValueError("batches must be a positive integer")
+    if batches > _MAX_EVALUATION_BATCHES:
+        raise ValueError("batches exceeds the Phase 0 evaluation budget")
+    config = _load_config(config_path)
+    _validate_operation_work(
+        config,
+        units=batches,
+        limit=_MAX_M0_EVALUATION_WORK,
+        operation="evaluation",
+    )
+    model, loaded = _load_disposable_checkpoint(
+        config,
+        run_dir=run_dir,
+        checkpoint=checkpoint,
+        device=device,
+    )
+    result = evaluate_smoke(config, model, batches=batches)
+    return {
+        "batches": result.batches,
+        "checkpoint": str(loaded.checkpoint_path.resolve()),
+        "checkpoint_step": loaded.global_step,
+        "lineage_id": loaded.lineage_id,
+        "loss": result.loss,
+        "samples": result.samples,
+        "tokens": result.tokens,
+    }
+
+
+def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
+    if arguments.command == "deployment":
+        return _describe_deployment(arguments.profile)
+    if arguments.command == "doctor":
+        return _doctor(arguments.config, arguments.run_dir, arguments.device)
+    if arguments.command == "train":
+        return _train(
+            arguments.config,
+            arguments.run_dir,
+            arguments.device,
+            arguments.stop_at_step,
+            arguments.resume,
+        )
+    if arguments.command == "checkpoint":
+        return _verify(arguments.config, arguments.run_dir, arguments.checkpoint)
+    if arguments.command == "evaluate":
+        return _evaluate(
+            arguments.config,
+            arguments.run_dir,
+            arguments.checkpoint,
+            arguments.device,
+            arguments.batches,
+        )
+    raise ValueError("unknown command")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    try:
+        output = _dispatch(parser.parse_args(argv))
+    except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(
+        json.dumps(
+            output,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
