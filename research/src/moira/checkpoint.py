@@ -3,35 +3,46 @@
 from __future__ import annotations
 
 import errno
+import gc
 import hashlib
 import json
 import math
 import os
 import pickletools
+import platform
 import random
 import re
 import stat
 import struct
 import tempfile
 import zipfile
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from threading import Lock, RLock, local
 from types import FunctionType
 from typing import Any, BinaryIO, Iterator, Mapping
+from weakref import ReferenceType
 
 import numpy as np
 import torch
 from torch import Tensor, nn
+from torch.nn.modules import module as torch_module
 from torch.optim import AdamW, Optimizer
+from torch.optim import optimizer as torch_optimizer_module
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
-from .config import ModelConfig, OptimizationConfig
-from .ledger import ParameterLedger, ParameterSubsystem
+from .config import (
+    DataConfig,
+    ModelConfig,
+    OptimizationConfig,
+    ReproducibilityConfig,
+)
+from .ledger import ParameterLedger, ParameterLedgerEntry, ParameterSubsystem
 from .model import MoiraModel
-from .synthetic import DataCursor
+from .synthetic import SYNTHETIC_CURSOR_KIND, DataCursor
 
 
 CHECKPOINT_SCHEMA_VERSION = 2
@@ -135,6 +146,32 @@ _PICKLE_GLOBALS = frozenset(
         "torch LongStorage",
     }
 )
+_PICKLE_STORAGE_BYTES = {
+    "torch BoolStorage": 1,
+    "torch ByteStorage": 1,
+    "torch FloatStorage": 4,
+    "torch LongStorage": 8,
+}
+_DATA_CONFIG_KEYS = {"kind", "seed", "train_split", "eval_split", "batch_size"}
+_DATA_DERIVED_KEYS = {"stream_version", "sequence_length", "vocab_size"}
+_RUNTIME_KEYS = {
+    "python",
+    "python_implementation",
+    "pytorch",
+    "numpy",
+    "platform",
+    "machine",
+    "device",
+    "cuda",
+    "cudnn",
+    "deterministic_algorithms",
+    "cudnn_benchmark",
+    "cudnn_deterministic",
+    "matmul_allow_tf32",
+    "cudnn_allow_tf32",
+    "float32_matmul_precision",
+    "torch_threads",
+}
 _SIDECAR_KEYS = {
     "schema_version",
     "checkpoint",
@@ -213,6 +250,41 @@ class _CheckpointSnapshot:
     source_status: os.stat_result
     byte_size: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PointerObservation:
+    encoded: bytes | None
+    protected_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _PickleGlobal:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PickleStorage:
+    key: str
+    storage_type: str
+    numel: int
+    item_size: int
+
+
+@dataclass(slots=True)
+class _PickleContainer:
+    kind: str
+    items: int = 0
+    children: list[object] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _PickleTuple:
+    children: tuple[object, ...]
+
+
+_PICKLE_MARK = object()
+_PICKLE_TENSOR = object()
 
 
 @contextmanager
@@ -350,26 +422,44 @@ def save_checkpoint(
     if global_step > 999_999_999:
         raise ValueError("global_step is outside the Phase 0 canonical range")
     _require_positive_integer("keep_last_checkpoints", keep_last_checkpoints)
-    if not isinstance(model, MoiraModel):
+    if type(model) is not MoiraModel:
         raise ValueError("Phase 0 checkpoints require a MoiraModel")
     if type(optimizer) is not AdamW:
         raise ValueError("Phase 0 checkpoints require AdamW")
     if type(scheduler) is not LambdaLR:
         raise ValueError("Phase 0 checkpoints require LambdaLR")
-    if not isinstance(data_cursor, DataCursor):
-        raise ValueError("data_cursor must be a DataCursor")
+    if type(data_cursor) is not DataCursor:
+        raise ValueError("data_cursor must be an exact Phase 0 DataCursor")
     if scaler is not None:
         raise ValueError("Phase 0 checkpoints require scaler=None")
-    if not isinstance(parameter_ledger, ParameterLedger):
-        raise ValueError("parameter_ledger must be a ParameterLedger")
-    if parameter_ledger._model is not model:
-        raise ValueError("parameter ledger must belong to the checkpoint model")
-    parameter_ledger.assert_matches()
-
+    if (
+        type(parameter_ledger) is not ParameterLedger
+        or type(parameter_ledger.entries) is not tuple
+        or any(
+            type(entry) is not ParameterLedgerEntry
+            or type(entry.aliases) is not tuple
+            or not entry.aliases
+            or any(type(alias) is not str or not alias for alias in entry.aliases)
+            or type(entry.subsystem) is not ParameterSubsystem
+            or not _is_positive_integer(entry.trainable_parameters)
+            for entry in parameter_ledger.entries
+        )
+        or not _is_positive_integer(parameter_ledger.total_trainable)
+    ):
+        raise ValueError("parameter_ledger must be an exact Phase 0 ledger")
     manifests = _normalize_manifests(semantic_manifests)
     manifest_hashes = _manifest_hashes(manifests)
     normalized_provenance = _normalize_provenance(provenance)
+    normalized_counters = _normalize_counters(counters)
+    normalized_metrics = _normalize_metrics(last_metrics)
+    _validate_live_component_runtime(model, optimizer, scheduler, manifests)
+    if parameter_ledger._model is not model:
+        raise ValueError("parameter ledger must belong to the checkpoint model")
+    ParameterLedger.assert_matches(parameter_ledger)
+
     model_state = dict(model.state_dict())
+    optimizer_state = optimizer.state_dict()
+    scheduler_state = scheduler.state_dict()
     ledger_evidence = _ledger_evidence(parameter_ledger, model_state)
     payload: dict[str, Any] = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -379,8 +469,8 @@ def save_checkpoint(
         "samples_seen": data_cursor.samples_seen,
         "tokens_seen": data_cursor.tokens_seen,
         "model_state": model_state,
-        "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
+        "optimizer_state": optimizer_state,
+        "scheduler_state": scheduler_state,
         "scaler_state": None,
         "rng_state": _capture_rng_state(),
         "data_cursor": {
@@ -393,8 +483,8 @@ def save_checkpoint(
         "manifest_hashes": manifest_hashes,
         "provenance": normalized_provenance,
         "parameter_ledger": ledger_evidence,
-        "counters": _normalize_counters(counters),
-        "last_metrics": _normalize_metrics(last_metrics),
+        "counters": normalized_counters,
+        "last_metrics": normalized_metrics,
     }
     _validate_payload(payload, expected_manifests=manifests)
     _validate_phase0_resumability(model, optimizer, scheduler, payload, manifests)
@@ -430,7 +520,9 @@ def _commit_checkpoint(
     checkpoint_path = checkpoint_dir / f"step-{global_step:09d}.pt"
     sidecar_path = checkpoint_path.with_suffix(".json")
     latest_path = checkpoint_dir / "latest.json"
-    _validate_previous_pointer(latest_path, lineage_id, global_step)
+    pointer_observation = _validate_previous_pointer(
+        latest_path, lineage_id, global_step
+    )
 
     staged_path: Path | None = None
     try:
@@ -458,7 +550,10 @@ def _commit_checkpoint(
                 _validate_payload(existing, expected_manifests=manifests)
             except ValueError:
                 _reclaim_unreferenced(
-                    (sidecar_path, checkpoint_path), latest_path, checkpoint_path.name
+                    (sidecar_path, checkpoint_path),
+                    latest_path,
+                    checkpoint_path.name,
+                    pointer_observation,
                 )
                 if not _claim_file(staged_path, checkpoint_path):
                     raise ValueError("checkpoint step was claimed concurrently")
@@ -503,12 +598,18 @@ def _commit_checkpoint(
             existing_sidecar = _read_json(sidecar_path, "existing checkpoint sidecar")
         except ValueError:
             _reclaim_unreferenced(
-                (sidecar_path,), latest_path, checkpoint_path.name
+                (sidecar_path,),
+                latest_path,
+                checkpoint_path.name,
+                pointer_observation,
             )
         else:
             if set(existing_sidecar) != _SIDECAR_KEYS:
                 _reclaim_unreferenced(
-                    (sidecar_path,), latest_path, checkpoint_path.name
+                    (sidecar_path,),
+                    latest_path,
+                    checkpoint_path.name,
+                    pointer_observation,
                 )
             elif existing_sidecar != sidecar:
                 raise ValueError("checkpoint sidecar has different committed content")
@@ -544,10 +645,8 @@ def _commit_checkpoint(
         "sha256": checksum,
         "byte_size": byte_size,
     }
-    existing_pointer = None
-    if latest_path.exists():
-        existing_pointer = _read_json(latest_path, "latest pointer")
-    if existing_pointer != pointer:
+    pointer_bytes, _ = _observe_pointer(latest_path)
+    if pointer_bytes != _canonical_json(pointer) + b"\n":
         _recheck_verified_checkpoint(verified)
         _atomic_write_json(latest_path, pointer)
     if _read_json(latest_path, "latest pointer") != pointer:
@@ -569,10 +668,10 @@ def _commit_checkpoint(
 def verify_checkpoint(
     checkpoint_path: str | os.PathLike[str],
     *,
-    expected_manifests: Mapping[str, Mapping[str, object]] | None = None,
+    expected_manifests: Mapping[str, Mapping[str, object]],
     expected_lineage_id: str | None = None,
 ) -> dict[str, Any]:
-    """Verify that an immutable artifact is resumable by the exact Phase-0 stack."""
+    """Verify resumability against caller-trusted exact Phase-0 manifests."""
     return _verify_checkpoint_record(
         Path(checkpoint_path),
         expected_manifests=expected_manifests,
@@ -618,7 +717,12 @@ def _load_checkpoint_locked(
     auto: bool,
 ) -> LoadedCheckpoint:
     """Strictly restore components and restore process RNG state last."""
+    if scaler is not None:
+        raise ValueError("Phase 0 checkpoints require scaler=None")
     normalized_expected = _normalize_manifests(expected_manifests)
+    _validate_live_component_runtime(
+        model, optimizer, scheduler, normalized_expected
+    )
     verified = _resolve_checkpoint(
         Path(source),
         auto=auto,
@@ -626,8 +730,6 @@ def _load_checkpoint_locked(
         expected_lineage_id=expected_lineage_id,
     )
     payload = verified.payload
-    if scaler is not None:
-        raise ValueError("Phase 0 checkpoints require scaler=None")
     _validate_phase0_resumability(
         model, optimizer, scheduler, payload, normalized_expected
     )
@@ -648,9 +750,13 @@ def _load_checkpoint_locked(
         scheduler.load_state_dict(payload["scheduler_state"])
         optimizer.load_state_dict(payload["optimizer_state"])
         _restore_rng_state(payload["rng_state"])
+        _validate_phase0_resumability(
+            model, optimizer, scheduler, payload, normalized_expected
+        )
+        _recheck_verified_checkpoint(verified)
     except Exception:
         nn.Module.load_state_dict(model, component_state[0], strict=True)
-        LRScheduler.load_state_dict(scheduler, component_state[2])
+        LambdaLR.load_state_dict(scheduler, component_state[2])
         Optimizer.load_state_dict(optimizer, component_state[1])
         _restore_rng_state(rng_before)
         raise
@@ -806,13 +912,16 @@ def _validate_payload(
     if not isinstance(payload, dict) or set(payload) != _REQUIRED_PAYLOAD_KEYS:
         raise ValueError("checkpoint payload schema is invalid")
     _validate_state_tree(payload)
-    if payload["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != CHECKPOINT_SCHEMA_VERSION
+    ):
         raise ValueError("checkpoint schema version is invalid")
     _require_non_empty_string("lineage_id", payload["lineage_id"])
     _require_positive_integer("global_step", payload["global_step"])
     if payload["global_step"] > 999_999_999:
         raise ValueError("checkpoint step is outside the canonical range")
-    if payload["micro_step"] != 0:
+    if type(payload["micro_step"]) is not int or payload["micro_step"] != 0:
         raise ValueError("checkpoint micro step must be zero")
     _require_non_negative_integer("samples_seen", payload["samples_seen"])
     _require_non_negative_integer("tokens_seen", payload["tokens_seen"])
@@ -1087,8 +1196,9 @@ def _validate_phase0_saved_progress(
             or exp_avg_sq.device.type != "cpu"
             or exp_avg.layout is not torch.strided
             or exp_avg_sq.layout is not torch.strided
+            or bool(torch.any(exp_avg_sq < 0).item())
         ):
-            raise ValueError("Phase 0 AdamW progress is incompatible")
+            raise ValueError("Phase 0 AdamW progress or second moment is incompatible")
 
     scheduler_keys = {
         "base_lrs",
@@ -1118,28 +1228,126 @@ def _validate_phase0_saved_progress(
 
 def _phase0_configs(
     manifests: Mapping[str, Mapping[str, object]],
-) -> tuple[ModelConfig, OptimizationConfig]:
+) -> tuple[
+    ModelConfig,
+    OptimizationConfig,
+    DataConfig,
+    ReproducibilityConfig,
+]:
+    model_manifest = manifests["model"]
+    optimization_manifest = manifests["optimization"]
+    model_integer_fields = (
+        "vocab_size",
+        "d_model",
+        "n_layers",
+        "n_heads",
+        "ffn_dim",
+        "thread_radius",
+        "spool_rank",
+        "knot_slots",
+        "capsule_width",
+        "max_seq_len",
+    )
+    optimization_float_fields = (
+        "learning_rate",
+        "weight_decay",
+        "clip_grad_norm",
+    )
+    optimization_integer_fields = (
+        "gradient_accumulation_steps",
+        "warmup_steps",
+        "schedule_total_steps",
+    )
+    if (
+        any(type(model_manifest.get(name)) is not int for name in model_integer_fields)
+        or type(model_manifest.get("dropout")) is not float
+        or type(model_manifest.get("tie_embeddings")) is not bool
+        or model_manifest.get("expected_trainable_parameters") is not None
+        and type(model_manifest["expected_trainable_parameters"]) is not int
+        or any(
+            type(optimization_manifest.get(name)) is not float
+            for name in optimization_float_fields
+        )
+        or any(
+            type(optimization_manifest.get(name)) is not int
+            for name in optimization_integer_fields
+        )
+        or any(
+            type(optimization_manifest.get(name)) is not str
+            for name in ("optimizer", "schedule", "precision")
+        )
+    ):
+        raise ValueError("Phase 0 model or optimization scalar types are invalid")
     try:
-        model_config = ModelConfig(**dict(manifests["model"]))
-        optimization_config = OptimizationConfig(**dict(manifests["optimization"]))
+        model_config = ModelConfig(**dict(model_manifest))
+        optimization_config = OptimizationConfig(**dict(optimization_manifest))
+        data_manifest = manifests["data"]
+        if set(data_manifest) != _DATA_CONFIG_KEYS | _DATA_DERIVED_KEYS:
+            raise ValueError("data manifest keys are invalid")
+        data_config = DataConfig(
+            **{name: data_manifest[name] for name in _DATA_CONFIG_KEYS}
+        )
+        reproducibility_config = ReproducibilityConfig(
+            **dict(manifests["reproducibility"])
+        )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("Phase 0 model or optimization manifest is invalid") from error
+        raise ValueError("Phase 0 semantic configuration manifest is invalid") from error
     if not _values_equal(asdict(model_config), manifests["model"]):
         raise ValueError("Phase 0 model manifest is not an exact ModelConfig")
     if not _values_equal(asdict(optimization_config), manifests["optimization"]):
         raise ValueError(
             "Phase 0 optimization manifest is not an exact OptimizationConfig"
         )
-    return model_config, optimization_config
+    if not _values_equal(
+        asdict(data_config),
+        {name: data_manifest[name] for name in _DATA_CONFIG_KEYS},
+    ):
+        raise ValueError("Phase 0 data manifest is not an exact DataConfig")
+    if (
+        any(
+            type(value) is not int or not 0 <= value <= (1 << 64) - 1
+            for value in (
+                data_config.seed,
+                data_config.train_split,
+                data_config.eval_split,
+            )
+        )
+        or type(data_config.batch_size) is not int
+        or type(data_manifest["stream_version"]) is not int
+        or type(data_manifest["sequence_length"]) is not int
+        or type(data_manifest["vocab_size"]) is not int
+    ):
+        raise ValueError("Phase 0 data manifest values are invalid")
+    if not _values_equal(
+        asdict(reproducibility_config), manifests["reproducibility"]
+    ):
+        raise ValueError(
+            "Phase 0 reproducibility manifest is not an exact ReproducibilityConfig"
+        )
+    if (
+        type(reproducibility_config.seed) is not int
+        or reproducibility_config.seed > (1 << 32) - 1
+    ):
+        raise ValueError("Phase 0 reproducibility seed is invalid")
+    _validate_phase0_runtime_manifest(manifests["runtime"])
+    return (
+        model_config,
+        optimization_config,
+        data_config,
+        reproducibility_config,
+    )
 
 
 def _build_phase0_validation_components(
     manifests: Mapping[str, Mapping[str, object]],
 ) -> tuple[MoiraModel, AdamW, LambdaLR]:
-    model_config, optimization_config = _phase0_configs(manifests)
+    _validate_global_module_hooks()
+    _validate_global_optimizer_hooks()
+    model_config, optimization_config, _, _ = _phase0_configs(manifests)
     _validate_phase0_model_budget(model_config)
     with torch.random.fork_rng(devices=[], enabled=True):
         model = MoiraModel(model_config).to(device="cpu", dtype=torch.float32)
+    _validate_global_module_hooks()
     optimizer = AdamW(
         model.parameters(),
         lr=optimization_config.learning_rate,
@@ -1154,6 +1362,7 @@ def _build_phase0_validation_components(
             optimization_config.schedule_total_steps,
         ),
     )
+    _validate_global_optimizer_hooks()
     return model, optimizer, scheduler
 
 
@@ -1183,6 +1392,583 @@ def _validate_phase0_model_budget(config: ModelConfig) -> None:
         raise ValueError("Phase 0 model dimensions exceed the checkpoint budget")
 
 
+def _validate_phase0_runtime_manifest(runtime: Mapping[str, object]) -> None:
+    context_strings = (
+        "python",
+        "python_implementation",
+        "pytorch",
+        "numpy",
+        "platform",
+        "machine",
+    )
+    if (
+        set(runtime) != _RUNTIME_KEYS
+        or any(
+            not isinstance(runtime.get(name), str) or not runtime[name]
+            for name in context_strings
+        )
+        or runtime.get("device") != "cpu"
+        or runtime.get("deterministic_algorithms") is not True
+        or runtime.get("cudnn_benchmark") is not False
+        or runtime.get("cudnn_deterministic") is not True
+        or runtime.get("matmul_allow_tf32") is not False
+        or runtime.get("cudnn_allow_tf32") is not False
+        or runtime.get("float32_matmul_precision") != "highest"
+        or type(runtime.get("torch_threads")) is not int
+        or runtime["torch_threads"] != 1
+        or runtime.get("cuda") is not None
+        and (not isinstance(runtime["cuda"], str) or not runtime["cuda"])
+        or runtime.get("cudnn") is not None
+        and (
+            type(runtime["cudnn"]) is not int
+            or int(runtime["cudnn"]) < 0
+        )
+    ):
+        raise ValueError("Phase 0 runtime manifest is not an honest CPU runtime")
+
+
+def _current_runtime_manifest() -> dict[str, object]:
+    return {
+        "python": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "pytorch": torch.__version__,
+        "numpy": np.__version__,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "device": "cpu",
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "torch_threads": torch.get_num_threads(),
+    }
+
+
+def _validate_current_runtime(runtime: Mapping[str, object]) -> None:
+    _validate_phase0_runtime_manifest(runtime)
+    if runtime != _current_runtime_manifest():
+        raise ValueError("current runtime does not match the strict runtime manifest")
+
+
+def _validate_global_module_hooks() -> None:
+    names = (
+        "_global_buffer_registration_hooks",
+        "_global_module_registration_hooks",
+        "_global_parameter_registration_hooks",
+        "_global_backward_pre_hooks",
+        "_global_backward_hooks",
+        "_global_forward_pre_hooks",
+        "_global_forward_hooks",
+        "_global_forward_hooks_always_called",
+        "_global_forward_hooks_with_kwargs",
+    )
+    if any(
+        type(getattr(torch_module, name, None)) is not OrderedDict
+        or bool(getattr(torch_module, name))
+        for name in names
+    ):
+        raise ValueError("Phase 0 process-global module hooks are not allowed")
+
+
+def _validate_global_optimizer_hooks() -> None:
+    if any(
+        type(getattr(torch_optimizer_module, name, None)) is not OrderedDict
+        or bool(getattr(torch_optimizer_module, name))
+        for name in ("_global_optimizer_pre_hooks", "_global_optimizer_post_hooks")
+    ):
+        raise ValueError("Phase 0 process-global optimizer hooks are not allowed")
+
+
+def _alias_signature(named_values: list[tuple[str, object]]) -> list[int]:
+    first: dict[int, int] = {}
+    return [first.setdefault(id(value), len(first)) for _, value in named_values]
+
+
+def _has_exact_dict_keys(value: dict[object, object], key_type: type[object]) -> bool:
+    return all(type(key) is key_type for key in dict.keys(value))
+
+
+def _storage_span(value: Tensor, label: str) -> tuple[str, int, int]:
+    try:
+        storage = value.untyped_storage()
+        byte_size = storage.nbytes()
+        start = storage.data_ptr()
+        device = str(storage.device)
+    except (RuntimeError, TypeError, OverflowError) as error:
+        raise ValueError(f"{label} storage cannot be inspected") from error
+    if (
+        type(byte_size) is not int
+        or byte_size < 0
+        or type(start) is not int
+        or start < 0
+        or byte_size > 0
+        and start == 0
+    ):
+        raise ValueError(f"{label} storage span is invalid")
+    return device, start, start + byte_size
+
+
+def _storage_spans_overlap(
+    left: tuple[str, int, int], right: tuple[str, int, int]
+) -> bool:
+    return (
+        left[0] == right[0]
+        and left[1] < right[2]
+        and right[1] < left[2]
+    )
+
+
+def _validate_accumulate_grad_hooks(parameter: Tensor) -> None:
+    accumulator = torch.autograd.graph.get_gradient_edge(parameter).node
+    hook_maps = gc.get_referents(accumulator)
+    if len(hook_maps) > 2 or any(
+        type(hooks) is not OrderedDict
+        or not _has_exact_dict_keys(hooks, int)
+        or bool(hooks)
+        for hooks in hook_maps
+    ):
+        raise ValueError("Phase 0 live model parameter has an AccumulateGrad hook")
+
+    def probe(*_args: object) -> None:
+        return None
+
+    for register_name in ("register_hook", "register_prehook"):
+        handle = getattr(accumulator, register_name)(probe)
+        try:
+            hooks = handle.hooks_dict_ref()
+            if (
+                type(hooks) is not OrderedDict
+                or not _has_exact_dict_keys(hooks, int)
+                or tuple(OrderedDict.keys(hooks)) != (handle.id,)
+                or OrderedDict.__getitem__(hooks, handle.id) is not probe
+            ):
+                raise ValueError(
+                    "Phase 0 live model parameter has an AccumulateGrad hook"
+                )
+        finally:
+            handle.remove()
+
+
+def _validate_named_tensor_graph(
+    live_values: list[tuple[str, Tensor]],
+    canonical_values: list[tuple[str, Tensor]],
+    label: str,
+) -> None:
+    if (
+        [name for name, _ in live_values]
+        != [name for name, _ in canonical_values]
+        or _alias_signature(live_values) != _alias_signature(canonical_values)
+    ):
+        raise ValueError(f"Phase 0 live model {label} topology is not exact")
+    for (_, live), (_, expected) in zip(live_values, canonical_values):
+        if type(live) is not type(expected):
+            raise ValueError(f"Phase 0 live model {label} semantics are not exact")
+        live_vars = vars(live)
+        expected_vars = vars(expected)
+        if type(live_vars) is not dict or not _has_exact_dict_keys(live_vars, str):
+            raise ValueError(f"Phase 0 live model {label} semantics are not exact")
+        live_hook_state = tuple(
+            getattr(live, name, None)
+            for name in ("_backward_hooks", "_post_accumulate_grad_hooks")
+        )
+        expected_hook_state = tuple(
+            getattr(expected, name, None)
+            for name in ("_backward_hooks", "_post_accumulate_grad_hooks")
+        )
+        if (
+            live.shape != expected.shape
+            or live.dtype != expected.dtype
+            or live.layout != expected.layout
+            or live.stride() != expected.stride()
+            or live.storage_offset() != expected.storage_offset()
+            or live.requires_grad is not expected.requires_grad
+            or set(live_vars) != set(expected_vars)
+            or any(
+                type(observed) is not type(canonical)
+                or not _values_equal(observed, canonical)
+                for observed, canonical in zip(
+                    live_hook_state, expected_hook_state
+                )
+            )
+            or any(
+                isinstance(expected_value, Mapping)
+                and type(live_vars[name]) is not type(expected_value)
+                for name, expected_value in expected_vars.items()
+            )
+            or any(
+                not _values_equal(live_vars[name], expected_value)
+                for name, expected_value in expected_vars.items()
+            )
+        ):
+            raise ValueError(f"Phase 0 live model {label} semantics are not exact")
+    if label == "parameter":
+        for _, parameter in live_values:
+            _validate_accumulate_grad_hooks(parameter)
+            for hook_name in ("_backward_hooks", "_post_accumulate_grad_hooks"):
+                Tensor.__setattr__(parameter, hook_name, OrderedDict())
+                Tensor.__setattr__(parameter, hook_name, None)
+    try:
+        live_storages = [
+            (name, value.untyped_storage()) for name, value in live_values
+        ]
+        canonical_storages = [
+            (name, value.untyped_storage()) for name, value in canonical_values
+        ]
+    except RuntimeError as error:
+        raise ValueError(
+            f"Phase 0 live model {label} storage cannot be inspected"
+        ) from error
+    if any(
+            live.nbytes() != expected.nbytes()
+            for (_, live), (_, expected) in zip(
+                live_storages, canonical_storages
+            )
+        ):
+        raise ValueError(f"Phase 0 live model {label} storage topology is not exact")
+    live_spans = [_storage_span(value, f"live model {label}") for _, value in live_values]
+    for index, (_, expected_storage) in enumerate(canonical_storages):
+        for other in range(index):
+            expected_alias = expected_storage is canonical_storages[other][1]
+            live_alias = _storage_spans_overlap(
+                live_spans[index], live_spans[other]
+            )
+            if expected_alias != live_alias:
+                raise ValueError(
+                    f"Phase 0 live model {label} storage topology is not exact"
+                )
+def _validate_live_model_runtime(model: nn.Module, config: ModelConfig) -> None:
+    _validate_global_module_hooks()
+    if type(model) is not MoiraModel:
+        raise ValueError("Phase 0 live model type is not exact")
+    try:
+        with torch.device("meta"):
+            canonical = MoiraModel(config)
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("Phase 0 live model graph cannot be inspected") from error
+    _validate_global_module_hooks()
+    registry_names = {"_parameters", "_buffers", "_modules"}
+    stack = [("", model, canonical)]
+    seen_pairs: set[tuple[int, int]] = set()
+    canonical_to_live: dict[int, int] = {}
+    live_to_canonical: dict[int, int] = {}
+    live_parameters: list[tuple[str, Tensor]] = []
+    canonical_parameters: list[tuple[str, Tensor]] = []
+    live_buffers: list[tuple[str, Tensor]] = []
+    canonical_buffers: list[tuple[str, Tensor]] = []
+    while stack:
+        path, live, expected = stack.pop()
+        if len(seen_pairs) >= PHASE0_MAX_STATE_ENTRIES:
+            raise ValueError("Phase 0 live model graph exceeds its traversal budget")
+        if type(live) is not type(expected):
+            raise ValueError("Phase 0 live model graph types are not exact")
+        live_vars = object.__getattribute__(live, "__dict__")
+        expected_vars = object.__getattribute__(expected, "__dict__")
+        if (
+            type(live_vars) is not dict
+            or not _has_exact_dict_keys(live_vars, str)
+            or set(live_vars) != set(expected_vars)
+        ):
+            raise ValueError("Phase 0 live model graph types are not exact")
+        expected_id = id(expected)
+        live_id = id(live)
+        if (
+            canonical_to_live.setdefault(expected_id, live_id) != live_id
+            or live_to_canonical.setdefault(live_id, expected_id) != expected_id
+        ):
+            raise ValueError("Phase 0 live model alias topology is not exact")
+        pair = (live_id, expected_id)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        for name, expected_value in expected_vars.items():
+            if name == "training":
+                live_training = dict.__getitem__(live_vars, name)
+                if type(live_training) is not bool or live_training is not True:
+                    raise ValueError(
+                        "Phase 0 checkpoints require every module in training mode"
+                    )
+                continue
+            live_value = live_vars[name]
+            if isinstance(expected_value, Mapping):
+                if type(live_value) is not type(expected_value):
+                    raise ValueError("Phase 0 live model mapping types are not exact")
+                expected_key_types = {
+                    type(key) for key in dict.keys(expected_value)
+                }
+                if any(
+                    type(key) not in expected_key_types
+                    for key in dict.keys(live_value)
+                ):
+                    raise ValueError("Phase 0 live model mapping keys are not exact")
+            if name in registry_names:
+                if tuple(dict.keys(live_value)) != tuple(dict.keys(expected_value)):
+                    raise ValueError("Phase 0 live model registries are not exact")
+            elif not _values_equal(live_value, expected_value):
+                raise ValueError("Phase 0 live model runtime semantics are not exact")
+        for registry_name, live_target, canonical_target in (
+            ("_parameters", live_parameters, canonical_parameters),
+            ("_buffers", live_buffers, canonical_buffers),
+        ):
+            live_registry = dict.__getitem__(live_vars, registry_name)
+            expected_registry = dict.__getitem__(expected_vars, registry_name)
+            for name in dict.keys(expected_registry):
+                live_value = dict.__getitem__(live_registry, name)
+                expected_value = dict.__getitem__(expected_registry, name)
+                if (live_value is None) != (expected_value is None):
+                    raise ValueError("Phase 0 live model registries are not exact")
+                if expected_value is not None:
+                    full_name = f"{path}.{name}" if path else name
+                    live_target.append((full_name, live_value))
+                    canonical_target.append((full_name, expected_value))
+        live_children = dict.__getitem__(live_vars, "_modules")
+        expected_children = dict.__getitem__(expected_vars, "_modules")
+        for name in reversed(tuple(dict.keys(expected_children))):
+            live_child = dict.__getitem__(live_children, name)
+            expected_child = dict.__getitem__(expected_children, name)
+            if (live_child is None) != (expected_child is None):
+                raise ValueError("Phase 0 live model registries are not exact")
+            if expected_child is not None:
+                child_path = f"{path}.{name}" if path else name
+                stack.append((child_path, live_child, expected_child))
+    _validate_global_module_hooks()
+    _validate_named_tensor_graph(
+        live_parameters,
+        canonical_parameters,
+        "parameter",
+    )
+    _validate_named_tensor_graph(
+        live_buffers,
+        canonical_buffers,
+        "buffer",
+    )
+
+
+def _validate_wrapped_optimizer_step(
+    observed: object, expected: object, optimizer: AdamW
+) -> None:
+    if (
+        not isinstance(observed, FunctionType)
+        or not isinstance(expected, FunctionType)
+        or observed.__code__ is not expected.__code__
+        or observed.__defaults__ != expected.__defaults__
+        or observed.__kwdefaults__ != expected.__kwdefaults__
+        or observed.__closure__ is None
+        or len(observed.__closure__) != 2
+    ):
+        raise ValueError("Phase 0 optimizer step wrapper is not exact")
+    observed_vars = vars(observed)
+    expected_vars = vars(expected)
+    if (
+        type(observed_vars) is not dict
+        or not _has_exact_dict_keys(observed_vars, str)
+        or set(observed_vars) != {"__wrapped__", "hooked", "_wrapped_by_lr_sched"}
+        or observed_vars["hooked"] is not True
+        or observed_vars["_wrapped_by_lr_sched"] is not True
+    ):
+        raise ValueError("Phase 0 optimizer step wrapper is not exact")
+    wrapped = observed_vars["__wrapped__"]
+    expected_wrapped = expected_vars["__wrapped__"]
+    function, reference = (cell.cell_contents for cell in observed.__closure__)
+    if (
+        not isinstance(wrapped, FunctionType)
+        or not isinstance(expected_wrapped, FunctionType)
+        or wrapped is not function
+        or wrapped.__code__ is not expected_wrapped.__code__
+        or wrapped.__module__ != expected_wrapped.__module__
+        or wrapped.__qualname__ != expected_wrapped.__qualname__
+        or type(reference) is not ReferenceType
+        or reference() is not optimizer
+    ):
+        raise ValueError("Phase 0 optimizer step wrapper is not bound exactly")
+
+
+def _validate_optimizer_scheduler_runtime(
+    model: MoiraModel,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    optimization: OptimizationConfig,
+) -> None:
+    _validate_global_optimizer_hooks()
+    if type(optimizer) is not AdamW or type(scheduler) is not LambdaLR:
+        raise ValueError("Phase 0 optimizer and scheduler types are not exact")
+    canonical_optimizer = AdamW(
+        model.parameters(),
+        lr=optimization.learning_rate,
+        weight_decay=optimization.weight_decay,
+        foreach=False,
+        fused=False,
+    )
+    canonical_scheduler = LambdaLR(
+        canonical_optimizer,
+        lr_lambda=_phase0_schedule_lambda(
+            optimization.warmup_steps, optimization.schedule_total_steps
+        ),
+    )
+    _validate_global_optimizer_hooks()
+    observed_vars = vars(optimizer)
+    canonical_vars = vars(canonical_optimizer)
+    scheduler_vars = vars(scheduler)
+    canonical_scheduler_vars = vars(canonical_scheduler)
+    if (
+        type(observed_vars) is not dict
+        or not _has_exact_dict_keys(observed_vars, str)
+        or type(scheduler_vars) is not dict
+        or not _has_exact_dict_keys(scheduler_vars, str)
+    ):
+        raise ValueError("Phase 0 optimizer/scheduler runtime keys are not exact")
+    observed_state = dict.get(observed_vars, "state")
+    if (
+        type(observed_state) is not defaultdict
+        or observed_state.default_factory is not dict
+    ):
+        raise ValueError("Phase 0 AdamW state container is not exact")
+    state_keys = tuple(dict.keys(observed_state))
+    if any(type(key) is not nn.Parameter for key in state_keys):
+        raise ValueError("Phase 0 AdamW state keys are not exact Parameters")
+    named_model_parameters = tuple(model.named_parameters())
+    model_parameters = tuple(parameter for _, parameter in named_model_parameters)
+    active_parameters = tuple(
+        parameter
+        for name, parameter in named_model_parameters
+        if name not in PHASE0_INACTIVE_PARAMETER_ALIASES
+    )
+    if state_keys and tuple(map(id, state_keys)) != tuple(map(id, active_parameters)):
+        raise ValueError("Phase 0 AdamW state parameter topology is not exact")
+    state_values = tuple(dict.values(observed_state))
+    if any(
+        type(state) is not dict or not _has_exact_dict_keys(state, str)
+        for state in state_values
+    ):
+        raise ValueError("Phase 0 AdamW parameter-state keys are not exact")
+    observed_defaults = dict.get(observed_vars, "defaults")
+    if type(observed_defaults) is not dict or not _has_exact_dict_keys(
+        observed_defaults, str
+    ):
+        raise ValueError("Phase 0 AdamW default keys are not exact")
+    observed_param_groups = dict.get(observed_vars, "param_groups")
+    if (
+        type(observed_param_groups) is not list
+        or len(observed_param_groups) != 1
+        or type(observed_param_groups[0]) is not dict
+        or not _has_exact_dict_keys(observed_param_groups[0], str)
+    ):
+        raise ValueError("Phase 0 AdamW parameter-group keys are not exact")
+    observed_param_group = observed_param_groups[0]
+    hook_names = (
+        "_optimizer_step_pre_hooks",
+        "_optimizer_step_post_hooks",
+        "_optimizer_state_dict_pre_hooks",
+        "_optimizer_state_dict_post_hooks",
+        "_optimizer_load_state_dict_pre_hooks",
+        "_optimizer_load_state_dict_post_hooks",
+    )
+    if (
+        set(observed_vars) - {"_opt_called"} != set(canonical_vars)
+        or "_opt_called" in observed_vars
+        and observed_vars["_opt_called"] is not True
+        or set(scheduler_vars) != set(canonical_scheduler_vars)
+        or any(
+            type(observed_vars.get(name)) is not OrderedDict
+            or bool(observed_vars[name])
+            for name in hook_names
+        )
+        or not _values_equal(observed_defaults, canonical_optimizer.defaults)
+        or not _values_equal(
+            optimizer._zero_grad_profile_name,
+            canonical_optimizer._zero_grad_profile_name,
+        )
+        or optimizer._warned_capturable_if_run_uncaptured
+        is not canonical_optimizer._warned_capturable_if_run_uncaptured
+        or any(
+            type(state) is not dict
+            or set(state) != {"step", "exp_avg", "exp_avg_sq"}
+            or any(type(value) is not Tensor for value in state.values())
+            for state in state_values
+        )
+        or type(observed_param_group.get("params")) is not list
+        or [id(parameter) for parameter in observed_param_group["params"]]
+        != [id(parameter) for parameter in model_parameters]
+        or set(observed_param_group) != set(canonical_optimizer.param_groups[0])
+        or any(
+            key not in {"lr", "params"}
+            and not _values_equal(value, canonical_optimizer.param_groups[0][key])
+            for key, value in observed_param_group.items()
+        )
+        or type(observed_param_group["lr"]) is not float
+        or not _is_finite_number(observed_param_group["lr"], non_negative=True)
+        or scheduler.optimizer is not optimizer
+        or type(scheduler.lr_lambdas) is not list
+        or len(scheduler.lr_lambdas) != 1
+        or type(scheduler.base_lrs) is not list
+        or type(scheduler._last_lr) is not list
+        or any(type(value) is not float for value in scheduler.base_lrs + scheduler._last_lr)
+        or not _values_equal(scheduler.base_lrs, canonical_scheduler.base_lrs)
+        or any(
+            type(scheduler_vars[name]) is not type(canonical_scheduler_vars[name])
+            for name in scheduler_vars
+            if name not in {"optimizer", "lr_lambdas"}
+        )
+    ):
+        raise ValueError("Phase 0 optimizer/scheduler runtime semantics are not exact")
+    occupied_spans = [
+        _storage_span(value, "live model state")
+        for value in (*model.parameters(), *model.buffers())
+    ]
+    for state in state_values:
+        for value in state.values():
+            state_span = _storage_span(value, "live AdamW state")
+            if any(
+                _storage_spans_overlap(state_span, occupied)
+                for occupied in occupied_spans
+            ):
+                raise ValueError(
+                    "Phase 0 live AdamW state overlaps model or optimizer storage"
+                )
+            occupied_spans.append(state_span)
+    _validate_wrapped_optimizer_step(
+        observed_vars["step"], canonical_vars["step"], optimizer
+    )
+    _validate_scheduler_callable(scheduler, optimization, 0)
+    _validate_global_optimizer_hooks()
+
+
+def _validate_live_component_runtime(
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    manifests: Mapping[str, Mapping[str, object]],
+) -> None:
+    model_config, optimization, _, _ = _phase0_configs(manifests)
+    _validate_current_runtime(manifests["runtime"])
+    if type(model) is not MoiraModel:
+        raise ValueError("live model config does not match the strict model manifest")
+    model_vars = object.__getattribute__(model, "__dict__")
+    if (
+        type(model_vars) is not dict
+        or not _has_exact_dict_keys(model_vars, str)
+        or "config" not in model_vars
+    ):
+        raise ValueError("live model config does not match the strict model manifest")
+    live_config = dict.__getitem__(model_vars, "config")
+    if type(live_config) is not ModelConfig:
+        raise ValueError("live model config does not match the strict model manifest")
+    expected_config = asdict(model_config)
+    live_config_values = {
+        name: object.__getattribute__(live_config, name) for name in expected_config
+    }
+    if any(
+        type(live_config_values[name]) is not type(expected)
+        for name, expected in expected_config.items()
+    ) or not _values_equal(live_config_values, expected_config):
+        raise ValueError("live model config does not match the strict model manifest")
+    _validate_live_model_runtime(model, model_config)
+    _validate_optimizer_scheduler_runtime(model, optimizer, scheduler, optimization)
+
+
 def _validate_phase0_resumability(
     model: nn.Module,
     optimizer: Optimizer,
@@ -1190,11 +1976,20 @@ def _validate_phase0_resumability(
     payload: Mapping[str, object],
     manifests: Mapping[str, Mapping[str, object]],
 ) -> None:
-    model_config, optimization_config = _phase0_configs(manifests)
-    if not isinstance(model, MoiraModel) or not _values_equal(
-        asdict(model.config), asdict(model_config)
+    model_config, optimization_config, data_config, _ = _phase0_configs(manifests)
+    _validate_live_component_runtime(model, optimizer, scheduler, manifests)
+    data_manifest = manifests["data"]
+    cursor = payload["data_cursor"]
+    if (
+        data_config.kind != SYNTHETIC_CURSOR_KIND
+        or data_config.train_split == data_config.eval_split
+        or data_manifest["stream_version"] != 1
+        or data_manifest["sequence_length"] != model_config.max_seq_len
+        or data_manifest["vocab_size"] != model_config.vocab_size
+        or not isinstance(cursor, Mapping)
+        or cursor.get("kind") != data_config.kind
     ):
-        raise ValueError("live model config does not match the strict model manifest")
+        raise ValueError("Phase 0 synthetic data manifest binding is invalid")
     _validate_model_compatibility(model, payload)
     _validate_phase0_component_binding(model, optimizer, scheduler, payload)
     cloned_scheduler = _preflight_components(model, optimizer, scheduler, payload)
@@ -1254,7 +2049,10 @@ def _validate_phase0_component_binding(
     saved_state = optimizer_state["state"]
     if set(saved_state) != expected_active:
         raise ValueError("Phase 0 AdamW active parameter coverage is incomplete")
-    state_storages: set[tuple[int, int]] = set()
+    occupied_spans = [
+        _storage_span(value, "model state")
+        for value in payload["model_state"].values()
+    ]
     for saved_id, parameter in zip(saved_group["params"], actual_parameters):
         if saved_id not in expected_active:
             continue
@@ -1268,17 +2066,20 @@ def _validate_phase0_component_binding(
             ):
                 raise ValueError("AdamW tensor state does not match its model parameter")
             storage = value.untyped_storage()
-            storage_key = (storage.data_ptr(), storage.nbytes())
+            storage_span = _storage_span(value, "AdamW tensor state")
             if (
                 value.device.type != "cpu"
                 or value.layout is not torch.strided
                 or value.storage_offset() != 0
                 or not value.is_contiguous()
                 or storage.nbytes() != value.numel() * value.element_size()
-                or storage_key in state_storages
+                or any(
+                    _storage_spans_overlap(storage_span, occupied)
+                    for occupied in occupied_spans
+                )
             ):
                 raise ValueError("AdamW tensor state storage topology is unsafe")
-            state_storages.add(storage_key)
+            occupied_spans.append(storage_span)
 
 def _validate_scheduler_callable(
     scheduler: LRScheduler,
@@ -1323,7 +2124,7 @@ def _validate_scheduler_callable(
 def _phase0_learning_rates(
     manifests: Mapping[str, Mapping[str, object]], step: int
 ) -> tuple[float, float, float]:
-    _, optimization = _phase0_configs(manifests)
+    _, optimization, _, _ = _phase0_configs(manifests)
     if optimization.gradient_accumulation_steps != 1 or step > (
         optimization.schedule_total_steps
     ):
@@ -1591,7 +2392,10 @@ def _validate_sidecar_integrity(
 ) -> None:
     if set(sidecar) != _SIDECAR_KEYS:
         raise ValueError("checkpoint sidecar schema is invalid")
-    if sidecar.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+    if (
+        type(sidecar.get("schema_version")) is not int
+        or sidecar["schema_version"] != CHECKPOINT_SCHEMA_VERSION
+    ):
         raise ValueError("checkpoint sidecar schema is invalid")
     if sidecar.get("checkpoint") != path.name:
         raise ValueError("checkpoint sidecar path mismatch")
@@ -1609,6 +2413,7 @@ def _validate_sidecar_binding(
     sidecar: Mapping[str, object], path: Path, payload: Mapping[str, object]
 ) -> None:
     filename_step = _canonical_step(path)
+    _require_positive_integer("checkpoint sidecar step", sidecar.get("step"))
     if sidecar.get("step") != filename_step:
         raise ValueError("checkpoint sidecar filename step mismatch")
     if sidecar.get("step") != payload["global_step"]:
@@ -1774,6 +2579,41 @@ class _BoundedPickleReader:
         return self._position
 
 
+def _validate_pickle_graph(root: _PickleContainer) -> None:
+    stack: list[tuple[object, int, bool]] = [(root, 0, False)]
+    active: set[int] = set()
+    seen_containers: set[int] = set()
+    entries = 0
+    while stack:
+        value, depth, leaving = stack.pop()
+        identity = id(value)
+        if leaving:
+            active.remove(identity)
+            continue
+        entries += 1
+        if entries > PHASE0_MAX_STATE_ENTRIES or depth > PHASE0_MAX_STATE_DEPTH:
+            raise ValueError("checkpoint pickle graph exceeds the Phase 0 budget")
+        if isinstance(value, _PickleContainer):
+            expected_children = value.items * (2 if value.kind == "dict" else 1)
+            if len(value.children) != expected_children:
+                raise ValueError("checkpoint pickle container graph is invalid")
+            if identity in active:
+                raise ValueError("checkpoint pickle graph contains a cycle")
+            if identity in seen_containers:
+                raise ValueError("checkpoint pickle graph repeats a mutable container")
+            seen_containers.add(identity)
+            children = value.children
+        elif isinstance(value, _PickleTuple):
+            if identity in active:
+                raise ValueError("checkpoint pickle graph contains a cycle")
+            children = value.children
+        else:
+            continue
+        active.add(identity)
+        stack.append((value, depth, True))
+        stack.extend((child, depth + 1, False) for child in reversed(children))
+
+
 def _preflight_pickle(
     archive: zipfile.ZipFile, members: list[zipfile.ZipInfo]
 ) -> None:
@@ -1786,9 +2626,14 @@ def _preflight_pickle(
         raise ValueError("checkpoint must contain one bounded data.pkl member")
     info = candidates[0]
     memo_count = mark_depth = string_bytes = persistent_ids = reduces = 0
+    tensor_rebuilds = 0
     opcodes = 0
     globals_seen: set[str] = set()
     mark_closers = {"APPENDS", "SETITEMS", "TUPLE"}
+    stack: list[object] = []
+    memo: dict[int, object] = {}
+    storage_definitions: dict[str, _PickleStorage] = {}
+    storage_bytes = tensor_bytes = 0
     try:
         with archive.open(info) as member:
             reader = _BoundedPickleReader(member, info.file_size)
@@ -1805,6 +2650,9 @@ def _preflight_pickle(
                 if name in {"BINPUT", "LONG_BINPUT"}:
                     if argument != memo_count or memo_count >= PHASE0_MAX_PICKLE_MEMO:
                         raise ValueError("checkpoint pickle memo is sparse or oversized")
+                    if not stack:
+                        raise ValueError("checkpoint pickle memo stack is invalid")
+                    memo[int(argument)] = stack[-1]
                     memo_count += 1
                 elif name in {"BINGET", "LONG_BINGET"} and (
                     not isinstance(argument, int) or not 0 <= argument < memo_count
@@ -1845,14 +2693,261 @@ def _preflight_pickle(
                         raise ValueError("checkpoint pickle integer exceeds the Phase 0 budget")
                 elif name == "BINFLOAT" and not math.isfinite(argument):
                     raise ValueError("checkpoint pickle float must be finite")
+
+                if name in {
+                    "BINFLOAT",
+                    "BININT",
+                    "BININT1",
+                    "BININT2",
+                    "BINUNICODE",
+                    "LONG1",
+                }:
+                    stack.append(argument)
+                elif name == "NEWFALSE":
+                    stack.append(False)
+                elif name == "NEWTRUE":
+                    stack.append(True)
+                elif name == "NONE":
+                    stack.append(None)
+                elif name == "GLOBAL":
+                    stack.append(_PickleGlobal(str(argument)))
+                elif name == "EMPTY_DICT":
+                    stack.append(_PickleContainer("dict"))
+                elif name == "EMPTY_LIST":
+                    stack.append(_PickleContainer("list"))
+                elif name == "EMPTY_TUPLE":
+                    stack.append(_PickleTuple(()))
+                elif name == "MARK":
+                    stack.append(_PICKLE_MARK)
+                elif name in {"BINGET", "LONG_BINGET"}:
+                    stack.append(memo[int(argument)])
+                elif name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                    count = int(name[-1])
+                    if len(stack) < count or _PICKLE_MARK in stack[-count:]:
+                        raise ValueError("checkpoint pickle tuple stack is invalid")
+                    values = tuple(stack[-count:])
+                    del stack[-count:]
+                    stack.append(_PickleTuple(values))
+                elif name == "TUPLE":
+                    try:
+                        mark = len(stack) - 1 - stack[::-1].index(_PICKLE_MARK)
+                    except ValueError as error:
+                        raise ValueError("checkpoint pickle tuple MARK is missing") from error
+                    values = tuple(stack[mark + 1 :])
+                    if len(values) > PHASE0_MAX_CONTAINER_ENTRIES:
+                        raise ValueError("checkpoint pickle tuple exceeds the budget")
+                    del stack[mark:]
+                    stack.append(_PickleTuple(values))
+                elif name in {"APPEND", "SETITEM"}:
+                    consumed = 1 if name == "APPEND" else 2
+                    container = stack[-consumed - 1] if len(stack) > consumed else None
+                    if (
+                        not isinstance(container, _PickleContainer)
+                        or container.kind != ("list" if name == "APPEND" else "dict")
+                    ):
+                        raise ValueError("checkpoint pickle container stack is invalid")
+                    container.items += 1
+                    if container.items > PHASE0_MAX_CONTAINER_ENTRIES:
+                        raise ValueError("checkpoint pickle container exceeds the budget")
+                    container.children.extend(stack[-consumed:])
+                    del stack[-consumed:]
+                elif name in {"APPENDS", "SETITEMS"}:
+                    try:
+                        mark = len(stack) - 1 - stack[::-1].index(_PICKLE_MARK)
+                    except ValueError as error:
+                        raise ValueError("checkpoint pickle container MARK is missing") from error
+                    count = len(stack) - mark - 1
+                    container = stack[mark - 1] if mark else None
+                    expected_kind = "list" if name == "APPENDS" else "dict"
+                    if (
+                        not isinstance(container, _PickleContainer)
+                        or container.kind != expected_kind
+                        or name == "SETITEMS" and count % 2
+                    ):
+                        raise ValueError("checkpoint pickle container stack is invalid")
+                    container.items += count if name == "APPENDS" else count // 2
+                    if container.items > PHASE0_MAX_CONTAINER_ENTRIES:
+                        raise ValueError("checkpoint pickle container exceeds the budget")
+                    container.children.extend(stack[mark + 1 :])
+                    del stack[mark:]
+                elif name == "BINPERSID":
+                    if not stack:
+                        raise ValueError("checkpoint pickle storage PID stack is empty")
+                    pid = stack.pop()
+                    if (
+                        not isinstance(pid, _PickleTuple)
+                        or len(pid.children) != 5
+                        or pid.children[0] != "storage"
+                        or not isinstance(pid.children[1], _PickleGlobal)
+                        or pid.children[1].name not in _PICKLE_STORAGE_BYTES
+                        or not isinstance(pid.children[2], str)
+                        or re.fullmatch(
+                            r"0|[1-9][0-9]*", pid.children[2], re.ASCII
+                        )
+                        is None
+                        or pid.children[3] != "cpu"
+                        or type(pid.children[4]) is not int
+                        or pid.children[4] < 0
+                        or pid.children[4] > PHASE0_MAX_TENSOR_NUMEL
+                    ):
+                        raise ValueError("checkpoint pickle storage PID is invalid")
+                    declared_bytes = (
+                        pid.children[4]
+                        * _PICKLE_STORAGE_BYTES[pid.children[1].name]
+                    )
+                    if declared_bytes > PHASE0_MAX_TENSOR_STORAGE_BYTES:
+                        raise ValueError("checkpoint pickle storage exceeds the budget")
+                    storage = _PickleStorage(
+                        pid.children[2],
+                        pid.children[1].name,
+                        pid.children[4],
+                        _PICKLE_STORAGE_BYTES[pid.children[1].name],
+                    )
+                    prior_definition = storage_definitions.get(storage.key)
+                    if prior_definition is None:
+                        storage_bytes += declared_bytes
+                        if storage_bytes > PHASE0_MAX_TOTAL_TENSOR_LOGICAL_BYTES:
+                            raise ValueError(
+                                "checkpoint pickle aggregate storage exceeds the budget"
+                            )
+                        storage_definitions[storage.key] = storage
+                    elif prior_definition != storage:
+                        raise ValueError("checkpoint pickle storage key is duplicated")
+                    stack.append(storage)
+                elif name == "REDUCE":
+                    if len(stack) < 2:
+                        raise ValueError("checkpoint pickle reduction stack is invalid")
+                    arguments = stack.pop()
+                    function = stack.pop()
+                    if function == _PickleGlobal("collections OrderedDict"):
+                        if not isinstance(arguments, _PickleTuple) or arguments.children:
+                            raise ValueError("checkpoint pickle OrderedDict args are invalid")
+                        stack.append(_PickleContainer("ordered_dict"))
+                    elif function == _PickleGlobal("torch._utils _rebuild_tensor_v2"):
+                        tensor_rebuilds += 1
+                        if (
+                            tensor_rebuilds > PHASE0_MAX_TENSORS
+                            or not isinstance(arguments, _PickleTuple)
+                            or len(arguments.children) != 6
+                            or not isinstance(arguments.children[0], _PickleStorage)
+                            or type(arguments.children[1]) is not int
+                            or arguments.children[1] < 0
+                            or not isinstance(arguments.children[2], _PickleTuple)
+                            or not isinstance(arguments.children[3], _PickleTuple)
+                            or len(arguments.children[2].children)
+                            != len(arguments.children[3].children)
+                            or len(arguments.children[2].children)
+                            > PHASE0_MAX_TENSOR_RANK
+                            or any(
+                                type(value) is not int
+                                or value < 0
+                                or value > PHASE0_MAX_TENSOR_DIMENSION
+                                for value in arguments.children[2].children
+                            )
+                            or any(
+                                type(value) is not int
+                                or value < 0
+                                or value > PHASE0_MAX_TENSOR_NUMEL
+                                for value in arguments.children[3].children
+                            )
+                            or arguments.children[4] is not False
+                            or not isinstance(
+                                arguments.children[5], _PickleContainer
+                            )
+                            or arguments.children[5].kind != "ordered_dict"
+                            or arguments.children[5].items != 0
+                        ):
+                            raise ValueError("checkpoint pickle tensor rebuild is invalid")
+                        storage = arguments.children[0]
+                        logical_numel = math.prod(arguments.children[2].children)
+                        if (
+                            logical_numel > PHASE0_MAX_TENSOR_NUMEL
+                            or logical_numel * storage.item_size
+                            > PHASE0_MAX_TENSOR_LOGICAL_BYTES
+                        ):
+                            raise ValueError("checkpoint pickle tensor exceeds the budget")
+                        last_element = arguments.children[1] + sum(
+                            (dimension - 1) * stride
+                            for dimension, stride in zip(
+                                arguments.children[2].children,
+                                arguments.children[3].children,
+                            )
+                            if dimension
+                        )
+                        if arguments.children[1] > storage.numel or (
+                            logical_numel and last_element >= storage.numel
+                        ):
+                            raise ValueError(
+                                "checkpoint pickle tensor exceeds its storage"
+                            )
+                        tensor_bytes += logical_numel * storage.item_size
+                        if tensor_bytes > PHASE0_MAX_TOTAL_TENSOR_LOGICAL_BYTES:
+                            raise ValueError(
+                                "checkpoint pickle aggregate tensors exceed the budget"
+                            )
+                        stack.append(_PICKLE_TENSOR)
+                    else:
+                        raise ValueError("checkpoint pickle reduction target is invalid")
                 if name == "STOP":
-                    if mark_depth != 0 or reader.tell() != info.file_size:
+                    if (
+                        mark_depth != 0
+                        or len(stack) != 1
+                        or not isinstance(stack[0], _PickleContainer)
+                        or stack[0].kind != "dict"
+                        or reader.tell() != info.file_size
+                    ):
                         raise ValueError("checkpoint pickle has trailing or unclosed data")
                     if reader.read(1) != b"":
                         raise ValueError("checkpoint pickle has trailing data")
+                    _validate_pickle_graph(stack[0])
                     stopped = True
             if not stopped:
                 raise ValueError("checkpoint pickle STOP is missing")
+        root = PurePosixPath(info.filename).parent.as_posix()
+        prefix = f"{root}/data/"
+        storage_members = [
+            member for member in members if member.filename.startswith(prefix)
+        ]
+        expected_names = {
+            f"{root}/data.pkl",
+            f"{root}/byteorder",
+            f"{root}/version",
+            f"{root}/.format_version",
+            f"{root}/.storage_alignment",
+            f"{root}/.data/serialization_id",
+            *(f"{prefix}{key}" for key in storage_definitions),
+        }
+        if (
+            len(members) != len(expected_names)
+            or {member.filename for member in members} != expected_names
+        ):
+            raise ValueError("checkpoint archive members are not exact")
+        members_by_name = {member.filename: member for member in members}
+        controls = {
+            f"{root}/byteorder": b"little",
+            f"{root}/version": b"3\n",
+            f"{root}/.format_version": b"1",
+            f"{root}/.storage_alignment": b"64",
+        }
+        for name, expected in controls.items():
+            control = members_by_name[name]
+            if control.file_size != len(expected):
+                raise ValueError("checkpoint archive control record is invalid")
+            with archive.open(control) as handle:
+                if handle.read(len(expected) + 1) != expected:
+                    raise ValueError("checkpoint archive control record is invalid")
+        serialization_id = members_by_name[f"{root}/.data/serialization_id"]
+        with archive.open(serialization_id) as handle:
+            encoded_id = handle.read(41)
+        if (
+            serialization_id.file_size != 40
+            or re.fullmatch(rb"[0-9]{40}", encoded_id) is None
+        ):
+            raise ValueError("checkpoint archive serialization ID is invalid")
+        for member in storage_members:
+            storage = storage_definitions[member.filename.removeprefix(prefix)]
+            if member.file_size != storage.numel * storage.item_size:
+                raise ValueError("checkpoint pickle storage member size is invalid")
     except (EOFError, UnicodeError, ValueError) as error:
         if isinstance(error, ValueError) and str(error).startswith("checkpoint "):
             raise
@@ -2153,26 +3248,22 @@ def _resolve_checkpoint(
         )
 
     pointer_path = checkpoint_dir / "latest.json"
-    if os.path.lexists(pointer_path):
-        _validate_regular_file(pointer_path, "latest pointer")
+    pointer_bytes, _ = _observe_pointer(pointer_path)
     try:
-        pointer = _read_json(pointer_path, "latest pointer")
+        if pointer_bytes is None:
+            raise ValueError("latest pointer is missing")
+        pointer = json.loads(pointer_bytes.decode("utf-8"))
+        if not isinstance(pointer, dict):
+            raise ValueError("latest pointer must be a JSON object")
+        _validate_state_tree(pointer)
         _validate_pointer_document(pointer, run_metadata)
-    except ValueError:
+    except (UnicodeError, json.JSONDecodeError, ValueError):
         verified = _scan_compatible_checkpoints(
             checkpoint_dir,
             expected_manifests=expected_manifests,
             lineage_id=lineage_id,
         )
-        repaired = {**verified.sidecar, "sidecar": verified.path.with_suffix(".json").name}
-        _validate_pointer_document(repaired, run_metadata)
-        _validate_pointer_target(
-            repaired, verified.payload, verified.sidecar
-        )
         _recheck_verified_checkpoint(verified)
-        _atomic_write_json(pointer_path, repaired)
-        if _read_json(pointer_path, "latest pointer") != repaired:
-            raise ValueError("repaired latest pointer did not reopen exactly")
         return verified
     _recover_pruning(checkpoint_dir, pointer, run_metadata)
     _recover_invalid_tombstones(checkpoint_dir, pointer, run_metadata)
@@ -2189,13 +3280,74 @@ def _resolve_checkpoint(
     return verified
 
 
-def _validate_previous_pointer(path: Path, lineage_id: str, step: int) -> None:
-    run_metadata = _read_run_metadata(path.parent)
+def _observe_pointer(
+    path: Path,
+) -> tuple[bytes | None, os.stat_result | None]:
     if not os.path.lexists(path):
+        return None, None
+    with _open_stable_regular(path, "latest pointer") as (handle, status):
+        if not 0 < status.st_size <= PHASE0_MAX_CONTROL_JSON_BYTES:
+            raise ValueError("latest pointer exceeds the Phase 0 JSON size budget")
+        value = handle.read(status.st_size)
+        if len(value) != status.st_size or handle.read(1) != b"":
+            raise ValueError("latest pointer changed while being read")
+    return value, status
+
+
+def _validate_previous_pointer(
+    path: Path, lineage_id: str, step: int
+) -> _PointerObservation:
+    run_metadata = _read_run_metadata(path.parent)
+    pointer_bytes, _ = _observe_pointer(path)
+    if pointer_bytes is None and not any(
+        _STEP_NAME.fullmatch(candidate.name)
+        for candidate in _directory_entries(path.parent)
+    ):
         _recover_invalid_tombstones(path.parent, None, run_metadata)
-        return
-    pointer = _read_json(path, "latest pointer")
-    _validate_pointer_document(pointer, run_metadata)
+        return _PointerObservation(pointer_bytes, frozenset())
+    try:
+        if pointer_bytes is None:
+            raise ValueError("latest pointer is missing")
+        pointer = json.loads(pointer_bytes.decode("utf-8"))
+        if not isinstance(pointer, dict):
+            raise ValueError("latest pointer must be a JSON object")
+        _validate_state_tree(pointer)
+        _validate_pointer_document(pointer, run_metadata)
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        try:
+            verified = _scan_compatible_checkpoints(
+                path.parent,
+                expected_manifests=None,
+                expected_manifest_hashes=run_metadata["manifest_hashes"],
+                lineage_id=lineage_id,
+            )
+        except ValueError:
+            candidates = _bounded_checkpoint_candidates(path.parent)
+            if (
+                pointer_bytes is None
+                and candidates
+                and all(
+                    candidate_step == step and not _has_pruning_material(candidate)
+                    for candidate_step, candidate in candidates
+                )
+            ):
+                _recover_invalid_tombstones(path.parent, None, run_metadata)
+                return _PointerObservation(pointer_bytes, frozenset())
+            raise
+        _recheck_verified_checkpoint(verified)
+        if verified.payload["global_step"] > step:
+            raise ValueError("new checkpoint step must advance the lineage")
+        trusted_pointer = dict(verified.sidecar)
+        trusted_pointer["sidecar"] = verified.path.with_suffix(".json").name
+        _recover_invalid_tombstones(
+            path.parent, trusted_pointer, run_metadata
+        )
+        return _PointerObservation(
+            pointer_bytes,
+            frozenset(
+                (trusted_pointer["checkpoint"], trusted_pointer["sidecar"])
+            ),
+        )
     _recover_pruning(path.parent, pointer, run_metadata)
     _recover_invalid_tombstones(path.parent, pointer, run_metadata)
     checkpoint_path = path.parent / pointer["checkpoint"]
@@ -2210,6 +3362,10 @@ def _validate_previous_pointer(path: Path, lineage_id: str, step: int) -> None:
     )
     if pointer["step"] > step:
         raise ValueError("new checkpoint step must advance the lineage")
+    return _PointerObservation(
+        pointer_bytes,
+        frozenset((str(pointer["checkpoint"]), str(pointer["sidecar"]))),
+    )
 
 
 def _bind_run_metadata(
@@ -2232,7 +3388,10 @@ def _read_run_metadata(checkpoint_dir: Path) -> dict[str, Any]:
     metadata = _read_json(checkpoint_dir / "run.json", "run metadata")
     if set(metadata) != _RUN_METADATA_KEYS:
         raise ValueError("run metadata schema is invalid")
-    if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+    if (
+        type(metadata.get("schema_version")) is not int
+        or metadata["schema_version"] != CHECKPOINT_SCHEMA_VERSION
+    ):
         raise ValueError("run metadata schema is invalid")
     _require_non_empty_string("run metadata lineage", metadata.get("lineage_id"))
     _validate_manifest_hashes(metadata.get("manifest_hashes"))
@@ -2244,7 +3403,10 @@ def _validate_pointer_document(
 ) -> None:
     if set(pointer) != _POINTER_KEYS:
         raise ValueError("latest pointer schema is invalid")
-    if pointer.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+    if (
+        type(pointer.get("schema_version")) is not int
+        or pointer["schema_version"] != CHECKPOINT_SCHEMA_VERSION
+    ):
         raise ValueError("latest pointer schema is invalid")
     step = pointer.get("step")
     _require_positive_integer("latest pointer step", step)
@@ -2280,8 +3442,9 @@ def _validate_pointer_target(
 def _scan_compatible_checkpoints(
     checkpoint_dir: Path,
     *,
-    expected_manifests: Mapping[str, Mapping[str, object]],
+    expected_manifests: Mapping[str, Mapping[str, object]] | None,
     lineage_id: str,
+    expected_manifest_hashes: Mapping[str, str] | None = None,
 ) -> _VerifiedCheckpoint:
     candidates = [
         (step, path)
@@ -2295,6 +3458,7 @@ def _scan_compatible_checkpoints(
                 candidate,
                 expected_manifests=expected_manifests,
                 expected_lineage_id=lineage_id,
+                expected_manifest_hashes=expected_manifest_hashes,
             )
         except ValueError:
             continue
@@ -2428,12 +3592,16 @@ def _recover_invalid_tombstones(
 
 
 def _reclaim_unreferenced(
-    paths: tuple[Path, ...], latest_path: Path, checkpoint_name: str
+    paths: tuple[Path, ...],
+    latest_path: Path,
+    checkpoint_name: str,
+    pointer_observation: _PointerObservation,
 ) -> None:
-    if latest_path.exists():
-        pointer = _read_json(latest_path, "latest pointer")
-        if pointer.get("checkpoint") == checkpoint_name:
-            raise ValueError("a pointer-referenced checkpoint cannot be reclaimed")
+    observed_bytes, _ = _observe_pointer(latest_path)
+    if observed_bytes != pointer_observation.encoded:
+        raise ValueError("latest pointer changed before invalid reclamation")
+    if checkpoint_name in pointer_observation.protected_names:
+        raise ValueError("a pointer-referenced checkpoint cannot be reclaimed")
     for path in paths:
         tombstone = path.parent / f".{path.name}.invalid"
         if tombstone.exists():
@@ -2506,7 +3674,7 @@ def _values_equal(left: object, right: object) -> bool:
         )
     if isinstance(left, Mapping):
         return (
-            isinstance(right, Mapping)
+            type(left) is type(right)
             and left.keys() == right.keys()
             and all(_values_equal(left[key], right[key]) for key in left)
         )
