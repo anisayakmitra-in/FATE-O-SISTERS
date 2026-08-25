@@ -104,7 +104,7 @@ def test_m1_inspect_and_catalog_validation_are_read_only() -> None:
             REPOSITORY_ROOT / "research" / "configs" / "m1-sources.toml",
         )
     )
-    assert catalog["source_count"] == 17
+    assert catalog["source_count"] == 36
     assert catalog["weights_or_datasets_downloaded"] is False
 
 

@@ -21,13 +21,16 @@ CATALOG = "research/configs/m1-sources.toml"
 def test_m1_catalog_contains_datasets_and_teacher_references() -> None:
     catalog = SourceCatalog.from_toml(CATALOG)
 
-    assert len(catalog.sources) == 17
+    assert len(catalog.sources) == 36
     assert catalog.by_id("zai-longcite-45k").license == "Apache-2.0"
     assert catalog.by_id("chartqa").modality == "vision-text"
     assert catalog.by_id("polyai-minds14").modality == "audio"
     assert catalog.by_id("lerobot-pusht").modality == "robotics"
     assert catalog.by_id("zai-glm-4.1v-9b-thinking").modality == "teacher"
     assert catalog.by_id("xiaomi-mimo-embodied-eval").modality == "evaluation"
+    assert catalog.by_id("open-web-math").license == "ODC-By-1.0"
+    assert catalog.by_id("open-graph-benchmark").license_verified is False
+    assert catalog.by_id("black-forest-labs-flux1-schnell").modality == "teacher"
 
 
 @pytest.mark.parametrize(
@@ -56,6 +59,24 @@ def test_m1_catalog_contains_datasets_and_teacher_references() -> None:
         (
             "deepseek-r1-openr1-math-220k",
             {"problem": "2+2", "solution": "4", "uuid": "math-1"},
+            "text",
+            "text",
+            "text",
+        ),
+        (
+            "nvidia-openmathinstruct-2",
+            {
+                "problem": "2+2",
+                "generated_solution": "2+2=4",
+                "expected_answer": "4",
+            },
+            "text",
+            "text",
+            "text",
+        ),
+        (
+            "openai-gsm8k",
+            {"question": "2+2?", "answer": "4"},
             "text",
             "text",
             "text",

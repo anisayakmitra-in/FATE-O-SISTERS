@@ -39,9 +39,33 @@ The catalog separates training data from teacher or evaluation references.
 | `lerobot/pusht` | Robotics | MIT | Action and time-series capsules |
 
 The catalog also lists optional teacher references from Z.ai GLM, DeepSeek R1
-Distill, Xiaomi MiMo-VL and MiMo-Audio, Qwen3, Mistral, Ai2 OLMo 2, and
-SmolLM2. A teacher reference is not part of the MOIRA parameter count and is
-never downloaded by the repository commands.
+Distill, Xiaomi MiMo-VL and MiMo-Audio, Qwen3, Mistral, Ai2 OLMo 2, SmolLM2,
+GLM-4.5-Air, DeepSeek-V3, IBM Granite, Mixtral, Qwen2-Audio, Whisper,
+DINOv2, SmolVLM, TimesFM, Graphormer, ESM2, and FLUX.1 schnell. A teacher
+reference is not part of the MOIRA parameter count and is never downloaded by
+the repository commands.
+
+## Additional open sources checked on 2026-08-26
+
+The second catalog tranche broadens the capability loom without making any of
+these sources runtime dependencies:
+
+| Source | Capability | License recorded | M1 status |
+| --- | --- | --- | --- |
+| `open-web-math` | Mathematical web text | ODC-By-1.0 + Common Crawl terms | Catalog reference; deterministic slicing required |
+| `nvidia/OpenMathInstruct-2` | Math reasoning | CC-BY-4.0 | Text normalizer available |
+| `openai/gsm8k` | Math verification | MIT | Test split held out; text normalizer available |
+| `facebook/voxpopuli` | Multilingual speech | CC0 plus European Parliament notice | Catalog reference; preserve the notice |
+| `google/fleurs` | Multilingual speech | CC-BY-4.0 | Catalog one language subset at a time |
+| `snap-stanford/ogb` | Graph learning | MIT code; per-dataset terms vary | License review required per graph dataset |
+| `facebook/esm2_t6_8M_UR50D` | Protein sequences | MIT | Optional teacher reference |
+| `google/timesfm-1.0-200m` | Time-series forecasting | Apache-2.0 | Optional teacher reference |
+| `black-forest-labs/FLUX.1-schnell` | Diffusion image generation | Apache-2.0 | Gated 12B reference; never required by M1 |
+
+The catalog deliberately records mixed or gated sources as references instead
+of silently treating them as enterprise-cleared training data. Per-row source
+licenses, consent, attribution, deletion, and redistribution checks still
+belong in the materialized-slice manifest.
 
 There are three important source boundaries:
 

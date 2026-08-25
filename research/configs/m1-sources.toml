@@ -239,3 +239,245 @@ revision = "main"
 license_verified = true
 upstream = "HuggingFaceTB/smol-smoltalk"
 notes = "Compact open teacher aligned with the cataloged SmolTalk data."
+
+[[sources]]
+source_id = "open-web-math"
+kind = "hf-dataset"
+uri = "hf://datasets/open-web-math/open-web-math"
+license = "ODC-By-1.0"
+license_url = "https://huggingface.co/datasets/open-web-math/open-web-math"
+modality = "text"
+purpose = "mathematical-web-pretraining-reference"
+revision = "main"
+config = "default"
+split = "train"
+row_count = 6315233
+license_verified = true
+notes = "ODC-By-1.0 dataset over Common Crawl; follow the Common Crawl Terms of Use and use deterministic slices."
+
+[[sources]]
+source_id = "nvidia-openmathinstruct-2"
+kind = "hf-dataset"
+uri = "hf://datasets/nvidia/OpenMathInstruct-2"
+license = "CC-BY-4.0"
+license_url = "https://huggingface.co/datasets/nvidia/OpenMathInstruct-2"
+modality = "text"
+purpose = "mathematical-reasoning-supervised-fine-tuning"
+revision = "main"
+config = "default"
+split = "train"
+row_count = 14000000
+license_verified = true
+notes = "Dataset Viewer reports an approximately 14M-row train split with problem, generated_solution, and expected_answer fields."
+
+[[sources]]
+source_id = "openai-gsm8k"
+kind = "hf-dataset"
+uri = "hf://datasets/openai/gsm8k"
+license = "MIT"
+license_url = "https://huggingface.co/datasets/openai/gsm8k"
+modality = "evaluation"
+purpose = "held-out-mathematical-verification"
+revision = "main"
+config = "main"
+split = "test"
+row_count = 1319
+license_verified = true
+notes = "Keep the test split held out from training; the card reports 8.5K problems and an MIT license."
+
+[[sources]]
+source_id = "facebook-voxpopuli"
+kind = "hf-dataset"
+uri = "hf://datasets/facebook/voxpopuli"
+license = "CC0-1.0-plus-European-Parliament-notice"
+license_url = "https://huggingface.co/datasets/facebook/voxpopuli"
+modality = "audio"
+purpose = "multilingual-speech-representation-and-asr"
+revision = "main"
+config = "multilang"
+split = "train"
+row_count = 1255237
+license_verified = true
+notes = "The dataset card records CC0 plus the European Parliament legal notice; preserve that additional notice in downstream artifacts."
+
+[[sources]]
+source_id = "google-fleurs"
+kind = "hf-dataset"
+uri = "hf://datasets/google/fleurs"
+license = "CC-BY-4.0"
+license_url = "https://huggingface.co/datasets/google/fleurs"
+modality = "audio"
+purpose = "multilingual-speech-recognition"
+revision = "main"
+config = "en_us"
+split = "train"
+license_verified = true
+notes = "Dataset Viewer exposes 103 language subsets; catalog one bounded subset at a time and retain attribution."
+
+[[sources]]
+source_id = "open-graph-benchmark"
+kind = "github"
+uri = "https://github.com/snap-stanford/ogb"
+license = "MIT-code-mixed-dataset-terms"
+license_url = "https://github.com/snap-stanford/ogb"
+modality = "structured"
+purpose = "graph-learning-benchmark-and-loader"
+revision = "master"
+license_verified = false
+notes = "The OGB repository is MIT, but individual graph datasets carry their own terms; verify each dataset before enterprise use."
+
+[[sources]]
+source_id = "microsoft-graphormer"
+kind = "hf-model"
+uri = "hf://models/microsoft/Graphormer"
+license = "MIT"
+license_url = "https://huggingface.co/microsoft/Graphormer"
+modality = "teacher"
+purpose = "graph-and-molecular-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Model and code reference for graph and molecular capability experiments; advanced Azure-only checkpoints are not an M1 dependency."
+
+[[sources]]
+source_id = "facebook-esm2-t6-8m"
+kind = "hf-model"
+uri = "hf://models/facebook/esm2_t6_8M_UR50D"
+license = "MIT"
+license_url = "https://huggingface.co/facebook/esm2_t6_8M_UR50D"
+modality = "teacher"
+purpose = "protein-sequence-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Small protein language model reference; weights remain caller-owned and are not downloaded by M1 commands."
+
+[[sources]]
+source_id = "google-timesfm-1.0-200m"
+kind = "hf-model"
+uri = "hf://models/google/timesfm-1.0-200m"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/google/timesfm-1.0-200m"
+modality = "teacher"
+purpose = "time-series-forecasting-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Open 200M time-series foundation checkpoint for forecasting adapters; not a required M1 weight."
+
+[[sources]]
+source_id = "ibm-granite-timeseries-ttm-r2"
+kind = "hf-model"
+uri = "hf://models/ibm-granite/granite-timeseries-ttm-r2"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/ibm-granite/granite-timeseries-ttm-r2"
+modality = "teacher"
+purpose = "enterprise-time-series-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Compact IBM Granite time-series reference; use caller-selected data and evaluate forecast drift before deployment."
+
+[[sources]]
+source_id = "mistral-mixtral-8x7b"
+kind = "hf-model"
+uri = "hf://models/mistralai/Mixtral-8x7B-v0.1"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/mistralai/Mixtral-8x7B-v0.1"
+modality = "teacher"
+purpose = "sparse-mixture-of-experts-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Sparse MoE reference with 47B total parameters; its weights are not part of the 33M M1 surface."
+
+[[sources]]
+source_id = "qwen2-audio-7b-instruct"
+kind = "hf-model"
+uri = "hf://models/Qwen/Qwen2-Audio-7B-Instruct"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct"
+modality = "teacher"
+purpose = "audio-language-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Audio analysis and voice-chat teacher reference; M1 retains a local audio capsule boundary."
+
+[[sources]]
+source_id = "openai-whisper-small"
+kind = "hf-model"
+uri = "hf://models/openai/whisper-small"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/openai/whisper-small"
+modality = "teacher"
+purpose = "speech-recognition-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Multilingual ASR reference; speaker identity and surveillance risks require a separate product review."
+
+[[sources]]
+source_id = "facebook-dinov2-base"
+kind = "hf-model"
+uri = "hf://models/facebook/dinov2-base"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/facebook/dinov2-base"
+modality = "teacher"
+purpose = "vision-encoder-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Self-supervised ViT feature reference; M1's pure-PyTorch vision patch encoder stays dependency-free."
+
+[[sources]]
+source_id = "huggingface-smollvm-instruct"
+kind = "hf-model"
+uri = "hf://models/HuggingFaceTB/SmolVLM-Instruct"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct"
+modality = "teacher"
+purpose = "compact-vision-language-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Compact multimodal reference designed for low-memory inference; weights are optional and never fetched by M1."
+
+[[sources]]
+source_id = "black-forest-labs-flux1-schnell"
+kind = "hf-model"
+uri = "hf://models/black-forest-labs/FLUX.1-schnell"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/black-forest-labs/FLUX.1-schnell"
+modality = "teacher"
+purpose = "diffusion-generation-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Gated 12B diffusion reference; cataloged for future image-generation alignment, never required for M1."
+
+[[sources]]
+source_id = "zai-glm-4.5-air"
+kind = "hf-model"
+uri = "hf://models/zai-org/GLM-4.5-Air"
+license = "MIT"
+license_url = "https://huggingface.co/zai-org/GLM-4.5-Air"
+modality = "teacher"
+purpose = "agentic-reasoning-and-moe-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Z.ai reports commercial use under MIT; 106B total and 12B active parameters make this an enterprise-only reference."
+
+[[sources]]
+source_id = "deepseek-v3"
+kind = "hf-model"
+uri = "hf://models/deepseek-ai/DeepSeek-V3"
+license = "DeepSeek-Model-License"
+license_url = "https://huggingface.co/deepseek-ai/DeepSeek-V3"
+modality = "teacher"
+purpose = "large-scale-moe-and-distillation-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "The card says model use supports commercial use under its model license; 671B total and 37B activated parameters require enterprise infrastructure."
+
+[[sources]]
+source_id = "ibm-granite-4.0-1b-base"
+kind = "hf-model"
+uri = "hf://models/ibm-granite/granite-4.0-1b-base"
+license = "Apache-2.0"
+license_url = "https://huggingface.co/ibm-granite/granite-4.0-1b-base"
+modality = "teacher"
+purpose = "compact-enterprise-text-and-code-teacher-reference"
+revision = "main"
+license_verified = true
+notes = "Compact Apache-2.0 baseline for consumer and edge experiments; optional teacher only."

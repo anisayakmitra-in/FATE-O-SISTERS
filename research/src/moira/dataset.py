@@ -365,6 +365,14 @@ def normalize_row(
         if not isinstance(solution, str) or not solution.strip():
             raise ValueError("OpenR1 row has no usable solution or answer")
         inputs, targets, modality = {"text": problem}, {"text": solution}, "text"
+    elif source_id == "nvidia-openmathinstruct-2":
+        problem = _string_field(row, "problem")
+        solution = _string_field(row, "generated_solution")
+        inputs, targets, modality = {"text": problem}, {"text": solution}, "text"
+    elif source_id == "openai-gsm8k":
+        problem = _string_field(row, "question")
+        solution = _string_field(row, "answer")
+        inputs, targets, modality = {"text": problem}, {"text": solution}, "text"
     elif source_id == "nvidia-opencode-reasoning":
         problem = _string_field(row, "input")
         solution = row.get("solution", row.get("output", ""))

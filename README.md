@@ -15,7 +15,8 @@ The Python reference contains:
 - Pulse state with 12 fast affect components and 6 slow affect components;
 - an exact trainable-parameter ledger checked against the model;
 - deterministic synthetic data, training, evaluation, and resume tests;
-- a manifest-first M1 catalog for text, code, vision-text, audio, robotics, and teacher references;
+- a manifest-first M1 catalog for text, code, vision-text, audio, robotics,
+  graph, protein, time-series, diffusion, evaluation, and teacher references;
 - bounded JSONL normalization with source revisions, licenses, split assignment, and record hashes;
 - pure-PyTorch vision and feature capsule encoders for image, audio, time-series, structured, graph, and robotics inputs;
 - an M1 meta-device parameter check, equal-parameter component ablations, and a bounded in-memory JSONL training path;
