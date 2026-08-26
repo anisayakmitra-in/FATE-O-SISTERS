@@ -67,6 +67,24 @@ def test_deployment_descriptions_are_read_only_and_keep_one_identity(
     assert output["switch_changes_weights"] is False
 
 
+def test_agent_inspect_reports_pandora_authority_boundary() -> None:
+    output = _output_json(_run_cli("agent", "inspect"))
+
+    assert output["model"] == "MOIRA"
+    assert output["integration"] == "PANDORA-AGENT"
+    assert output["orientations"] == ["clotho", "lachesis", "atropos"]
+    assert output["roles"] == [
+        "planner",
+        "analyst",
+        "executor",
+        "reviewer",
+        "evaluator",
+    ]
+    assert output["any_orientation_can_hold_any_role"] is True
+    assert output["direct_effect_execution"] is False
+    assert output["model_can_authorize_its_own_effects"] is False
+
+
 def test_deployment_switch_persists_policy_without_changing_weights(
     cli_root: Path,
 ) -> None:
@@ -129,7 +147,7 @@ def test_m1_inspect_and_catalog_validation_are_read_only() -> None:
             REPOSITORY_ROOT / "research" / "configs" / "m1-sources.toml",
         )
     )
-    assert catalog["source_count"] == 36
+    assert catalog["source_count"] == 38
     assert catalog["weights_or_datasets_downloaded"] is False
 
 

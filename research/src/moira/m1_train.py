@@ -383,7 +383,7 @@ def iter_cataloged_capability_examples(
     max_records: int,
     split: str = "train",
 ) -> Iterator[DatasetExample]:
-    """Stream vision/audio/structured/robotics examples from a cataloged JSONL."""
+    """Stream typed capability examples from a cataloged JSONL."""
     catalog = SourceCatalog.from_toml(catalog_path)
     source = catalog.by_id(source_id)
     if source.modality not in {
@@ -392,6 +392,7 @@ def iter_cataloged_capability_examples(
         "structured",
         "robotics",
         "time-series",
+        "cyber",
     }:
         raise ValueError("M1 capability training requires a capability catalog source")
     return iter_jsonl_examples(

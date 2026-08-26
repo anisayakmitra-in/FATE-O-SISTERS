@@ -1,6 +1,21 @@
 """CPU-testable research components for MOIRA."""
 
 from .config import ModelConfig, TrainingConfig
+from .agent import (
+    BRIDGE_PROTOCOL,
+    AgentLease,
+    AgentRole,
+    AgentTraceEvent,
+    AuthorizedEffect,
+    DecisionStatus,
+    EffectOutcome,
+    PandoraAgentLayer,
+    PandoraDecision,
+    PandoraEffectReceipt,
+    PandoraEffectRequest,
+    PandoraGateway,
+    agent_contract,
+)
 from .ablation import (
     AblationResult,
     assert_equal_parameter_surface,
@@ -81,6 +96,19 @@ from .qat import (
 )
 
 __all__ = [
+    "BRIDGE_PROTOCOL",
+    "AgentLease",
+    "AgentRole",
+    "AgentTraceEvent",
+    "AuthorizedEffect",
+    "DecisionStatus",
+    "EffectOutcome",
+    "PandoraAgentLayer",
+    "PandoraDecision",
+    "PandoraEffectReceipt",
+    "PandoraEffectRequest",
+    "PandoraGateway",
+    "agent_contract",
     "ModelConfig",
     "AblationResult",
     "equal_parameter_ablation_report",

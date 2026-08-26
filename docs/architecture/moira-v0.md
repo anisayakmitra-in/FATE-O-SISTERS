@@ -3,6 +3,7 @@
 - Status: approved research design for Phase 0 implementation
 - Repository: `anisayakmitra-in/FATE-O-SISTERS`
 - Pinned parent commit: `9458927c3d2532f1f3e066d9c725297957a08bc7`
+- PANDORA contract reference: `anisayakmitra-in/PANDORA-AGENT@f001dd706a66631ff3c8ba01e21588745a152b72`
 - Canonical model name: MOIRA
 
 ## 1. Scope and claim boundary
@@ -95,7 +96,7 @@ Fast state decays toward a scoped baseline. Slow state persists only for an auth
 
 ## 5. Shared Capability Loom
 
-Vision, speech, audio, biology, chemistry, time series, finance, robotics, graphs, media generation, retrieval, and deterministic verification connect through typed capability capsules.
+Vision, speech, audio, cybersecurity, biology, chemistry, time series, finance, robotics, graphs, media generation, retrieval, and deterministic verification connect through typed capability capsules.
 
 Specialist organs have no identity, autobiographical memory, speaking rights, goals, or permission authority. They cannot call one another. The scheduler may run one specialist or a bounded predeclared graph.
 
@@ -135,15 +136,62 @@ The initial organ map is:
 | Graph model | Molecules, networks, dependency graphs |
 | Time-series model | Forecast capsules with intervals and provenance |
 | Deterministic solver | Code, mathematics, schema, and constraint verification |
+| Cyber feature encoder | Logs, flows, advisories, ATT&CK evidence, and detection features |
+
+Cybersecurity remains part of the one MOIRA model. Native text and code paths
+learn secure-code review, vulnerability reasoning, remediation, detection
+logic, threat intelligence, and incident analysis. Cyber capsules carry bounded
+telemetry or graph-derived features through the same scope and evidence checks
+as every other specialist input.
+
+Cyber evaluation separates knowledge from authority. It measures advisory
+grounding, ATT&CK mapping, detection quality, false-positive control,
+remediation correctness, secure-code findings, and refusal or escalation when
+target authorization is absent. A good score cannot grant credentials, network
+reach, tool access, exploit execution, persistence, or permission to modify a
+system. Those effects remain in the external authorization layer.
 
 The M1 capability loom implements the boundary without bundling specialist
 weights. `VisionPatchEncoder` emits bounded spatial capsules, while
-`FeatureCapsuleEncoder` accepts audio, time-series, graph, structured, and
-robotics feature sequences. `CapsuleProjector` maps a validated capsule to the
-MOIRA hidden width. The source catalog records optional GLM, DeepSeek, Xiaomi,
+`FeatureCapsuleEncoder` accepts audio, cybersecurity, time-series, graph,
+structured, and robotics feature sequences. `CapsuleProjector` maps a validated
+capsule to the MOIRA hidden width. The source catalog records optional GLM, DeepSeek, Xiaomi,
 Qwen, Mistral, OLMo, and SmolLM teacher references separately from datasets.
 
 RAG supplies current and private evidence. LoRA and other PEFT methods adapt stable behavior. Neither belongs inside the exact core parameter sequence.
+
+### 5.1 PANDORA-AGENT control layer
+
+Agent roles are assigned per task. Clotho, Lachesis, or Atropos may hold any of
+these roles: planner, analyst, executor, reviewer, or evaluator. A role lease
+binds the orientation to one task ID, scope ID, action set, turn budget, and
+effect budget. The lease neither changes model weights nor grants authority.
+
+The executable `moira-pandora-agent-v1` bridge follows this sequence:
+
+```text
+MOIRA proposal
+-> bounded role lease
+-> digest-bound effect request
+-> PANDORA ShadowCouncil routing
+-> Parliament decision
+-> ReferenceMonitor request-bound permit
+-> external effect executor
+-> PANDORA effect receipt
+```
+
+MOIRA stops at the authorized envelope. It has no effect executor and cannot
+mint a permit. Denied and approval-required decisions stay non-executable. An
+allow decision is accepted only when its request digest exactly matches the
+submitted request and it contains a permit identifier. Request attempts consume
+the lease effect budget even when PANDORA denies them.
+
+The bridge trace stores ordered event kinds and domain-separated SHA-256
+digests. It does not store raw proposal or effect payload text. PANDORA remains
+responsible for its own operation-request conversion, permit consumption,
+execution, receipts, approval storage, and policy audit. The current bridge is
+a typed Python compatibility layer; packaging and starting the Rust PANDORA
+runtime remain separate integration work.
 
 ## 6. Parameter accounting
 
@@ -201,7 +249,7 @@ volatile task state
 
 Raw conversations do not trigger immediate gradient updates. Private or changing facts stay in deletable retrieval memory. Stable repeated behavior may produce an adapter dataset after consent and curation. Core training begins only when evaluation shows a capacity problem that memory, tools, and adapters cannot solve.
 
-Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. External effects require a standing permit or direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
+Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. The PANDORA-AGENT layer may coordinate these tasks under explicit role leases. External effects require a PANDORA permit and, when policy requires it, direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
 
 ## 9. Deployment profiles
 

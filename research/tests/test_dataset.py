@@ -21,7 +21,7 @@ CATALOG = "research/configs/m1-sources.toml"
 def test_m1_catalog_contains_datasets_and_teacher_references() -> None:
     catalog = SourceCatalog.from_toml(CATALOG)
 
-    assert len(catalog.sources) == 36
+    assert len(catalog.sources) == 38
     assert catalog.by_id("zai-longcite-45k").license == "Apache-2.0"
     assert catalog.by_id("chartqa").modality == "vision-text"
     assert catalog.by_id("polyai-minds14").modality == "audio"
@@ -31,6 +31,8 @@ def test_m1_catalog_contains_datasets_and_teacher_references() -> None:
     assert catalog.by_id("open-web-math").license == "ODC-By-1.0"
     assert catalog.by_id("open-graph-benchmark").license_verified is False
     assert catalog.by_id("black-forest-labs-flux1-schnell").modality == "teacher"
+    assert catalog.by_id("github-advisory-database").modality == "cyber"
+    assert catalog.by_id("mitre-attack-stix").license_verified is True
 
 
 @pytest.mark.parametrize(
@@ -144,6 +146,32 @@ def test_m1_catalog_contains_datasets_and_teacher_references() -> None:
             "structured",
             "text",
             "target",
+        ),
+        (
+            "github-advisory-database",
+            {
+                "id": "GHSA-2345-6789-cfgh",
+                "summary": "A package accepts an unsafe path",
+                "details": "Upgrade to the patched release and validate resolved paths.",
+                "affected": [{"package": {"name": "demo", "ecosystem": "PyPI"}}],
+                "severity": [{"type": "CVSS_V3", "score": "7.5"}],
+            },
+            "cyber",
+            "text",
+            "text",
+        ),
+        (
+            "mitre-attack-stix",
+            {
+                "type": "attack-pattern",
+                "name": "Example technique",
+                "description": "Monitor process creation and command-line telemetry.",
+                "x_mitre_platforms": ["Windows"],
+                "x_mitre_data_sources": ["Process: Process Creation"],
+            },
+            "cyber",
+            "text",
+            "text",
         ),
     ],
 )

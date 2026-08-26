@@ -308,3 +308,92 @@ def test_capability_training_writes_and_resumes_a_bounded_checkpoint() -> None:
         jsonl_path.unlink(missing_ok=True)
         eval_jsonl_path.unlink(missing_ok=True)
         checkpoint_path.unlink(missing_ok=True)
+
+
+def test_cyber_capability_trains_resumes_and_scores_without_mutation() -> None:
+    train_path = Path("research") / f".cyber-train-{uuid.uuid4().hex}.jsonl"
+    eval_path = Path("research") / f".cyber-eval-{uuid.uuid4().hex}.jsonl"
+    checkpoint_path = Path("research") / f".cyber-checkpoint-{uuid.uuid4().hex}.pt"
+    try:
+        train_path.write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "id": f"GHSA-2345-6789-cfg{index}",
+                        "summary": f"Unsafe path handling case {index}",
+                        "details": "Validate the resolved path and upgrade to the fixed release.",
+                        "affected": [{"package": {"name": "demo", "ecosystem": "PyPI"}}],
+                        "severity": [{"type": "CVSS_V3", "score": "7.5"}],
+                    }
+                )
+                for index in range(2)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        eval_path.write_text(
+            json.dumps(
+                {
+                    "id": "GHSA-2345-6789-cfgh",
+                    "summary": "Held-out unsafe archive path",
+                    "details": "Reject traversal components before extraction.",
+                    "affected": [{"package": {"name": "archive-demo", "ecosystem": "npm"}}],
+                    "severity": [{"type": "CVSS_V3", "score": "6.5"}],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        config = ModelConfig(512, 32, 1, 4, 64, 3, 8, 4, 8, 96)
+        observations = torch.rand(2, 4, 6)
+        train_m1_capabilities(
+            "research/configs/m1-sources.toml",
+            train_path,
+            observations,
+            source_id="github-advisory-database",
+            modality="cyber",
+            steps=1,
+            model_config=config,
+            checkpoint_path=checkpoint_path,
+            max_slots=4,
+            scope_id="defensive-lab",
+        )
+        resumed = train_m1_capabilities(
+            "research/configs/m1-sources.toml",
+            train_path,
+            observations,
+            source_id="github-advisory-database",
+            modality="cyber",
+            steps=2,
+            model_config=config,
+            checkpoint_path=checkpoint_path,
+            resume=True,
+            max_slots=4,
+            scope_id="defensive-lab",
+        )
+        checkpoint_bytes = checkpoint_path.read_bytes()
+        evaluation = evaluate_m1_capabilities(
+            "research/configs/m1-sources.toml",
+            eval_path,
+            torch.rand(1, 4, 6),
+            source_id="github-advisory-database",
+            modality="cyber",
+            checkpoint_path=checkpoint_path,
+            model_config=config,
+            max_slots=4,
+            scope_id="defensive-lab",
+            split="eval",
+        )
+
+        assert resumed.steps == 2
+        assert resumed.samples == 2
+        assert len(resumed.losses) == 2
+        assert evaluation.checkpoint_step == 2
+        assert evaluation.samples == 1
+        assert evaluation.tokens > 0
+        assert evaluation.loss > 0
+        assert checkpoint_path.read_bytes() == checkpoint_bytes
+    finally:
+        train_path.unlink(missing_ok=True)
+        eval_path.unlink(missing_ok=True)
+        checkpoint_path.unlink(missing_ok=True)

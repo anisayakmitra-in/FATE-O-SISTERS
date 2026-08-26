@@ -481,3 +481,27 @@ purpose = "compact-enterprise-text-and-code-teacher-reference"
 revision = "main"
 license_verified = true
 notes = "Compact Apache-2.0 baseline for consumer and edge experiments; optional teacher only."
+
+[[sources]]
+source_id = "github-advisory-database"
+kind = "github"
+uri = "https://github.com/github/advisory-database"
+license = "CC-BY-4.0"
+license_url = "https://github.com/github/advisory-database/blob/main/LICENSE.md"
+modality = "cyber"
+purpose = "defensive-vulnerability-and-package-advisory-reasoning"
+revision = "528bbfe6111488a4e9c82d98e8ac7e04a1f33317"
+license_verified = true
+notes = "Use reviewed OSV advisories for affected-package, remediation, and triage tasks. Preserve attribution, keep temporal holdouts, and do not treat generated severity claims as authoritative."
+
+[[sources]]
+source_id = "mitre-attack-stix"
+kind = "github"
+uri = "https://github.com/mitre-attack/attack-stix-data"
+license = "MITRE-ATT&CK-License"
+license_url = "https://github.com/mitre-attack/attack-stix-data/blob/master/LICENSE.txt"
+modality = "cyber"
+purpose = "defensive-threat-intelligence-detection-and-technique-reasoning"
+revision = "6cda5ad8462c79e14fbb872f4e09059b18e0cfc4"
+license_verified = true
+notes = "Use versioned STIX objects with descriptions and reproduce MITRE's copyright designation and license. Hold out complete ATT&CK releases to test temporal generalization."

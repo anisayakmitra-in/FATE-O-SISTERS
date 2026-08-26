@@ -28,6 +28,7 @@ from .checkpoint import (
     verify_checkpoint,
 )
 from .ablation import assert_equal_parameter_surface
+from .agent import agent_contract
 from .config import (
     DataConfig,
     ModelConfig,
@@ -102,6 +103,14 @@ def _build_parser() -> argparse.ArgumentParser:
         description="MOIRA M0 deterministic CPU and M1 inspection commands.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    agent = commands.add_parser(
+        "agent", help="Inspect the bounded PANDORA-AGENT integration contract."
+    )
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    agent_commands.add_parser(
+        "inspect", help="Show roles, orientations, budgets, and authority boundaries."
+    )
 
     deployment = commands.add_parser(
         "deployment", help="Inspect future deployment profile contracts."
@@ -202,7 +211,7 @@ def _build_parser() -> argparse.ArgumentParser:
     m1_capabilities.add_argument(
         "--modality",
         required=True,
-        choices=("vision", "audio", "time-series", "structured", "robotics"),
+        choices=("vision", "audio", "time-series", "structured", "robotics", "cyber"),
     )
     m1_capabilities.add_argument("--steps", default=1, type=int)
     m1_capabilities.add_argument("--batch-size", default=1, type=int)
@@ -223,7 +232,7 @@ def _build_parser() -> argparse.ArgumentParser:
     m1_evaluate.add_argument(
         "--modality",
         required=True,
-        choices=("vision", "audio", "time-series", "structured", "robotics"),
+        choices=("vision", "audio", "time-series", "structured", "robotics", "cyber"),
     )
     m1_evaluate.add_argument("--checkpoint", required=True, type=Path)
     m1_evaluate.add_argument("--split", default="eval")
@@ -1051,6 +1060,10 @@ def _evaluate(
 
 
 def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
+    if arguments.command == "agent":
+        if arguments.agent_command == "inspect":
+            return agent_contract()
+        raise ValueError("unknown agent command")
     if arguments.command == "deployment":
         if arguments.deployment_command == "describe":
             return _describe_deployment(arguments.profile)

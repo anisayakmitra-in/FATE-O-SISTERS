@@ -34,6 +34,7 @@ _MODALITIES = frozenset(
         "structured",
         "robotics",
         "time-series",
+        "cyber",
         "teacher",
         "evaluation",
     }
@@ -426,6 +427,27 @@ def normalize_row(
         inputs = {"text": prompt}
         targets = {"text": target} if isinstance(target, str) else {"target": target}
         modality = "structured"
+    elif source_id == "github-advisory-database":
+        advisory_id = _string_field(row, "id")
+        summary = _string_field(row, "summary")
+        details = _string_field(row, "details")
+        inputs = {
+            "text": f"Analyze advisory {advisory_id}: {summary}",
+            "affected": row.get("affected", []),
+            "severity": row.get("severity", []),
+        }
+        targets, modality = {"text": details}, "cyber"
+    elif source_id == "mitre-attack-stix":
+        object_type = _string_field(row, "type")
+        name = _string_field(row, "name")
+        description = _string_field(row, "description")
+        inputs = {
+            "text": f"Explain the defensive significance of ATT&CK {object_type}: {name}",
+            "platforms": row.get("x_mitre_platforms", []),
+            "data_sources": row.get("x_mitre_data_sources", []),
+            "kill_chain_phases": row.get("kill_chain_phases", []),
+        }
+        targets, modality = {"text": description}, "cyber"
     else:
         text = row.get("text", row.get("prompt", row.get("input")))
         target = row.get("target", row.get("response", row.get("output", "")))

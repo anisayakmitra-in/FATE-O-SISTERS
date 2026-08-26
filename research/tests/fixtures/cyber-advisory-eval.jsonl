@@ -1,0 +1,1 @@
+{"id":"GHSA-2345-6789-cfg4","summary":"Held-out demo package follows a symbolic link during extraction","details":"Reject link targets that escape the extraction root and use the patched package release.","affected":[{"package":{"name":"demo-extractor","ecosystem":"Go"}}],"severity":[{"type":"CVSS_V3","score":"8.1"}]}

@@ -15,12 +15,16 @@ The Python reference contains:
 - Pulse state with 12 fast affect components and 6 slow affect components;
 - an exact trainable-parameter ledger checked against the model;
 - deterministic synthetic data, training, evaluation, and resume tests;
-- a manifest-first M1 catalog for text, code, vision-text, audio, robotics,
-  graph, protein, time-series, diffusion, evaluation, and teacher references;
+- a manifest-first M1 catalog for text, code, cybersecurity, vision-text,
+  audio, robotics, graph, protein, time-series, diffusion, evaluation, and
+  teacher references;
 - bounded JSONL normalization with source revisions, licenses, split assignment, and record hashes;
-- pure-PyTorch vision and feature capsule encoders for image, audio, time-series, structured, graph, and robotics inputs;
+- pure-PyTorch vision and feature capsule encoders for image, audio,
+  cybersecurity telemetry, time-series, structured, graph, and robotics inputs;
 - an M1 meta-device parameter check, equal-parameter component ablations, and a bounded in-memory JSONL training path;
 - checkpointed capability-prefix training, resume, and no-update held-out evaluation;
+- a bounded PANDORA-AGENT bridge with per-task role leases, turn and effect
+  budgets, request-digest binding, and chained audit events;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -172,6 +176,51 @@ scope manifest, reports token-weighted loss plus per-batch losses, and sets
 identity; the JSONL and observation files themselves must be held out by the
 caller. This remains bounded local training/evaluation; it does not fetch Hub
 weights, execute robotics, or claim a trained 3B/AGI system.
+
+Cybersecurity is a typed specialization beside the other capabilities. Advisory
+or ATT&CK JSONL supplies the text objective, while a caller-owned finite
+`[records, events, features]` tensor supplies log, flow, package, or detection
+features:
+
+```powershell
+python -m moira m1 train-capabilities `
+  --catalog research/configs/m1-sources.toml `
+  --source github-advisory-database `
+  --path C:\data\ghsa-train.jsonl `
+  --observations C:\data\ghsa-features.pt `
+  --modality cyber `
+  --scope-id defensive-lab `
+  --steps 1 `
+  --checkpoint C:\runs\moira-cyber\advisories.pt `
+  --device cuda
+```
+
+The specialization covers secure-code review, vulnerability triage,
+remediation, ATT&CK mapping, detection engineering, threat-intelligence
+synthesis, and incident analysis. It does not grant network access, credentials,
+scanner control, exploit execution, or permission to act on a target.
+
+## PANDORA-AGENT integration
+
+Any MOIRA orientation can serve as planner, analyst, executor, reviewer, or
+evaluator for a bounded task. Roles are temporary leases, not permanent sister
+identities. Inspect the executable bridge contract with:
+
+```powershell
+python -m moira agent inspect
+```
+
+The Python bridge records a proposal turn, constructs a canonical effect
+request, binds the payload and request with SHA-256 digests, and submits it to a
+caller-provided PANDORA gateway. A local action set limits what may be proposed;
+it is not permission. PANDORA must independently route the request, apply
+policy, issue a request-bound permit, execute the effect, and return its receipt.
+MOIRA exposes no direct effect executor, and denial or approval-required
+decisions do not produce an authorized envelope.
+
+The bridge is executable and unit-tested, but the repositories are not linked
+as a packaged runtime dependency yet. `agent inspect` describes the interface;
+it does not launch PANDORA, call a tool, or make the model autonomous by itself.
 
 ## Elastic capacity and custom bitplane precision
 

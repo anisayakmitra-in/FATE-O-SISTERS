@@ -76,10 +76,12 @@ def test_consumer_and_enterprise_policies_switch_bits_and_compute_dtype() -> Non
     assert set(consumer.capabilities) == set(CAPABILITY_AREAS)
     assert consumer.core_bits == 3
     assert consumer.capabilities["mathematics-reasoning"] == 9
+    assert consumer.capabilities["cybersecurity"] == 9
     assert consumer.verifier_bits == 9
     assert consumer.compute_dtype.value == "bf16"
     assert enterprise.core_bits == 9
     assert enterprise.capabilities["mathematics-reasoning"] == 27
+    assert enterprise.capabilities["cybersecurity"] == 27
     assert enterprise.verifier_bits == 81
     assert enterprise.verifier_compute_dtype.value == "fp64"
 

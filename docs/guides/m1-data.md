@@ -61,6 +61,8 @@ these sources runtime dependencies:
 | `facebook/esm2_t6_8M_UR50D` | Protein sequences | MIT | Optional teacher reference |
 | `google/timesfm-1.0-200m` | Time-series forecasting | Apache-2.0 | Optional teacher reference |
 | `black-forest-labs/FLUX.1-schnell` | Diffusion image generation | Apache-2.0 | Gated 12B reference; never required by M1 |
+| `github/advisory-database` | Vulnerability and package advisories | CC-BY-4.0 | Cyber normalizer and capability training |
+| `mitre-attack/attack-stix-data` | Threat intelligence and detection mapping | MITRE ATT&CK license | Cyber normalizer; attribution required |
 
 The catalog deliberately records mixed or gated sources as references instead
 of silently treating them as enterprise-cleared training data. Per-row source
@@ -102,15 +104,28 @@ file. A JSONL row must match the selected source schema; generic text rows use
 ## Capability loom
 
 `VisionPatchEncoder` turns a bounded RGB tensor into spatial capsules.
-`FeatureCapsuleEncoder` covers audio, time series, graphs, structured values,
-and robotics state vectors through the same typed boundary. `CapsuleProjector`
-maps a validated capsule to the MOIRA hidden width. Each capsule carries a task,
-scope, modality, source hash, slot types, uncertainty, and evidence status.
+`FeatureCapsuleEncoder` covers audio, cybersecurity telemetry, time series,
+graphs, structured values, and robotics state vectors through the same typed
+boundary. `CapsuleProjector` maps a validated capsule to the MOIRA hidden width.
+Each capsule carries a task, scope, modality, source hash, slot types,
+uncertainty, and evidence status.
 
 Image decoding is optional. `load_image_tensor` uses Pillow only when a caller
 asks for local image decoding; Pillow is not a required M1 dependency. External
 ViT, ASR, diffusion, VAE, GAN, or other specialist weights remain teacher or
 organ references until a separate alignment contract is measured.
+
+Cyber capability rows use either the GitHub Advisory Database OSV schema or a
+reviewed subset of MITRE ATT&CK STIX objects. The accompanying observation
+tensor is `[N,T,F]`: records, bounded events, and caller-defined finite
+features. The checkpoint binds the exact observation shape and scope. Keep
+feature definitions in the materialized dataset manifest; a tensor without its
+schema is not reusable evidence.
+
+Cyber training targets defensive analysis. The model may explain attacker
+behavior when that explanation supports detection or remediation. External
+scanning, exploit execution, credential use, and changes to live systems remain
+separate authorized tools and never follow from a capability score.
 
 ## Bounded M1 training path
 
