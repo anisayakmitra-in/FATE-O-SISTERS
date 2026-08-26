@@ -15,9 +15,17 @@ one, and keep a local copy of every checkpoint.
 | Google Colab | Free GPU or TPU access | Interactive debugging and notebook reproduction | No fixed GPU type or published stable quota; free runtimes last at most 12 hours |
 | Hugging Face ZeroGPU | Five GPU-minutes per day on free accounts; 48 GB or 96 GB allocation | Inference, demos, and short evaluation functions | Gradio-only and too short for pretraining |
 
+The private Kaggle kernel pins PyTorch 2.7.1 with CUDA 12.6. Kaggle assigned a
+Tesla P100 to the first run, while its preinstalled CUDA 12.8 wheel omitted the
+P100's `sm_60` kernels. CUDA 12.6 is the last official PyTorch wheel line that
+supports this Pascal GPU. The kernel asserts `sm_60` support before allocating
+the model so an incompatible runtime fails with a direct diagnostic.
+
 Primary sources:
 
 - [Kaggle CLI authentication](https://github.com/Kaggle/kaggle-cli/blob/main/skills/references/auth.md)
+- [PyTorch 2.7 CUDA 12.6 wheels](https://download.pytorch.org/whl/cu126/torch/)
+- [PyTorch CUDA 12.8 architecture change](https://github.com/pytorch/pytorch/releases/tag/v2.8.0)
 - [Lightning AI pricing](https://lightning.ai/pricing)
 - [Modal pricing](https://modal.com/pricing)
 - [Beam pricing](https://www.beam.cloud/pricing)

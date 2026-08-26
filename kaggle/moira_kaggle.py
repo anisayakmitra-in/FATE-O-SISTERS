@@ -9,7 +9,7 @@ import sys
 
 
 REPOSITORY = "https://github.com/anisayakmitra-in/FATE-O-SISTERS.git"
-CHECKOUT = Path("/kaggle/working/fate-o-sisters-source")
+CHECKOUT = Path("/tmp/fate-o-sisters-source")
 CHECKPOINT = Path("/kaggle/working/moira-artifacts/m1-text.pt")
 
 
@@ -19,7 +19,26 @@ def run(*arguments: str, cwd: Path | None = None) -> None:
 
 run("git", "clone", "--depth", "1", "--branch", "main", REPOSITORY, str(CHECKOUT))
 run("git", "rev-parse", "HEAD", cwd=CHECKOUT)
-run(sys.executable, "-m", "pip", "install", "-e", "research[training]", cwd=CHECKOUT)
+run(
+    sys.executable,
+    "-m",
+    "pip",
+    "install",
+    "--index-url",
+    "https://download.pytorch.org/whl/cu126",
+    "torch==2.7.1+cu126",
+)
+run(sys.executable, "-m", "pip", "install", "-e", "research", cwd=CHECKOUT)
+run(sys.executable, "-m", "pip", "install", "bitsandbytes>=0.50,<0.51")
+run(
+    sys.executable,
+    "-c",
+    (
+        "import torch; "
+        "print(torch.__version__, torch.cuda.get_device_name(0), torch.cuda.get_arch_list()); "
+        "assert 'sm_60' in torch.cuda.get_arch_list()"
+    ),
+)
 run("nvidia-smi")
 
 environment = os.environ.copy()
