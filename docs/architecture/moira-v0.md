@@ -248,7 +248,7 @@ Training data requires source, license or consent class, content hash, preproces
 | M4 | About 1B | Scaling estimate, distributed recovery, full evaluation |
 | M5 | Exact 3B | First canonical root |
 
-The canonical capacity sequence begins `3B -> 6B -> 9B -> 27B -> 81B` and
+The canonical capacity sequence begins `3B -> 9B -> 27B -> 81B -> 243B` and
 continues by hardware-supported expansion; there is no architectural upper
 bound. Every added block or expert requires training and held-out promotion.
 The research-sized M1 model does not claim to be any tier in that lineage.
@@ -292,6 +292,12 @@ build_growth_plan(...) -> GrowthPlan
 build_elastic_plan(...) -> ElasticPlan
 quantize_tensor(...) -> QuantizedTensor
 materialize_bit_precision(...) -> Tensor | QuantizedTensor
+prepare_model_for_qat(...) -> QATPreparation
+promote_model_qat(...) -> dict[str, object]
+save_qat_checkpoint(...) -> Path
+load_qat_checkpoint(...) -> dict[str, object]
+verify_qat_checkpoint(...) -> dict[str, object]
+switch_deployment_profile(...) -> dict[str, object]
 ```
 
 The reference package lives under `research/src/moira`. CPU tests use tiny dimensions and deterministic seeds. A synthetic next-token task provides the first smoke-training command. Kaggle uses the same command and writes resumable checkpoints containing model, optimizer, scheduler, random-number-generator, data-cursor, configuration, and manifest state.
@@ -312,7 +318,7 @@ per-batch losses without updating the model or loom.
 MOIRA uses one field with two independent elastic axes:
 
 ```text
-capacity: 3B -> 6B -> 9B -> 27B -> 81B -> 243B -> ...
+capacity: 3B -> 9B -> 27B -> 81B -> 243B -> 729B -> ...
 logical bits: int3 -> int6 -> int9 -> int27 -> int81 -> int243 -> ...
 arithmetic: bf16/fp32/fp64 selected by the hardware and operation
 ```
@@ -334,6 +340,22 @@ If only the `int3` artifact survives, materializing `int81` increases the
 container size but cannot recover discarded information. Promotion with quality
 recovery requires retained master/residual state, distillation, or new training.
 
+The checked-in master-retained QAT path parametrizes every `Linear` and
+`Embedding` weight. Each weight row gets its own scale, and the forward pass
+receives a signed symmetric INT3 view;
+the straight-through backward pass updates the original FP32 parameter. A
+promotion may advance only one rung (`int3 -> int6 -> int9 -> int27`) and must
+be followed by training and held-out evaluation. Tied parameters remain tied.
+The experimental continuation checkpoint records the complete precision
+history and retains floating masters and optimizer state. It is a
+trusted-local prototype, not the hardened M0 checkpoint format.
+
+Executable QAT stops at `int27`. It uses FP64 intermediates above 24 bits, but
+an FP32 master still contains only FP32 information. `int81` and higher remain
+packed storage and policy budgets because no FP32/FP64 computation can
+truthfully emulate that many integer levels. This arithmetic limit does not cap
+the independent parameter-growth sequence.
+
 Consumer and Enterprise are precision policies over the same MOIRA identity.
 Consumer defaults to an `int3` core, higher logical precision for reasoning,
 and an FP32 verifier. Enterprise defaults to an `int9` core, `int27` active
@@ -348,12 +370,19 @@ python -m moira elastic policy --profile consumer
 python -m moira elastic policy --profile enterprise
 python -m moira elastic plan --current 3B --target 243B \
   --profile enterprise --runtime-bits int27
+python -m moira deployment switch consumer \
+  --state research/runs/deployment.json
+python -m moira elastic qat-smoke \
+  --config research/configs/m0-smoke.toml \
+  --initial-bits int3 --promote-to int6 --steps-per-stage 1 \
+  --device cuda --checkpoint research/runs/int3-to-int6.pt
 ```
 
-The output is a candidate manifest. It does not pretend that a local machine
-has allocated or trained the target capacity. Promotion still requires
-checkpoint signatures, held-out capability scores, hardware/resource checks,
-and rollback.
+The growth output is a candidate manifest. The profile switch changes only a
+local JSON policy state, and the QAT command trains only the configured
+proof-scale model. None of these commands pretends that a local machine has
+allocated or trained the target capacity. Promotion still requires checkpoint
+signatures, held-out capability scores, hardware/resource checks, and rollback.
 
 Phase 0 excludes:
 
@@ -361,7 +390,7 @@ Phase 0 excludes:
 - long stable M1 learning curves and precision comparisons;
 - custom bitplane materialization kernels for large tensors;
 - autonomous adapter or core promotion;
-- production deployment switching;
+- production deployment orchestration or live weight conversion;
 - external network tools;
 - robotics execution;
 - claims of AGI, consciousness, benchmark leadership, or measured speedups.

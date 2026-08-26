@@ -37,6 +37,7 @@ from .config import (
     TrainingConfig,
 )
 from .dataset import SourceCatalog, iter_jsonl_examples
+from .deployment import switch_deployment_profile
 from .elastic import (
     BIT_PRECISION_LADDER,
     CANONICAL_PARAMETER_LADDER,
@@ -49,6 +50,7 @@ from .m1_train import (
     train_m1_capabilities,
     train_m1_jsonl,
 )
+from .qat import run_moira_qat_smoke
 from .synthetic import SyntheticStream
 from .train import (
     _build_components,
@@ -110,6 +112,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "describe", help="Describe a deployment profile without changing state."
     )
     describe.add_argument("profile", choices=("consumer", "enterprise"))
+    switch = deployment_commands.add_parser(
+        "switch", help="Persist a local Consumer or Enterprise policy selection."
+    )
+    switch.add_argument("profile", choices=("consumer", "enterprise"))
+    switch.add_argument(
+        "--state",
+        type=Path,
+        required=True,
+        help="JSON state path; this command does not convert or allocate weights.",
+    )
 
     elastic = commands.add_parser(
         "elastic",
@@ -135,6 +147,20 @@ def _build_parser() -> argparse.ArgumentParser:
     elastic_plan.add_argument(
         "--runtime-bits",
         help="Override the profile core level, for example int3, int9, or int81.",
+    )
+    qat_smoke = elastic_commands.add_parser(
+        "qat-smoke",
+        help="Train a proof-scale MOIRA model at one bit level, then promote it.",
+    )
+    qat_smoke.add_argument("--config", required=True, type=Path)
+    qat_smoke.add_argument("--initial-bits", default="int3")
+    qat_smoke.add_argument("--promote-to", default="int6")
+    qat_smoke.add_argument("--steps-per-stage", default=1, type=int)
+    qat_smoke.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    qat_smoke.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Optional trusted-local continuation checkpoint path.",
     )
 
     m1 = commands.add_parser(
@@ -771,9 +797,12 @@ def _describe_deployment(profile: str) -> dict[str, object]:
         "model": "MOIRA",
         "profile": profile,
         "profile_changes_model_identity": False,
-        "status": "architecture contract only",
+        "status": "local profile state available; runtime orchestration pending",
         "description": descriptions[profile],
-        "switch_command_available": False,
+        "switch_command_available": True,
+        "switch_changes_weights": False,
+        "profile_state_implemented": True,
+        "runtime_profile_application_implemented": False,
         "precision_policy": policy["precision_policy"],
         "parameter_growth_ladder": policy["parameter_growth_ladder"],
         "bit_precision_ladder": policy["bit_precision_ladder"],
@@ -958,7 +987,11 @@ def _evaluate(
 
 def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
     if arguments.command == "deployment":
-        return _describe_deployment(arguments.profile)
+        if arguments.deployment_command == "describe":
+            return _describe_deployment(arguments.profile)
+        if arguments.deployment_command == "switch":
+            return switch_deployment_profile(arguments.profile, arguments.state)
+        raise ValueError("unknown deployment command")
     if arguments.command == "elastic":
         if arguments.elastic_command == "policy":
             return _elastic_policy(arguments.profile)
@@ -968,6 +1001,15 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 arguments.target,
                 arguments.profile,
                 arguments.runtime_bits,
+            )
+        if arguments.elastic_command == "qat-smoke":
+            return run_moira_qat_smoke(
+                _load_config(arguments.config),
+                initial_bits=arguments.initial_bits,
+                promote_to=arguments.promote_to,
+                steps_per_stage=arguments.steps_per_stage,
+                device=arguments.device,
+                checkpoint=arguments.checkpoint,
             )
         raise ValueError("unknown elastic command")
     if arguments.command == "m1":

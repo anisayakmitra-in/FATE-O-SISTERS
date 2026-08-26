@@ -61,6 +61,24 @@ from .elastic import (
     parse_parameter_count,
     quantize_tensor,
 )
+from .deployment import (
+    DEPLOYMENT_STATE_SCHEMA_VERSION,
+    deployment_state,
+    load_deployment_state,
+    switch_deployment_profile,
+)
+from .qat import (
+    IntXWeightParametrization,
+    QATPreparation,
+    fake_quantize_weight_ste,
+    load_qat_checkpoint,
+    prepare_model_for_qat,
+    promote_model_qat,
+    qat_model_state,
+    run_moira_qat_smoke,
+    save_qat_checkpoint,
+    verify_qat_checkpoint,
+)
 
 __all__ = [
     "ModelConfig",
@@ -115,6 +133,20 @@ __all__ = [
     "parse_bit_precision",
     "parse_parameter_count",
     "quantize_tensor",
+    "DEPLOYMENT_STATE_SCHEMA_VERSION",
+    "deployment_state",
+    "load_deployment_state",
+    "switch_deployment_profile",
+    "IntXWeightParametrization",
+    "QATPreparation",
+    "fake_quantize_weight_ste",
+    "load_qat_checkpoint",
+    "prepare_model_for_qat",
+    "promote_model_qat",
+    "qat_model_state",
+    "run_moira_qat_smoke",
+    "save_qat_checkpoint",
+    "verify_qat_checkpoint",
     "ParameterLedger",
     "ParameterSubsystem",
     "TrainingConfig",

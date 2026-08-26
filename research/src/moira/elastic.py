@@ -2,7 +2,7 @@
 
 MOIRA has two independent scaling axes:
 
-* parameter capacity: 3B, 6B, 9B, 27B, 81B, and future generated tiers; and
+* parameter capacity: 3B, 9B, 27B, 81B, and future x3-generated tiers; and
 * logical weight precision: 3-bit, 6-bit, 9-bit, 27-bit, 81-bit, and future
   generated levels.
 
@@ -27,10 +27,11 @@ from torch import Tensor
 
 CANONICAL_PARAMETER_LADDER = (
     3_000_000_000,
-    6_000_000_000,
     9_000_000_000,
     27_000_000_000,
     81_000_000_000,
+    243_000_000_000,
+    729_000_000_000,
 )
 BIT_PRECISION_LADDER = (3, 6, 9, 27, 81)
 CAPABILITY_AREAS = (
@@ -200,29 +201,23 @@ class GrowthPlan:
 def build_growth_plan(
     current: int | str,
     target: int | str,
-    *,
-    ladder: tuple[int, ...] = CANONICAL_PARAMETER_LADDER,
 ) -> GrowthPlan:
-    """Build a non-allocating expansion plan with no hard upper tier."""
+    """Build an exact x3, non-allocating expansion plan with no hard upper tier."""
     current_count = parse_parameter_count(current)
     target_count = parse_parameter_count(target)
     if target_count < current_count:
         raise ValueError("growth target cannot be smaller than the current model")
-    if not ladder or any(type(value) is not int or value <= 0 for value in ladder):
-        raise ValueError("growth ladder must contain positive integer counts")
-    if tuple(sorted(set(ladder))) != ladder:
-        raise ValueError("growth ladder must be strictly increasing")
     if current_count == target_count:
         return GrowthPlan(current_count, target_count, ())
 
-    milestones = [
-        value for value in ladder if current_count < value <= target_count
-    ]
-    if target_count not in milestones:
-        milestones.append(target_count)
     steps: list[GrowthStep] = []
     source = current_count
-    for milestone in milestones:
+    while source < target_count:
+        milestone = source * 3
+        if milestone > target_count:
+            raise ValueError(
+                "growth target must be reachable from the current model by exact x3 steps"
+            )
         steps.append(
             GrowthStep(
                 source_parameters=source,

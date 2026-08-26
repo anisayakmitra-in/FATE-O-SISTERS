@@ -32,7 +32,6 @@ def test_growth_plan_continues_past_81b_without_an_upper_cap() -> None:
     plan = build_growth_plan("3B", "243B")
 
     assert [step.target_parameters for step in plan.steps] == [
-        6_000_000_000,
         9_000_000_000,
         27_000_000_000,
         81_000_000_000,
@@ -40,6 +39,20 @@ def test_growth_plan_continues_past_81b_without_an_upper_cap() -> None:
     ]
     assert plan.requires_training is True
     assert plan.to_dict()["unbounded_growth"] is True
+
+
+def test_growth_plan_generates_every_x3_tier_beyond_the_preview_ladder() -> None:
+    plan = build_growth_plan("81B", "729B")
+
+    assert [step.target_parameters for step in plan.steps] == [
+        243_000_000_000,
+        729_000_000_000,
+    ]
+
+
+def test_growth_plan_rejects_a_non_x3_target() -> None:
+    with pytest.raises(ValueError, match="exact x3 steps"):
+        build_growth_plan("3B", "6B")
 
 
 @pytest.mark.parametrize("bits", (3, 6, 9, 27, 81))

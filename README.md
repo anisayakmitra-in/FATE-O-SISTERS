@@ -151,7 +151,7 @@ MOIRA now has a planning contract for one identity that can grow with
 hardware-supported resources:
 
 ```text
-parameters: 3B -> 6B -> 9B -> 27B -> 81B -> 243B -> ...
+parameters: 3B -> 9B -> 27B -> 81B -> 243B -> 729B -> ...
 logical bits: int3 -> int6 -> int9 -> int27 -> int81 -> int243 -> ...
 ```
 
@@ -168,14 +168,36 @@ python -m moira elastic plan `
   --target 243B `
   --profile enterprise `
   --runtime-bits int27
+python -m moira deployment switch consumer `
+  --state research/runs/deployment.json
 ```
 
 The plan is non-allocating and records every growth step, target storage
 estimate, capability precision policy, arithmetic dtype, and the requirement
-for training and promotion. Low-bit training can use retained master or
-residual state; turning an `int3` artifact into an `int81` container alone does
-not recover information discarded during quantization. Large-field packed
-kernels and distributed training remain future implementation work.
+for training and promotion. The deployment command atomically selects a local
+policy; it does not convert weights, allocate a different model, or grant new
+capabilities.
+
+The executable proof path trains Linear and Embedding weights through an
+`int3` fake-quantized forward view while AdamW updates retained FP32 masters,
+then advances exactly one rung to `int6`:
+
+```powershell
+python -m moira elastic qat-smoke `
+  --config research/configs/m0-smoke.toml `
+  --initial-bits int3 `
+  --promote-to int6 `
+  --steps-per-stage 1 `
+  --device cuda `
+  --checkpoint research/runs/int3-to-int6.pt
+```
+
+This is weight-only quantization-aware training, not native packed INT3 matrix
+multiplication. The executable QAT levels stop at `int27`: FP64 has 52 explicit
+significand bits, so pretending to simulate `int81` numerics would be false.
+`int81` and higher remain logical storage/policy levels. Turning an `int3`-only
+artifact into a larger container cannot recover discarded information.
+Large-field packed kernels and distributed training remain future work.
 
 Successful commands write one compact JSON object to standard output. Expected argument, configuration, filesystem, and checkpoint failures write an error to standard error and exit with status 2. Keep the complete run directory for automatic recovery and resume; a checkpoint tensor file by itself is not the whole run state.
 
@@ -191,12 +213,15 @@ python -m pytest research/tests -p no:cacheprovider
 | --- | --- |
 | `research/src/moira/` | Executable PyTorch CPU reference and CLI |
 | `research/src/moira/elastic.py` | Unbounded capacity plans, custom bitplane views, and profile policies |
+| `research/src/moira/qat.py` | Master-retained INT3/INT6/INT9/INT27 weight-QAT and continuation checkpoint |
+| `research/src/moira/deployment.py` | Atomic local Consumer/Enterprise profile selection |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
 | `research/configs/m1-sources.toml` | M1 dataset, model, and evaluation source catalog |
 | `docs/architecture/moira-v0.md` | Architecture, scope boundaries, and milestone gates |
 | `docs/guides/kaggle-m0.md` | Cell-by-cell Kaggle workflow and artifact rules |
 | `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
+| `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 
 ## Research boundary

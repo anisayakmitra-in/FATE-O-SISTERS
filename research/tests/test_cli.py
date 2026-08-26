@@ -63,7 +63,32 @@ def test_deployment_descriptions_are_read_only_and_keep_one_identity(
     assert output["profile"] == profile
     assert output["implemented_in_phase_0"] is False
     assert output["profile_changes_model_identity"] is False
-    assert output["switch_command_available"] is False
+    assert output["switch_command_available"] is True
+    assert output["switch_changes_weights"] is False
+
+
+def test_deployment_switch_persists_policy_without_changing_weights(
+    cli_root: Path,
+) -> None:
+    state_path = cli_root / "deployment.json"
+
+    consumer = _output_json(
+        _run_cli("deployment", "switch", "consumer", "--state", state_path)
+    )
+    enterprise = _output_json(
+        _run_cli("deployment", "switch", "enterprise", "--state", state_path)
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert consumer["previous_profile"] is None
+    assert enterprise["previous_profile"] == "consumer"
+    assert enterprise["model"] == "MOIRA"
+    assert enterprise["profile"] == "enterprise"
+    assert enterprise["switch_applied"] is True
+    assert enterprise["weights_converted"] is False
+    assert persisted["profile"] == "enterprise"
+    assert persisted["precision_policy"]["verifier_compute_dtype"] == "fp64"
+    assert persisted["state_only_no_weight_conversion"] is True
 
 
 def test_doctor_reports_the_exact_m0_cpu_surface(cli_root: Path) -> None:
@@ -127,6 +152,14 @@ def test_elastic_policy_and_unbounded_growth_plan_cli() -> None:
         "int27",
         "int81",
     ]
+    assert policy["parameter_growth_ladder"] == [
+        "3B",
+        "9B",
+        "27B",
+        "81B",
+        "243B",
+        "729B",
+    ]
     assert policy["unbounded_parameter_growth"] is True
     assert policy["precision_policy"]["verifier_bits"] == "int81"
 
@@ -146,8 +179,46 @@ def test_elastic_policy_and_unbounded_growth_plan_cli() -> None:
     )
     assert plan["runtime_bits"] == "int6"
     assert plan["growth"]["target"] == "243B"
+    assert [step["target"] for step in plan["growth"]["steps"]] == [
+        "9B",
+        "27B",
+        "81B",
+        "243B",
+    ]
     assert plan["growth"]["unbounded_growth"] is True
     assert plan["status"] == "plan-only-no-target-allocation"
+
+
+def test_qat_smoke_cli_trains_int3_then_promotes_to_int6(cli_root: Path) -> None:
+    checkpoint = cli_root / "int3-to-int6.pt"
+    output = _output_json(
+        _run_cli(
+            "elastic",
+            "qat-smoke",
+            "--config",
+            CONFIG_PATH,
+            "--initial-bits",
+            "int3",
+            "--promote-to",
+            "int6",
+            "--steps-per-stage",
+            1,
+            "--device",
+            "cpu",
+            "--checkpoint",
+            checkpoint,
+        )
+    )
+
+    assert output["architecture"] == "MOIRA-master-retained-INTx-QAT-v1"
+    assert output["precision_history"] == ["int3", "int6"]
+    assert output["preparation"]["master_weights_retained"] is True
+    assert output["promotion"]["reconstructed_from_low_bit_artifact"] is False
+    assert output["final_qat_state"]["logical_bits"] == "int6"
+    assert output["global_step"] == 2
+    assert output["all_losses_finite"] is True
+    assert output["scope"] == "proof-scale-weight-only-QAT-not-a-trained-3B-checkpoint"
+    assert Path(str(output["checkpoint"])).is_file()
 
 
 def test_train_verify_evaluate_and_auto_resume_cli(cli_root: Path) -> None:
