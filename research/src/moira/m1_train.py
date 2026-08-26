@@ -422,10 +422,6 @@ def train_m1_jsonl(
     if resume and checkpoint_path is None:
         raise ValueError("resume requires checkpoint_path")
     config = model_config or ModelConfig.m1_cpu()
-    model = MoiraModel(config).to(device=device, dtype=torch.float32)
-    if checkpoint_path is not None:
-        checkpoint_byte_limit(model)
-    optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False)
     examples = tuple(
         iter_cataloged_text_examples(
             catalog_path,
@@ -436,7 +432,6 @@ def train_m1_jsonl(
     )
     if len(examples) < steps * batch_size:
         raise ValueError("JSONL source ended before the requested training steps")
-    tokenizer = ByteTokenizer()
     manifest = {
         "model_config": asdict(config),
         "source_id": source_id,
@@ -445,6 +440,47 @@ def train_m1_jsonl(
         "tokenizer": "utf8-byte-v1",
         "dataset_sha256": _sha256_file(jsonl_path),
     }
+    return train_causal_examples(
+        examples,
+        manifest=manifest,
+        steps=steps,
+        batch_size=batch_size,
+        device=device,
+        checkpoint_path=checkpoint_path,
+        resume=resume,
+        model_config=config,
+    )
+
+
+def train_causal_examples(
+    examples: tuple[DatasetExample, ...],
+    *,
+    manifest: dict[str, object],
+    steps: int,
+    batch_size: int,
+    device: str,
+    checkpoint_path: str | Path | None,
+    resume: bool,
+    model_config: ModelConfig,
+) -> M1TrainingResult:
+    """Train the shared MOIRA decoder on validated target-only text pairs."""
+    _validate_m1_limits(steps=steps, batch_size=batch_size, device=device)
+    if resume and checkpoint_path is None:
+        raise ValueError("resume requires checkpoint_path")
+    if not isinstance(examples, tuple) or any(
+        not isinstance(example, DatasetExample) for example in examples
+    ):
+        raise ValueError("causal examples must be a tuple of DatasetExample values")
+    if not isinstance(manifest, dict):
+        raise ValueError("causal training manifest must be a dictionary")
+    config = model_config
+    model = MoiraModel(config).to(device=device, dtype=torch.float32)
+    if checkpoint_path is not None:
+        checkpoint_byte_limit(model)
+    optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False)
+    if len(examples) < steps * batch_size:
+        raise ValueError("causal source ended before the requested training steps")
+    tokenizer = ByteTokenizer()
     lineage_id = uuid.uuid4().hex
     global_step = 0
     sample_cursor = 0

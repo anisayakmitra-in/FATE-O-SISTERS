@@ -210,6 +210,28 @@ invocation requires approval bound to the action, target, payload digest,
 payload size, task, scope, role, orientation, and policy version. Browser and
 network tools remain unregistered.
 
+### 5.2 Native action objective
+
+The runtime action schema is also a decoder training language. Each trajectory
+contains task identity, task text, orientation, temporary role, the registered
+tool catalog, prior observations, and exactly one next action. The model-visible
+prompt excludes the target action. Only the canonical action bytes and EOS
+receive causal loss.
+
+The objective uses the existing shared token embedding, TSK blocks, Pulse, and
+tied output projection. It does not create a separate policy network, action
+head, or parameter copy, so it preserves the model's parameter ledger and the
+same 3B-family scale axis. At inference, the exact parser used for Ollama also
+validates training targets, preventing the data and runtime schemas from
+drifting independently.
+
+The local `agent-smoke` surface has 114,366 trainable parameters and a 768-token
+context. It verifies deterministic batching, target-only masks, optimizer
+updates, bit-exact resume, fail-closed checkpoint manifests, no-update
+evaluation, and all four action kinds. It does not establish autonomous-agent
+quality. Scaling requires a consented trajectory corpus, held-out tasks, schema
+validity and exact-action metrics, safety evaluations, and then M1/M2/3B runs.
+
 ## 6. Parameter accounting
 
 Every artifact reports separate counts:

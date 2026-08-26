@@ -224,6 +224,29 @@ can speak without being prompted again, ask the user a necessary question,
 select a registered tool, consume its observation, and finish within a step
 budget.
 
+MOIRA now also has a native trainable action objective. It teaches the shared
+Atropos decoder to emit the same exact `speak`, `ask_user`, `use_tool`, and
+`finish` objects consumed by the runtime. The objective adds no separate policy
+model or action-head parameters: task state is the causal prompt and only the
+canonical action bytes receive loss. A 114,366-parameter local surface proves
+the data, loss, exact-resume, evaluation, and checkpoint contracts:
+
+```powershell
+python -m moira agent train-actions `
+  --path research/tests/fixtures/agent-trajectories.jsonl `
+  --checkpoint research/runs/agent-actions.pt `
+  --steps 1
+
+python -m moira agent evaluate-actions `
+  --path research/tests/fixtures/agent-trajectories.jsonl `
+  --checkpoint research/runs/agent-actions.pt `
+  --max-records 4
+```
+
+The bundled four-record file is a deterministic schema fixture, not a useful
+trained agent dataset or benchmark. See
+[`docs/guides/agent-action-training.md`](docs/guides/agent-action-training.md).
+
 For an Ollama download, the weights provide cognition and structured action
 selection. A model file cannot directly call the operating system. Real file,
 terminal, browser, or API effects therefore use the small MOIRA companion

@@ -11,7 +11,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .agent_loop import AgentAction, AgentActionKind, AgentContext
+from .agent_loop import (
+    AgentAction,
+    AgentActionKind,
+    AgentContext,
+    agent_action_from_mapping,
+)
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
@@ -144,38 +149,12 @@ def parse_ollama_action(response: object) -> AgentAction:
         value = json.loads(message["content"])
     except (json.JSONDecodeError, RecursionError) as error:
         raise ValueError("Ollama action content is not valid JSON") from error
-    required = {"kind", "text", "tool_id", "target", "payload_text"}
-    if not isinstance(value, dict) or set(value) != required:
-        raise ValueError("Ollama action does not match the MOIRA action schema")
-    if any(not isinstance(value[field], str) for field in required):
-        raise ValueError("Ollama action fields must be strings")
     try:
-        kind = AgentActionKind(value["kind"])
+        return agent_action_from_mapping(value)
     except ValueError as error:
-        raise ValueError("Ollama action kind is invalid") from error
-    if kind is AgentActionKind.SPEAK:
-        action = AgentAction.speak(value["text"])
-    elif kind is AgentActionKind.ASK_USER:
-        action = AgentAction.ask_user(value["text"])
-    elif kind is AgentActionKind.USE_TOOL:
-        action = AgentAction.use_tool(
-            value["tool_id"], value["target"], value["payload_text"].encode("utf-8")
-        )
-    else:
-        action = AgentAction.finish(value["text"])
-    _validate_unused_fields(kind, value)
-    return action
-
-
-def _validate_unused_fields(kind: AgentActionKind, value: dict[str, str]) -> None:
-    if kind in (AgentActionKind.SPEAK, AgentActionKind.ASK_USER):
-        if value["tool_id"] or value["target"] or value["payload_text"]:
-            raise ValueError("Ollama speech action contains unexpected tool fields")
-    elif kind is AgentActionKind.USE_TOOL:
-        if value["text"] or not value["tool_id"] or not value["target"]:
-            raise ValueError("Ollama tool action fields are invalid")
-    elif value["tool_id"] or value["target"] or value["payload_text"]:
-        raise ValueError("Ollama finish action contains unexpected tool fields")
+        raise ValueError(
+            f"Ollama action does not match the MOIRA action schema: {error}"
+        ) from error
 
 
 def _post_json(url: str, payload: bytes, timeout: float, maximum: int) -> dict[str, Any]:

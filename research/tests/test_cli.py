@@ -14,6 +14,9 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "research" / "configs" / "m0-smoke.toml"
+AGENT_TRAJECTORY_PATH = (
+    REPOSITORY_ROOT / "research" / "tests" / "fixtures" / "agent-trajectories.jsonl"
+)
 
 
 @pytest.fixture
@@ -387,6 +390,49 @@ def test_agent_run_ollama_rejects_unavailable_allowlisted_command(
     assert result.returncode == 2
     assert result.stdout == ""
     assert "allowlisted command is unavailable" in result.stderr
+
+
+def test_agent_action_training_and_evaluation_cli_are_checkpointed(
+    cli_root: Path,
+) -> None:
+    checkpoint = cli_root / "agent-actions.pt"
+    training = _output_json(
+        _run_cli(
+            "agent",
+            "train-actions",
+            "--path",
+            AGENT_TRAJECTORY_PATH,
+            "--checkpoint",
+            checkpoint,
+            "--steps",
+            1,
+        )
+    )
+    before_evaluation = checkpoint.read_bytes()
+    evaluation = _output_json(
+        _run_cli(
+            "agent",
+            "evaluate-actions",
+            "--path",
+            AGENT_TRAJECTORY_PATH,
+            "--checkpoint",
+            checkpoint,
+            "--max-records",
+            4,
+        )
+    )
+
+    assert training["objective"] == "moira-agent-action-json-v1"
+    assert training["model_surface"] == "agent-smoke"
+    assert training["weights_updated"] is True
+    assert training["steps"] == 1
+    assert training["samples"] == 1
+    assert evaluation["objective"] == "moira-agent-action-json-v1"
+    assert evaluation["weights_updated"] is False
+    assert evaluation["checkpoint_step"] == 1
+    assert evaluation["samples"] == 4
+    assert 0.0 <= evaluation["token_accuracy"] <= 1.0
+    assert checkpoint.read_bytes() == before_evaluation
 
 
 def test_deployment_switch_persists_policy_without_changing_weights(

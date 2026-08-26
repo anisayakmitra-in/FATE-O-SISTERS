@@ -31,6 +31,11 @@ from .checkpoint import (
 from .ablation import assert_equal_parameter_surface
 from .agent import AgentPolicy, AgentRole, MoiraAgentKernel, agent_contract
 from .agent_loop import MoiraAgentRuntime
+from .agent_train import (
+    AGENT_ACTION_OBJECTIVE,
+    evaluate_agent_jsonl,
+    train_agent_jsonl,
+)
 from .config import (
     DataConfig,
     ModelConfig,
@@ -155,6 +160,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_ollama.add_argument("--command-timeout", type=float, default=30.0)
+    train_actions = agent_commands.add_parser(
+        "train-actions",
+        help="Train the proof-scale shared decoder on canonical agent trajectories.",
+    )
+    train_actions.add_argument("--path", type=Path, required=True)
+    train_actions.add_argument("--checkpoint", type=Path, required=True)
+    train_actions.add_argument("--steps", type=int, default=1)
+    train_actions.add_argument("--batch-size", type=int, default=1)
+    train_actions.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    train_actions.add_argument("--resume", action="store_true")
+    evaluate_actions = agent_commands.add_parser(
+        "evaluate-actions",
+        help="Evaluate action loss and token accuracy without updating a checkpoint.",
+    )
+    evaluate_actions.add_argument("--path", type=Path, required=True)
+    evaluate_actions.add_argument("--checkpoint", type=Path, required=True)
+    evaluate_actions.add_argument("--batch-size", type=int, default=1)
+    evaluate_actions.add_argument("--max-records", type=int, default=128)
+    evaluate_actions.add_argument(
+        "--device", choices=("cpu", "cuda"), default="cpu"
+    )
 
     deployment = commands.add_parser(
         "deployment", help="Inspect future deployment profile contracts."
@@ -1210,6 +1236,65 @@ def _run_ollama_agent(
     }
 
 
+def _train_agent_actions(
+    path: Path,
+    checkpoint: Path,
+    *,
+    steps: int,
+    batch_size: int,
+    device: str,
+    resume: bool,
+) -> dict[str, object]:
+    result = train_agent_jsonl(
+        path,
+        steps=steps,
+        batch_size=batch_size,
+        device=device,
+        checkpoint_path=checkpoint,
+        resume=resume,
+    )
+    return {
+        "checkpoint": str(checkpoint.resolve()),
+        "final_loss": result.final_loss,
+        "model_surface": "agent-smoke",
+        "objective": AGENT_ACTION_OBJECTIVE,
+        "samples": result.samples,
+        "steps": result.steps,
+        "tokens": result.tokens,
+        "trainable_parameters": result.trainable_parameters,
+        "weights_updated": True,
+    }
+
+
+def _evaluate_agent_actions(
+    path: Path,
+    checkpoint: Path,
+    *,
+    batch_size: int,
+    max_records: int,
+    device: str,
+) -> dict[str, object]:
+    result = evaluate_agent_jsonl(
+        path,
+        checkpoint_path=checkpoint,
+        batch_size=batch_size,
+        max_records=max_records,
+        device=device,
+    )
+    return {
+        "checkpoint": str(result.checkpoint_path.resolve()),
+        "checkpoint_step": result.checkpoint_step,
+        "loss": result.loss,
+        "model_surface": "agent-smoke",
+        "objective": AGENT_ACTION_OBJECTIVE,
+        "samples": result.samples,
+        "token_accuracy": result.token_accuracy,
+        "tokens": result.tokens,
+        "trainable_parameters": result.trainable_parameters,
+        "weights_updated": False,
+    }
+
+
 def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
     if arguments.command == "agent":
         if arguments.agent_command == "inspect":
@@ -1228,6 +1313,23 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 allow_write=arguments.allow_write,
                 allowed_commands=tuple(arguments.allow_command),
                 command_timeout=arguments.command_timeout,
+            )
+        if arguments.agent_command == "train-actions":
+            return _train_agent_actions(
+                arguments.path,
+                arguments.checkpoint,
+                steps=arguments.steps,
+                batch_size=arguments.batch_size,
+                device=arguments.device,
+                resume=arguments.resume,
+            )
+        if arguments.agent_command == "evaluate-actions":
+            return _evaluate_agent_actions(
+                arguments.path,
+                arguments.checkpoint,
+                batch_size=arguments.batch_size,
+                max_records=arguments.max_records,
+                device=arguments.device,
             )
         raise ValueError("unknown agent command")
     if arguments.command == "deployment":

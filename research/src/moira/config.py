@@ -67,6 +67,22 @@ class ModelConfig:
         )
 
     @classmethod
+    def agent_smoke(cls) -> "ModelConfig":
+        """Sub-million local surface with room for canonical action trajectories."""
+        return cls(
+            vocab_size=512,
+            d_model=64,
+            n_layers=2,
+            n_heads=4,
+            ffn_dim=128,
+            thread_radius=8,
+            spool_rank=8,
+            knot_slots=8,
+            capsule_width=16,
+            max_seq_len=768,
+        )
+
+    @classmethod
     def m2_gpu(cls) -> "ModelConfig":
         """The fixed 153M M2 reference surface for bounded GPU training."""
         return cls(

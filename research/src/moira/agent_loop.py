@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from .agent import (
     AgentRole,
@@ -56,6 +56,59 @@ class AgentAction:
     @classmethod
     def finish(cls, text: str = "") -> AgentAction:
         return cls(AgentActionKind.FINISH, text=text)
+
+
+def agent_action_to_mapping(action: AgentAction) -> dict[str, str]:
+    """Return the one canonical structured-action object used for training and I/O."""
+    validate_agent_action(action)
+    try:
+        payload_text = action.payload.decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("MOIRA action payload must be UTF-8 for serialization") from error
+    return {
+        "kind": action.kind.value,
+        "text": action.text,
+        "tool_id": action.tool_id or "",
+        "target": action.target or "",
+        "payload_text": payload_text,
+    }
+
+
+def agent_action_from_mapping(value: object) -> AgentAction:
+    """Parse the exact structured-action object shared by training and inference."""
+    required = {"kind", "text", "tool_id", "target", "payload_text"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError("MOIRA action does not match the exact action schema")
+    if any(not isinstance(value[field], str) for field in required):
+        raise ValueError("MOIRA action fields must be strings")
+    try:
+        kind = AgentActionKind(value["kind"])
+    except ValueError as error:
+        raise ValueError("MOIRA action kind is invalid") from error
+    if kind in (AgentActionKind.SPEAK, AgentActionKind.ASK_USER) and (
+        value["tool_id"] or value["target"] or value["payload_text"]
+    ):
+        raise ValueError("MOIRA speech action contains unexpected tool fields")
+    if kind is AgentActionKind.USE_TOOL and (
+        value["text"] or not value["tool_id"] or not value["target"]
+    ):
+        raise ValueError("MOIRA tool action fields are invalid")
+    if kind is AgentActionKind.FINISH and (
+        value["tool_id"] or value["target"] or value["payload_text"]
+    ):
+        raise ValueError("MOIRA finish action contains unexpected tool fields")
+    if kind is AgentActionKind.SPEAK:
+        action = AgentAction.speak(value["text"])
+    elif kind is AgentActionKind.ASK_USER:
+        action = AgentAction.ask_user(value["text"])
+    elif kind is AgentActionKind.USE_TOOL:
+        action = AgentAction.use_tool(
+            value["tool_id"], value["target"], value["payload_text"].encode("utf-8")
+        )
+    else:
+        action = AgentAction.finish(value["text"])
+    validate_agent_action(action)
+    return action
 
 
 @dataclass(frozen=True)
@@ -153,7 +206,7 @@ class MoiraAgentRuntime:
                 observations=tuple(observations),
             )
             action = cognition.next_action(context)
-            _validate_action(action)
+            validate_agent_action(action)
             self._kernel.record_turn(lease_id, _action_summary(action))
 
             if action.kind is AgentActionKind.SPEAK:
@@ -236,7 +289,7 @@ class MoiraAgentRuntime:
         )
 
 
-def _validate_action(action: object) -> None:
+def validate_agent_action(action: object) -> None:
     if not isinstance(action, AgentAction) or not isinstance(
         action.kind, AgentActionKind
     ):
@@ -245,7 +298,10 @@ def _validate_action(action: object) -> None:
         raise ValueError("MOIRA action fields have invalid types")
     if "\x00" in action.text:
         raise ValueError("MOIRA action text cannot contain NUL")
-    if len(action.text.encode("utf-8")) > 1_000_000 or len(action.payload) > 16 * 1024 * 1024:
+    if (
+        len(action.text.encode("utf-8")) > 1_000_000
+        or len(action.payload) > 16 * 1024 * 1024
+    ):
         raise ValueError("MOIRA action exceeds its size budget")
     if action.kind in (AgentActionKind.SPEAK, AgentActionKind.ASK_USER):
         if not action.text.strip() or action.tool_id is not None or action.target is not None:
@@ -256,6 +312,10 @@ def _validate_action(action: object) -> None:
             or not action.tool_id
             or not isinstance(action.target, str)
             or not action.target
+            or "\x00" in action.tool_id
+            or "\x00" in action.target
+            or len(action.tool_id.encode("utf-8")) > 512
+            or len(action.target.encode("utf-8")) > 4_096
             or action.text
         ):
             raise ValueError("tool actions require a tool ID and target")
@@ -279,5 +339,8 @@ __all__ = [
     "AgentRunStatus",
     "MoiraAgentRuntime",
     "MoiraCognition",
+    "agent_action_from_mapping",
+    "agent_action_to_mapping",
+    "validate_agent_action",
 ]
 
