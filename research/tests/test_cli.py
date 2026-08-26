@@ -467,6 +467,16 @@ def test_scale_probe_cli_rejects_sequence_past_milestone_limit() -> None:
     assert "sequence_length must fit" in result.stderr
 
 
+def test_m2_inspect_reports_the_fixed_reference_surface() -> None:
+    output = _output_json(_run_cli("m2", "inspect"))
+
+    assert output["phase"] == "M2"
+    assert output["device"] == "meta"
+    assert output["trainable_parameters"] == 153_349_122
+    assert output["expected_trainable_parameters"] == 153_349_122
+    assert output["weights_downloaded"] is False
+
+
 def test_train_rejects_a_step_past_the_schedule(cli_root: Path) -> None:
     run_dir = cli_root / "past-schedule-run"
     result = _run_cli(

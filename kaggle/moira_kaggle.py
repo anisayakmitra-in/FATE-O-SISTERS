@@ -1,4 +1,4 @@
-"""Private Kaggle GPU run for the bounded MOIRA M1 and M3 checks."""
+"""Private Kaggle GPU run for the bounded MOIRA M2 resume check."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 
 REPOSITORY = "https://github.com/anisayakmitra-in/FATE-O-SISTERS.git"
 CHECKOUT = Path("/tmp/fate-o-sisters-source")
-CHECKPOINT = Path("/kaggle/working/moira-artifacts/m1-text.pt")
+CHECKPOINT = Path("/kaggle/working/moira-artifacts/m2-text.pt")
 
 
 def run(*arguments: str, cwd: Path | None = None) -> None:
@@ -29,7 +29,6 @@ run(
     "torch==2.7.1+cu126",
 )
 run(sys.executable, "-m", "pip", "install", "-e", "research", cwd=CHECKOUT)
-run(sys.executable, "-m", "pip", "install", "bitsandbytes>=0.50,<0.51")
 run(
     sys.executable,
     "-c",
@@ -54,20 +53,9 @@ def moira(*arguments: str) -> None:
     )
 
 
-moira(
-    "m1",
-    "scale-probe",
-    "--milestone",
-    "m3",
-    "--optimizer",
-    "adamw8bit",
-    "--sequence-length",
-    "64",
-)
-
 CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
 common = (
-    "m1",
+    "m2",
     "train-jsonl",
     "--catalog",
     "research/configs/m1-sources.toml",

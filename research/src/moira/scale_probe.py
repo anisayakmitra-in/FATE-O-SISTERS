@@ -30,7 +30,7 @@ class ScaleProbeResult:
 def scale_probe_config(milestone: str) -> ModelConfig:
     configs = {
         "m1": ModelConfig.m1_cpu(),
-        "m2": ModelConfig(8_192, 896, 20, 14, 2_304, 8, 32, 16, 64, 256),
+        "m2": ModelConfig.m2_gpu(),
         "m3": ModelConfig(8_192, 1_280, 32, 20, 3_840, 8, 32, 16, 64, 128),
     }
     try:

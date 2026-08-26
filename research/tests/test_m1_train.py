@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 import uuid
 
@@ -7,6 +8,11 @@ import torch
 
 from moira.config import ModelConfig
 from moira.dataset import normalize_row
+from moira.m1_checkpoint import (
+    M1_MAX_CHECKPOINT_BYTES,
+    M2_MAX_CHECKPOINT_BYTES,
+    checkpoint_byte_limit,
+)
 from moira.m1_train import (
     ByteTokenizer,
     CapabilityLoom,
@@ -177,6 +183,25 @@ def test_capability_batch_runs_through_the_model_prefix_boundary() -> None:
     )
     (loss * batch.loss_mask.reshape(-1)).sum().backward()
     assert loom.projector.projection.weight.grad is not None
+
+
+def test_checkpoint_envelope_expands_only_for_the_fixed_m2_surface() -> None:
+    m1 = MoiraModel(ModelConfig.m1_cpu())
+    with torch.device("meta"):
+        m2 = MoiraModel(ModelConfig.m2_gpu())
+        unsupported = MoiraModel(
+            ModelConfig(8_192, 640, 16, 10, 1_600, 8, 32, 16, 64, 128)
+        )
+        same_count_wrong_contract = MoiraModel(
+            replace(ModelConfig.m2_gpu(), max_seq_len=128)
+        )
+
+    assert checkpoint_byte_limit(m1) == M1_MAX_CHECKPOINT_BYTES
+    assert checkpoint_byte_limit(m2) == M2_MAX_CHECKPOINT_BYTES
+    with pytest.raises(ValueError, match="not enabled"):
+        checkpoint_byte_limit(unsupported)
+    with pytest.raises(ValueError, match="not enabled"):
+        checkpoint_byte_limit(same_count_wrong_contract)
 
 
 def test_capability_training_writes_and_resumes_a_bounded_checkpoint() -> None:

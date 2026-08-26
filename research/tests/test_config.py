@@ -1,5 +1,6 @@
 import pytest
 import moira
+import torch
 
 from moira.config import (
     DataConfig,
@@ -9,12 +10,22 @@ from moira.config import (
     RunConfig,
     TrainingConfig,
 )
+from moira.model import MoiraModel
 
 
 def test_m0_config_is_valid_and_head_aligned() -> None:
     config = ModelConfig.m0_cpu()
     assert config.d_model % config.n_heads == 0
     assert config.head_dim == config.d_model // config.n_heads
+
+
+def test_m2_config_parameter_contract() -> None:
+    config = ModelConfig.m2_gpu()
+    with torch.device("meta"):
+        model = MoiraModel(config)
+
+    assert model.parameter_ledger().total_trainable == 153_349_122
+    assert config.expected_trainable_parameters == 153_349_122
 
 
 def test_package_exposes_the_task_one_configuration_interfaces() -> None:

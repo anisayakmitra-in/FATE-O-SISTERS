@@ -101,6 +101,34 @@ small data-to-loss systems run. Long stable curves and precision comparisons
 remain M1 exit gates. The capability path below adds bounded checkpoint resume
 and held-out evaluation for vision and feature observations.
 
+M2 uses the fixed 153,349,122-parameter GPU surface. Its checkpoint contains
+FP32 model weights, FP32 AdamW state, RNG state, loss history, source manifest,
+and data cursor:
+
+```powershell
+python -m moira m2 inspect
+python -m moira m2 train-jsonl `
+  --catalog research/configs/m1-sources.toml `
+  --source zai-longcite-45k `
+  --path C:\data\longcite-slice.jsonl `
+  --steps 1 `
+  --batch-size 1 `
+  --device cuda `
+  --checkpoint C:\runs\moira-m2\text.pt
+python -m moira m2 train-jsonl `
+  --catalog research/configs/m1-sources.toml `
+  --source zai-longcite-45k `
+  --path C:\data\longcite-slice.jsonl `
+  --steps 2 `
+  --batch-size 1 `
+  --device cuda `
+  --checkpoint C:\runs\moira-m2\text.pt `
+  --resume
+```
+
+This command proves bounded training and resume. It does not satisfy the M2
+long-stream, capsule-alignment, or validation-loss exit conditions by itself.
+
 For a caller-owned capability slice, provide a CPU-readable `torch.save` tensor
 of observations alongside the normalized JSONL rows. Vision uses
 `[records, 3, height, width]`; audio, time-series, structured, and robotics
@@ -223,7 +251,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `docs/guides/free-compute.md` | Current free compute routes and their limits |
 | `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
 | `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
-| `kaggle/` | Private Kaggle M1 resume and M3 capacity-probe script |
+| `kaggle/` | Private Kaggle M2 FP32 train-save-resume script |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 
 ## Research boundary

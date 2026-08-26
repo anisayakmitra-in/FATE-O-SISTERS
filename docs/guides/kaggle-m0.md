@@ -1,4 +1,4 @@
-# Run the MOIRA M0 smoke model on Kaggle
+# Run MOIRA checkpoints on Kaggle
 
 The repository also contains a private GPU script. After installing the
 official Kaggle CLI and completing `kaggle auth login`, run:
@@ -6,13 +6,15 @@ official Kaggle CLI and completing `kaggle auth login`, run:
 ```powershell
 research\.venv-cuda\Scripts\kaggle.exe kernels push -p kaggle
 research\.venv-cuda\Scripts\kaggle.exe kernels status anisayakmitra/moira-m1-capacity-and-resume-probe
-research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m1-capacity-and-resume-probe -p research\runs\kaggle-m1
+research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m1-capacity-and-resume-probe -p research\runs\kaggle-m2
 ```
 
-The script clones the current `main`, prints the resolved commit, runs one M3
-capacity probe with an INT8 optimizer state, then trains and resumes the 33M M1
-FP32 checkpoint. It is private by default. The M3 result is a memory check, not
-a pretrained checkpoint.
+The private kernel keeps its original Kaggle slug so existing links continue to
+work. It clones the current `main`, prints the resolved commit, checks that the
+PyTorch build supports the assigned GPU, then trains and resumes the fixed
+153,349,122-parameter M2 surface. The exported checkpoint uses FP32 model
+weights and FP32 AdamW state. A two-row fixture checks persistence and cursor
+continuation; it is not a corpus-training or model-quality result.
 
 This guide runs the deterministic Phase 0 model on Kaggle CPU. The checked-in
 configuration has 24,478 trainable parameters and uses indexed synthetic data.

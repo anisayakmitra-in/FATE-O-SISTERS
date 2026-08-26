@@ -1,4 +1,4 @@
-"""Portable, bounded checkpoints for the M1 data/capability trainer.
+"""Portable, bounded checkpoints for the M1 and M2 data trainers.
 
 The existing checkpoint module is deliberately strict and Phase-0-specific.
 M1 uses a separate small contract so a capability loom can be saved alongside
@@ -21,11 +21,14 @@ import torch
 from torch import Tensor, nn
 from torch.optim import Optimizer
 
+from .config import ModelConfig
 from .model import MoiraModel
 
 
 M1_CHECKPOINT_SCHEMA_VERSION = 1
 M1_MAX_CHECKPOINT_BYTES = 1 * 1024 * 1024 * 1024
+M2_MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024 * 1024
+M2_REFERENCE_PARAMETERS = 153_349_122
 _CHECKPOINT_KEYS = frozenset(
     {
         "schema_version",
@@ -102,8 +105,8 @@ def save_m1_checkpoint(
             torch.save(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        if temporary.stat().st_size > M1_MAX_CHECKPOINT_BYTES:
-            raise ValueError("M1 checkpoint exceeds the 1 GiB artifact limit")
+        if temporary.stat().st_size > checkpoint_byte_limit(model):
+            raise ValueError("checkpoint exceeds its model-surface artifact limit")
         os.replace(temporary, destination)
         temporary = None
     finally:
@@ -122,7 +125,7 @@ def load_m1_checkpoint(
 ) -> M1LoadedCheckpoint:
     """Load and validate an M1 checkpoint, restoring model, loom, optimizer, and RNG."""
     source = Path(path)
-    _validate_source(source)
+    _validate_source(source, max_bytes=checkpoint_byte_limit(model))
     try:
         payload = torch.load(source, map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, EOFError, pickle.UnpicklingError) as error:
@@ -168,15 +171,28 @@ def _validate_destination(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _validate_source(path: Path) -> None:
+def _validate_source(path: Path, *, max_bytes: int) -> None:
     try:
         status = path.stat()
     except OSError as error:
         raise ValueError("M1 checkpoint path cannot be inspected") from error
     if not path.is_file() or path.is_symlink():
         raise ValueError("M1 checkpoint must be a regular file")
-    if status.st_size <= 0 or status.st_size > M1_MAX_CHECKPOINT_BYTES:
+    if status.st_size <= 0 or status.st_size > max_bytes:
         raise ValueError("M1 checkpoint exceeds the bounded artifact limit")
+
+
+def checkpoint_byte_limit(model: MoiraModel) -> int:
+    """Return the fail-closed artifact envelope for a supported model surface."""
+    parameters = model.parameter_ledger().total_trainable
+    if parameters <= 50_000_000:
+        return M1_MAX_CHECKPOINT_BYTES
+    if (
+        parameters == M2_REFERENCE_PARAMETERS
+        and model.config == ModelConfig.m2_gpu()
+    ):
+        return M2_MAX_CHECKPOINT_BYTES
+    raise ValueError("checkpointing is not enabled for this model surface")
 
 
 def _validate_identity(

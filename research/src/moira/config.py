@@ -66,6 +66,23 @@ class ModelConfig:
             expected_trainable_parameters=33_032_562,
         )
 
+    @classmethod
+    def m2_gpu(cls) -> "ModelConfig":
+        """The fixed 153M M2 reference surface for bounded GPU training."""
+        return cls(
+            vocab_size=8_192,
+            d_model=896,
+            n_layers=20,
+            n_heads=14,
+            ffn_dim=2_304,
+            thread_radius=8,
+            spool_rank=32,
+            knot_slots=16,
+            capsule_width=64,
+            max_seq_len=256,
+            expected_trainable_parameters=153_349_122,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:

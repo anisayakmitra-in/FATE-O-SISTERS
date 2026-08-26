@@ -248,6 +248,11 @@ Training data requires source, license or consent class, content hash, preproces
 | M4 | About 1B | Scaling estimate, distributed recovery, full evaluation |
 | M5 | Exact 3B | First canonical root |
 
+The current M2 evidence covers one local CUDA data step and the checkpoint
+contract. M2 remains open until a licensed long stream produces a stable
+held-out loss curve and passes provenance, capsule-alignment, and quantization
+checks.
+
 The canonical capacity sequence begins `3B -> 9B -> 27B -> 81B -> 243B` and
 continues by hardware-supported expansion; there is no architectural upper
 bound. Every added block or expert requires training and held-out promotion.

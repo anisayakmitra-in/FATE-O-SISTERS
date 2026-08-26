@@ -234,6 +234,25 @@ def _build_parser() -> argparse.ArgumentParser:
     m1_evaluate.add_argument("--patch-size", default=16, type=int)
     m1_evaluate.add_argument("--scope-id", default="local")
 
+    m2 = commands.add_parser(
+        "m2", help="Train or inspect the fixed 153M MOIRA M2 reference surface."
+    )
+    m2_commands = m2.add_subparsers(dest="m2_command", required=True)
+    m2_commands.add_parser(
+        "inspect", help="Count the M2 reference parameters without allocating weights."
+    )
+    m2_train = m2_commands.add_parser(
+        "train-jsonl", help="Run bounded resumable M2 training on local text/code JSONL."
+    )
+    m2_train.add_argument("--catalog", required=True, type=Path)
+    m2_train.add_argument("--source", required=True)
+    m2_train.add_argument("--path", required=True, type=Path)
+    m2_train.add_argument("--steps", default=1, type=int)
+    m2_train.add_argument("--batch-size", default=1, type=int)
+    m2_train.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    m2_train.add_argument("--checkpoint", type=Path)
+    m2_train.add_argument("--resume", action="store_true")
+
     dataset = commands.add_parser(
         "dataset", help="Validate manifest-first local dataset metadata and samples."
     )
@@ -505,6 +524,9 @@ def _m1_train(
     device: str,
     checkpoint_path: Path | None,
     resume: bool,
+    *,
+    model_config: ModelConfig | None = None,
+    phase: str = "M1",
 ) -> dict[str, object]:
     result = train_m1_jsonl(
         catalog_path,
@@ -515,6 +537,7 @@ def _m1_train(
         device=device,
         checkpoint_path=checkpoint_path,
         resume=resume,
+        model_config=model_config,
     )
     return {
         "checkpoint": (
@@ -524,13 +547,34 @@ def _m1_train(
         ),
         "device": device,
         "final_loss": result.final_loss,
-        "phase": "M1",
+        "phase": phase,
         "samples": result.samples,
         "steps": result.steps,
         "tokens": result.tokens,
         "trainable_parameters": result.trainable_parameters,
         "checkpoint_written": result.checkpoint_path is not None,
         "losses": list(result.losses),
+    }
+
+
+def _m2_inspect() -> dict[str, object]:
+    config = ModelConfig.m2_gpu()
+    with torch.device("meta"):
+        model = MoiraModel(config)
+    count = model.parameter_ledger().total_trainable
+    if count != config.expected_trainable_parameters:
+        raise ValueError("M2 reference parameter count does not match its contract")
+    assert_equal_parameter_surface(model)
+    return {
+        "ablation_parameter_surface": "equal",
+        "device": "meta",
+        "expected_trainable_parameters": config.expected_trainable_parameters,
+        "max_trainable_parameters": 200_000_000,
+        "min_trainable_parameters": 100_000_000,
+        "model": "MOIRA",
+        "phase": "M2",
+        "trainable_parameters": count,
+        "weights_downloaded": False,
     }
 
 
@@ -1088,6 +1132,23 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 arguments.scope_id,
             )
         raise ValueError("unknown M1 command")
+    if arguments.command == "m2":
+        if arguments.m2_command == "inspect":
+            return _m2_inspect()
+        if arguments.m2_command == "train-jsonl":
+            return _m1_train(
+                arguments.catalog,
+                arguments.source,
+                arguments.path,
+                arguments.steps,
+                arguments.batch_size,
+                arguments.device,
+                arguments.checkpoint,
+                arguments.resume,
+                model_config=ModelConfig.m2_gpu(),
+                phase="M2",
+            )
+        raise ValueError("unknown M2 command")
     if arguments.command == "dataset":
         if arguments.dataset_command == "validate":
             return _dataset_validate(arguments.catalog)

@@ -25,6 +25,7 @@ from .dataset import DatasetExample, SourceCatalog, iter_jsonl_examples
 from .loom import CapsuleProjector, FeatureCapsuleEncoder, VisionPatchEncoder
 from .m1_checkpoint import (
     M1LoadedCheckpoint,
+    checkpoint_byte_limit,
     load_m1_checkpoint,
     save_m1_checkpoint,
 )
@@ -415,12 +416,14 @@ def train_m1_jsonl(
     resume: bool = False,
     model_config: ModelConfig | None = None,
 ) -> M1TrainingResult:
-    """Run bounded, optionally resumable M1 causal training on local JSONL."""
+    """Run bounded, optionally resumable causal training on local JSONL."""
     _validate_m1_limits(steps=steps, batch_size=batch_size, device=device)
     if resume and checkpoint_path is None:
         raise ValueError("resume requires checkpoint_path")
     config = model_config or ModelConfig.m1_cpu()
     model = MoiraModel(config).to(device=device, dtype=torch.float32)
+    if checkpoint_path is not None:
+        checkpoint_byte_limit(model)
     optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False)
     examples = tuple(
         iter_cataloged_text_examples(
@@ -431,7 +434,7 @@ def train_m1_jsonl(
         )
     )
     if len(examples) < steps * batch_size:
-        raise ValueError("JSONL source ended before the requested M1 steps")
+        raise ValueError("JSONL source ended before the requested training steps")
     tokenizer = ByteTokenizer()
     manifest = {
         "model_config": asdict(config),
@@ -483,7 +486,7 @@ def train_m1_jsonl(
         )
         loss = _masked_loss(output.logits, targets, loss_mask)
         if not bool(torch.isfinite(loss)):
-            raise ValueError("M1 training loss became non-finite")
+            raise ValueError("causal training loss became non-finite")
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
         optimizer.step()
@@ -787,11 +790,11 @@ def evaluate_m1_capabilities(
 
 def _validate_m1_limits(*, steps: int, batch_size: int, device: str) -> None:
     if type(steps) is not int or not 0 < steps <= M1_MAX_STEPS:
-        raise ValueError("steps must be between 1 and the M1 step limit")
+        raise ValueError("steps must be between 1 and the bounded step limit")
     if type(batch_size) is not int or not 0 < batch_size <= M1_MAX_BATCH_SIZE:
-        raise ValueError("batch_size exceeds the M1 in-memory limit")
+        raise ValueError("batch_size exceeds the bounded in-memory limit")
     if device not in {"cpu", "cuda"}:
-        raise ValueError("M1 device must be cpu or cuda")
+        raise ValueError("training device must be cpu or cuda")
     if device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA is not available")
 
