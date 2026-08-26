@@ -13,7 +13,11 @@ from .ledger import (
     ParameterSubsystem,
     build_parameter_ledger,
 )
-from .masks import CognitiveMode, build_visibility_mask
+from .masks import (
+    CognitiveMode,
+    build_local_visibility_mask,
+    validate_visibility_inputs,
+)
 from .pulse import Pulse, PulseState
 
 
@@ -69,19 +73,48 @@ class ThreadLocalAttention(nn.Module):
                 "visibility must be bool [batch, sequence, sequence] on hidden.device"
             )
 
+        key_indices, in_bounds = _local_window_indices(
+            length, self.radius, hidden.device
+        )
+        local_visibility = visibility.gather(
+            dim=2,
+            index=key_indices.unsqueeze(0).expand(batch, -1, -1),
+        ) & in_bounds.unsqueeze(0)
+        return self._forward_local(hidden, local_visibility)
+
+    def forward_local(self, hidden: Tensor, visibility: Tensor) -> Tensor:
+        """Run Thread from pre-windowed visibility without a full ``L × L`` mask."""
+        batch, length = _validate_hidden("hidden", hidden, self.d_model, self)
+        window_width = 2 * self.radius + 1
+        if (
+            not isinstance(visibility, Tensor)
+            or visibility.dtype is not torch.bool
+            or visibility.shape != (batch, length, window_width)
+            or visibility.device != hidden.device
+        ):
+            raise ValueError(
+                "visibility must be bool [batch, sequence, local_window] "
+                "on hidden.device"
+            )
+        _, in_bounds = _local_window_indices(length, self.radius, hidden.device)
+        return self._forward_local(hidden, visibility & in_bounds.unsqueeze(0))
+
+    def _forward_local(self, hidden: Tensor, visibility: Tensor) -> Tensor:
+        batch, length, _ = hidden.shape
+
         queries = self._split_heads(self.query_projection(hidden))
         keys = self._split_heads(self.key_projection(hidden))
         values = self._split_heads(self.value_projection(hidden))
         queries = _apply_rope(queries)
         keys = _apply_rope(keys)
-        scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(
+        key_indices, _ = _local_window_indices(length, self.radius, hidden.device)
+        local_keys = keys[:, :, key_indices]
+        local_values = values[:, :, key_indices]
+        scores = torch.einsum("bhld,bhlwd->bhlw", queries, local_keys) / math.sqrt(
             self.head_dim
         )
-        positions = torch.arange(length, device=hidden.device)
-        local = (positions[:, None] - positions[None, :]).abs() <= self.radius
-        allowed = visibility[:, None] & local[None, None]
-        weights = _safe_masked_softmax(scores, allowed)
-        attended = torch.matmul(weights, values)
+        weights = _safe_masked_softmax(scores, visibility[:, None])
+        attended = torch.einsum("bhlw,bhlwd->bhld", weights, local_values)
         combined = attended.transpose(1, 2).reshape(batch, length, self.d_model)
         return self.output_projection(combined)
 
@@ -296,7 +329,7 @@ class TSKBlock(nn.Module):
     def forward(
         self,
         hidden: Tensor,
-        visibility: Tensor,
+        thread_visibility: Tensor,
         valid_tokens: Tensor,
         *,
         mode: CognitiveMode,
@@ -305,7 +338,9 @@ class TSKBlock(nn.Module):
         ablate: frozenset[str] = frozenset(),
     ) -> tuple[Tensor, SpoolState]:
         if "thread" not in ablate:
-            thread_output = self.thread(self.thread_norm(hidden), visibility)
+            thread_output = self.thread.forward_local(
+                self.thread_norm(hidden), thread_visibility
+            )
             hidden = hidden + self.residual_dropout(thread_output)
         if "spool" not in ablate:
             spool_output, next_state = self.spool(
@@ -359,7 +394,7 @@ class TSKBlock(nn.Module):
             )
         if bool(torch.any(~valid_tokens[:, :-1] & valid_tokens[:, 1:])):
             raise ValueError("valid_tokens must be right-padded")
-        build_visibility_mask(mode, valid_tokens, source_lengths)
+        validate_visibility_inputs(mode, valid_tokens, source_lengths)
 
         capacity = min(self.knot_slots, length)
         landmarks = hidden.new_zeros((batch, capacity, hidden.shape[-1]))
@@ -642,8 +677,11 @@ class MoiraModel(nn.Module):
             and source_lengths is not None
         ):
             raise ValueError("source_lengths is only valid for Lachesis")
-        visibility = build_visibility_mask(
-            visibility_mode, valid_tokens, source_lengths
+        thread_visibility = build_local_visibility_mask(
+            visibility_mode,
+            valid_tokens,
+            self.config.thread_radius,
+            source_lengths,
         )
 
         if state is None:
@@ -670,7 +708,7 @@ class MoiraModel(nn.Module):
         for block, spool_state in zip(self.blocks, spool_states):
             hidden, next_spool = block(
                 hidden,
-                visibility,
+                thread_visibility,
                 valid_tokens,
                 mode=visibility_mode,
                 source_lengths=source_lengths,
@@ -804,6 +842,19 @@ def _landmark_spans(
     target_count = landmark_count - source_count
     return uniform(0, source_length, source_count) + uniform(
         source_length, valid_length, target_count
+    )
+
+
+def _local_window_indices(
+    length: int, radius: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """Return clamped local-key indices and a mask for the in-range slots."""
+    positions = torch.arange(length, device=device).view(length, 1)
+    offsets = torch.arange(-radius, radius + 1, device=device).view(1, -1)
+    keys = positions + offsets
+    return (
+        keys.clamp(0, max(length - 1, 0)),
+        (keys >= 0) & (keys < length),
     )
 
 

@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from moira.masks import CognitiveMode, build_visibility_mask
+from moira.masks import (
+    CognitiveMode,
+    build_local_visibility_mask,
+    build_visibility_mask,
+)
 
 
 @pytest.mark.parametrize(
@@ -151,3 +155,47 @@ def test_lachesis_rejects_non_right_padded_valid_tokens() -> None:
 
     with pytest.raises(ValueError, match="right-padded"):
         build_visibility_mask(CognitiveMode.LACHESIS, valid_tokens, source_lengths)
+
+
+@pytest.mark.parametrize("radius", [0, 1, 3])
+@pytest.mark.parametrize(
+    ("mode", "source_lengths"),
+    [
+        (CognitiveMode.CLOTHO, None),
+        (CognitiveMode.LACHESIS, torch.tensor([2, 1], dtype=torch.int64)),
+        (CognitiveMode.ATROPOS, None),
+    ],
+)
+def test_compact_local_mask_matches_the_full_orientation_mask(
+    mode: CognitiveMode,
+    source_lengths: torch.Tensor | None,
+    radius: int,
+) -> None:
+    """Catches a local window changing an orientation or exposing a padded edge."""
+    valid_tokens = torch.tensor(
+        [[True, True, True, True, False], [True, True, False, False, False]]
+    )
+    full = build_visibility_mask(mode, valid_tokens, source_lengths)
+    local = build_local_visibility_mask(mode, valid_tokens, radius, source_lengths)
+    length = valid_tokens.shape[1]
+    query = torch.arange(length).view(length, 1)
+    key = query + torch.arange(-radius, radius + 1).view(1, -1)
+    in_bounds = (key >= 0) & (key < length)
+    expected = full.gather(
+        2,
+        key.clamp(0, length - 1).unsqueeze(0).expand(valid_tokens.shape[0], -1, -1),
+    ) & in_bounds.unsqueeze(0)
+
+    assert local.shape == (valid_tokens.shape[0], length, 2 * radius + 1)
+    assert torch.equal(local, expected)
+
+
+@pytest.mark.parametrize("radius", [-1, True, 1.5])
+def test_compact_local_mask_rejects_an_invalid_radius(radius: object) -> None:
+    """Catches variable-width or negative windows escaping the kernel contract."""
+    with pytest.raises(ValueError, match="radius"):
+        build_local_visibility_mask(
+            CognitiveMode.CLOTHO,
+            torch.ones((1, 2), dtype=torch.bool),
+            radius,  # type: ignore[arg-type]
+        )

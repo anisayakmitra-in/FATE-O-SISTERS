@@ -13,6 +13,7 @@ moira = "moira.__main__:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+dspy-gepa = ["dspy>=3.1,<4"]
 training = [
     "accelerate>=1.14,<2",
     "datasets>=5,<6",

@@ -1,3 +1,5 @@
+import copy
+import math
 from dataclasses import replace
 
 import pytest
@@ -15,6 +17,8 @@ from moira.model import (
     SpoolState,
     TSKBlock,
     ThreadLocalAttention,
+    _apply_rope,
+    _safe_masked_softmax,
 )
 
 
@@ -35,6 +39,36 @@ def _tiny_config(
         dropout=dropout,
         tie_embeddings=tie_embeddings,
     )
+
+
+def _full_thread_reference(
+    layer: ThreadLocalAttention, hidden: torch.Tensor, visibility: torch.Tensor
+) -> torch.Tensor:
+    """The original full-score formulation, retained only as a kernel oracle."""
+    batch, length, _ = hidden.shape
+    queries = _apply_rope(layer._split_heads(layer.query_projection(hidden)))
+    keys = _apply_rope(layer._split_heads(layer.key_projection(hidden)))
+    values = layer._split_heads(layer.value_projection(hidden))
+    scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(layer.head_dim)
+    positions = torch.arange(length, device=hidden.device)
+    local = (positions[:, None] - positions[None, :]).abs() <= layer.radius
+    weights = _safe_masked_softmax(scores, visibility[:, None] & local[None, None])
+    attended = torch.matmul(weights, values)
+    combined = attended.transpose(1, 2).reshape(batch, length, layer.d_model)
+    return layer.output_projection(combined)
+
+
+def _local_visibility_from_full(visibility: torch.Tensor, radius: int) -> torch.Tensor:
+    """Extract the fixed-width local slice used by Thread's compact entry point."""
+    batch, length, _ = visibility.shape
+    query = torch.arange(length, device=visibility.device).view(length, 1)
+    key = query + torch.arange(-radius, radius + 1, device=visibility.device).view(
+        1, -1
+    )
+    in_bounds = (key >= 0) & (key < length)
+    return visibility.gather(
+        2, key.clamp(0, length - 1).unsqueeze(0).expand(batch, -1, -1)
+    ) & in_bounds.unsqueeze(0)
 
 
 def test_selected_orientation_can_use_causal_source_visibility() -> None:
@@ -113,6 +147,60 @@ def test_thread_overflow_cannot_select_a_blocked_future_value() -> None:
 
     assert torch.isfinite(output).all()
     assert torch.equal(output[:, 0], torch.zeros_like(output[:, 0]))
+
+
+def test_windowed_thread_kernel_matches_full_reference_outputs_and_gradients() -> None:
+    """Catches a compact kernel changing Thread's old full-score semantics."""
+    torch.manual_seed(41)
+    compact = ThreadLocalAttention(d_model=8, n_heads=2, radius=2)
+    reference = copy.deepcopy(compact)
+    full_visibility = torch.rand((2, 7, 7)) > 0.35
+    full_visibility[:, 4] = False
+    compact_hidden = torch.randn(2, 7, 8, requires_grad=True)
+    reference_hidden = compact_hidden.detach().clone().requires_grad_(True)
+    local_visibility = _local_visibility_from_full(full_visibility, compact.radius)
+
+    actual = compact.forward_local(compact_hidden, local_visibility)
+    expected = _full_thread_reference(reference, reference_hidden, full_visibility)
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    actual.square().mean().backward()
+    expected.square().mean().backward()
+    torch.testing.assert_close(
+        compact_hidden.grad, reference_hidden.grad, atol=1e-6, rtol=1e-5
+    )
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in compact.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad,
+            reference_parameters[name].grad,
+            atol=1e-6,
+            rtol=1e-5,
+        )
+
+    with torch.no_grad():
+        public_output = compact(compact_hidden.detach(), full_visibility)
+    torch.testing.assert_close(public_output, expected.detach(), atol=1e-6, rtol=1e-5)
+
+
+def test_model_builds_one_compact_thread_mask_per_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches reintroducing a quadratic model-level Thread visibility allocation."""
+    import moira.model as model_module
+
+    recorded_shapes: list[tuple[int, ...]] = []
+    original = model_module.build_local_visibility_mask
+
+    def record_local_mask(*args: object, **kwargs: object) -> torch.Tensor:
+        result = original(*args, **kwargs)
+        recorded_shapes.append(tuple(result.shape))
+        return result
+
+    monkeypatch.setattr(model_module, "build_local_visibility_mask", record_local_mask)
+    model = MoiraModel(_tiny_config()).eval()
+
+    model(torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]), mode=CognitiveMode.ATROPOS)
+
+    assert recorded_shapes == [(1, 8, 3)]
 
 
 def test_spool_full_sequence_matches_chunked_execution() -> None:
