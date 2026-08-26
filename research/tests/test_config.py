@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 import moira
 import torch
@@ -49,6 +51,14 @@ def test_config_rejects_misaligned_heads() -> None:
             knot_slots=2,
             capsule_width=8,
             max_seq_len=16,
+        )
+
+
+def test_config_rejects_an_unknown_causal_knot_policy() -> None:
+    with pytest.raises(ValueError, match="causal_knot_policy"):
+        replace(
+            ModelConfig.m0_cpu(),
+            causal_knot_policy="dynamic-final-length-v1",
         )
 
 

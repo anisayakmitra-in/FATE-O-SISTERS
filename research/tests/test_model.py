@@ -339,6 +339,8 @@ def test_sequence_landmarks_are_contiguous_means_with_mode_correct_visibility() 
         thread_radius=1,
         spool_rank=2,
         knot_slots=2,
+        causal_knot_width=3,
+        causal_knot_max_tokens=6,
     )
     hidden = torch.tensor(
         [
@@ -367,17 +369,17 @@ def test_sequence_landmarks_are_contiguous_means_with_mode_correct_visibility() 
         landmarks,
         torch.tensor(
             [
-                [[1.5] * 4, [4.0] * 4],
-                [[10.0] * 4, [20.0] * 4],
+                [[2.0] * 4, [0.0] * 4],
+                [[0.0] * 4, [0.0] * 4],
             ]
         ),
     )
     assert torch.equal(type_ids, torch.zeros((2, 2), dtype=torch.int64))
-    assert torch.equal(end_positions, torch.tensor([[1, 4], [0, 1]]))
+    assert torch.equal(end_positions, torch.tensor([[2, -1], [-1, -1]]))
     assert torch.equal(
         atropos[0],
         torch.tensor(
-            [[0, 0], [1, 0], [1, 0], [1, 0], [1, 1]], dtype=torch.bool
+            [[0, 0], [0, 0], [1, 0], [1, 0], [1, 0]], dtype=torch.bool
         ),
     )
     assert torch.equal(
@@ -402,6 +404,8 @@ def test_lachesis_landmarks_never_pool_across_the_source_boundary() -> None:
         thread_radius=1,
         spool_rank=2,
         knot_slots=3,
+        causal_knot_width=2,
+        causal_knot_max_tokens=6,
     )
     hidden = torch.tensor([[[float(value)] * 4 for value in range(1, 6)]])
     valid = torch.ones((1, 5), dtype=torch.bool)
@@ -441,6 +445,8 @@ def test_lachesis_single_landmark_preserves_source_without_crossing_boundary() -
         thread_radius=1,
         spool_rank=2,
         knot_slots=1,
+        causal_knot_width=4,
+        causal_knot_max_tokens=4,
     )
     hidden = torch.tensor([[[float(value)] * 4 for value in range(1, 5)]])
 
@@ -478,6 +484,8 @@ def test_lachesis_empty_or_full_source_keeps_the_unsplit_layout(
         thread_radius=1,
         spool_rank=2,
         knot_slots=2,
+        causal_knot_width=2,
+        causal_knot_max_tokens=4,
     )
     hidden = torch.tensor([[[float(value)] * 4 for value in range(1, 5)]])
 
@@ -506,6 +514,19 @@ def test_atropos_future_token_cannot_change_prior_logits() -> None:
     b = model(right, mode=CognitiveMode.ATROPOS).logits
 
     assert torch.allclose(a[:, :4], b[:, :4], atol=1e-6)
+
+
+def test_atropos_extension_preserves_the_complete_prefix_logits() -> None:
+    """Catches final-length-dependent Knot landmarks breaking causal decoding."""
+    torch.manual_seed(17)
+    model = MoiraModel(_tiny_config()).eval()
+    prefix = torch.tensor([[1, 2, 3, 4]])
+    extended = torch.tensor([[1, 2, 3, 4, 5, 6]])
+
+    prefix_logits = model(prefix, mode=CognitiveMode.ATROPOS).logits
+    extended_logits = model(extended, mode=CognitiveMode.ATROPOS).logits[:, :4]
+
+    torch.testing.assert_close(prefix_logits, extended_logits, atol=1e-6, rtol=1e-5)
 
 
 def test_lachesis_future_target_cannot_change_source_or_prior_target_logits() -> None:
@@ -571,7 +592,7 @@ def test_every_trainable_parameter_receives_a_finite_gradient() -> None:
     """Catches any counted parameter disconnected from the representative objective."""
     torch.manual_seed(23)
     model = MoiraModel(_tiny_config())
-    tokens = torch.tensor([[1, 2, 3, 4]])
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
     with torch.no_grad():
         warm = model(tokens, mode=CognitiveMode.ATROPOS).state
     incoming = MoiraState(

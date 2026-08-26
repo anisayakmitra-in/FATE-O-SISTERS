@@ -11,6 +11,7 @@ spool_rank = 8
 knot_slots = 4
 capsule_width = 16
 max_seq_len = 32
+causal_knot_policy = "fixed-complete-chunks-v1"
 dropout = 0.1
 tie_embeddings = true
 expected_trainable_parameters = 24478

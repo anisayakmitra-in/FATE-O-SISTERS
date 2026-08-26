@@ -15,6 +15,7 @@ class ModelConfig:
     knot_slots: int
     capsule_width: int
     max_seq_len: int
+    causal_knot_policy: str = "fixed-complete-chunks-v1"
     dropout: float = 0.0
     tie_embeddings: bool = True
     expected_trainable_parameters: int | None = None
@@ -38,12 +39,19 @@ class ModelConfig:
             raise ValueError("d_model must be divisible by n_heads")
         if self.ffn_dim < self.d_model:
             raise ValueError("ffn_dim must be at least d_model")
+        if self.causal_knot_policy != "fixed-complete-chunks-v1":
+            raise ValueError("unsupported causal_knot_policy")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
 
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
+
+    @property
+    def causal_knot_width(self) -> int:
+        """Fixed Atropos chunk width that fits the configured Knot capacity."""
+        return (self.max_seq_len + self.knot_slots - 1) // self.knot_slots
 
     @classmethod
     def m0_cpu(cls) -> "ModelConfig":

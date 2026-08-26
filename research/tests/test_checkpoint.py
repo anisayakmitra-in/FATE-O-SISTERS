@@ -285,6 +285,7 @@ def _manifests() -> dict[str, dict[str, object]]:
             "knot_slots": config.knot_slots,
             "capsule_width": config.capsule_width,
             "max_seq_len": config.max_seq_len,
+            "causal_knot_policy": config.causal_knot_policy,
             "dropout": config.dropout,
             "tie_embeddings": config.tie_embeddings,
             "expected_trainable_parameters": config.expected_trainable_parameters,
@@ -2860,6 +2861,7 @@ def test_checkpoint_rejects_current_runtime_drift_before_state_mutation(
     ("section", "field", "value"),
     (
         ("model", "n_layers", True),
+        ("model", "causal_knot_policy", True),
         ("optimization", "clip_grad_norm", True),
     ),
 )
@@ -2879,6 +2881,27 @@ def test_standalone_verify_requires_exact_model_and_optimization_scalar_types(
     )
 
     with pytest.raises(ValueError, match="model|optimization|config|manifest|scalar"):
+        verify_checkpoint(
+            record.checkpoint_path,
+            expected_manifests=payload["semantic_manifests"],
+        )
+
+
+def test_standalone_verify_requires_the_causal_knot_policy_manifest_field(
+    run_dir: Path,
+) -> None:
+    record = _save(run_dir)
+    _rewrite_semantic_evidence(
+        record,
+        lambda payload: payload["semantic_manifests"]["model"].pop(
+            "causal_knot_policy"
+        ),
+    )
+    payload = torch.load(
+        record.checkpoint_path, map_location="cpu", weights_only=True
+    )
+
+    with pytest.raises(ValueError, match="model|manifest|scalar"):
         verify_checkpoint(
             record.checkpoint_path,
             expected_manifests=payload["semantic_manifests"],

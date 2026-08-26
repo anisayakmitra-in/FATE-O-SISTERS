@@ -1262,6 +1262,7 @@ def _phase0_configs(
         any(type(model_manifest.get(name)) is not int for name in model_integer_fields)
         or type(model_manifest.get("dropout")) is not float
         or type(model_manifest.get("tie_embeddings")) is not bool
+        or model_manifest.get("causal_knot_policy") != "fixed-complete-chunks-v1"
         or model_manifest.get("expected_trainable_parameters") is not None
         and type(model_manifest["expected_trainable_parameters"]) is not int
         or any(

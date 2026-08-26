@@ -307,13 +307,28 @@ class TSKBlock(nn.Module):
         thread_radius: int,
         spool_rank: int,
         knot_slots: int,
+        causal_knot_width: int,
+        causal_knot_max_tokens: int,
         num_landmark_types: int = 8,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        if (
+            type(causal_knot_width) is not int
+            or causal_knot_width <= 0
+            or type(causal_knot_max_tokens) is not int
+            or causal_knot_max_tokens <= 0
+            or causal_knot_width > causal_knot_max_tokens
+            or (causal_knot_max_tokens + causal_knot_width - 1)
+            // causal_knot_width
+            > knot_slots
+        ):
+            raise ValueError("causal Knot chunks must fit the configured slot capacity")
         self.knot_slots = knot_slots
+        self.causal_knot_width = causal_knot_width
+        self.causal_knot_max_tokens = causal_knot_max_tokens
         self.residual_dropout = nn.Dropout(dropout)
         self.thread_norm = nn.LayerNorm(d_model)
         self.thread = ThreadLocalAttention(d_model, n_heads, thread_radius)
@@ -396,6 +411,9 @@ class TSKBlock(nn.Module):
             raise ValueError("valid_tokens must be right-padded")
         validate_visibility_inputs(mode, valid_tokens, source_lengths)
 
+        if mode is CognitiveMode.ATROPOS:
+            return self._causal_sequence_landmarks(hidden, valid_tokens)
+
         capacity = min(self.knot_slots, length)
         landmarks = hidden.new_zeros((batch, capacity, hidden.shape[-1]))
         end_positions = torch.full(
@@ -450,6 +468,56 @@ class TSKBlock(nn.Module):
             )
         return landmarks, type_ids, end_positions, landmark_visibility
 
+    def _causal_sequence_landmarks(
+        self, hidden: Tensor, valid_tokens: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Use fixed complete chunks so an Atropos prefix never gets repartitioned.
+
+        A chunk is admitted only after all of its configured positions are
+        present. Its end boundary is therefore independent of the caller's
+        current sequence length, and a later token cannot change an earlier
+        query's visible Knot keys.
+        """
+        batch, length = _validate_hidden(
+            "hidden", hidden, self.knot.d_model, self
+        )
+        if length > self.causal_knot_max_tokens:
+            raise ValueError("causal Knot input exceeds its configured context")
+
+        landmarks = hidden.new_zeros((batch, self.knot_slots, hidden.shape[-1]))
+        end_positions = torch.full(
+            (batch, self.knot_slots), -1, dtype=torch.int64, device=hidden.device
+        )
+        valid_lengths = valid_tokens.sum(dim=1)
+        for batch_index in range(batch):
+            valid_length = int(valid_lengths[batch_index].item())
+            for landmark_index in range(self.knot_slots):
+                start = landmark_index * self.causal_knot_width
+                if start >= self.causal_knot_max_tokens:
+                    break
+                end = min(
+                    start + self.causal_knot_width,
+                    self.causal_knot_max_tokens,
+                )
+                if end > valid_length:
+                    break
+                landmarks[batch_index, landmark_index] = hidden[
+                    batch_index, start:end
+                ].mean(dim=0)
+                end_positions[batch_index, landmark_index] = end - 1
+
+        type_ids = torch.zeros(
+            (batch, self.knot_slots), dtype=torch.int64, device=hidden.device
+        )
+        landmark_valid = end_positions >= 0
+        query_positions = torch.arange(length, device=hidden.device).view(1, length, 1)
+        landmark_visibility = (
+            valid_tokens[:, :, None]
+            & landmark_valid[:, None, :]
+            & (end_positions[:, None, :] <= query_positions)
+        )
+        return landmarks, type_ids, end_positions, landmark_visibility
+
 
 class MoiraModel(nn.Module):
     """Small CPU-first MOIRA reference with explicit recurrent and affect state."""
@@ -469,6 +537,8 @@ class MoiraModel(nn.Module):
                     thread_radius=config.thread_radius,
                     spool_rank=config.spool_rank,
                     knot_slots=config.knot_slots,
+                    causal_knot_width=config.causal_knot_width,
+                    causal_knot_max_tokens=config.max_seq_len,
                     dropout=config.dropout,
                 )
                 for _ in range(config.n_layers)
