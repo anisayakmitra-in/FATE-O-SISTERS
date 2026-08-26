@@ -11,7 +11,7 @@ MOIRA v0 defines an experimental sequence model, its multimodal boundary, its le
 
 The current repository does not contain a trained model. Its Rust binary is a sketch: the forward pass returns zero logits, the entropy threshold is hard-coded, and the memory worker does not persist trajectories. Phase 0 keeps that code available for comparison while the executable research model is built beside it.
 
-Claims require measurements. Reusing a weight tensor nine times increases parameter applications; it does not create nine times as many physical parameters. Copying a 3B field three times creates 9B logical parameter positions at birth; it does not add learned capability until the children train and diverge.
+Claims require measurements. Reusing a weight tensor nine times increases parameter applications; it does not create nine times as many physical parameters. Copying a 3B field three times creates 9B logical parameter positions at birth; it does not add learned capability until the children train and diverge. The elastic field therefore treats capacity growth, logical bit precision, and arithmetic dtype as separate manifest axes.
 
 ## 2. One model and three cognitive orientations
 
@@ -248,7 +248,10 @@ Training data requires source, license or consent class, content hash, preproces
 | M4 | About 1B | Scaling estimate, distributed recovery, full evaluation |
 | M5 | Exact 3B | First canonical root |
 
-Smaller milestones are research models. They never enter the canonical `3B -> 9B -> 27B` lineage.
+The canonical capacity sequence begins `3B -> 6B -> 9B -> 27B -> 81B` and
+continues by hardware-supported expansion; there is no architectural upper
+bound. Every added block or expert requires training and held-out promotion.
+The research-sized M1 model does not claim to be any tier in that lineage.
 
 Promotion requires architecture, learning, capability, governance, and systems gates. A quality gain does not excuse a causal leak, privacy failure, broken checkpoint, or false parameter claim.
 
@@ -285,6 +288,10 @@ train_m1_capabilities(...) -> M1TrainingResult
 evaluate_m1_capabilities(...) -> M1EvaluationResult
 save_m1_checkpoint(...) -> Path
 load_m1_checkpoint(...) -> M1LoadedCheckpoint
+build_growth_plan(...) -> GrowthPlan
+build_elastic_plan(...) -> ElasticPlan
+quantize_tensor(...) -> QuantizedTensor
+materialize_bit_precision(...) -> Tensor | QuantizedTensor
 ```
 
 The reference package lives under `research/src/moira`. CPU tests use tiny dimensions and deterministic seeds. A synthetic next-token task provides the first smoke-training command. Kaggle uses the same command and writes resumable checkpoints containing model, optimizer, scheduler, random-number-generator, data-cursor, configuration, and manifest state.
@@ -300,11 +307,59 @@ and Knot leave-one-out ablations keep the same parameter count. The held-out
 capability evaluator loads that manifest and reports token-weighted and
 per-batch losses without updating the model or loom.
 
+## 13. Precision-lattice capacity architecture
+
+MOIRA uses one field with two independent elastic axes:
+
+```text
+capacity: 3B -> 6B -> 9B -> 27B -> 81B -> 243B -> ...
+logical bits: int3 -> int6 -> int9 -> int27 -> int81 -> int243 -> ...
+arithmetic: bf16/fp32/fp64 selected by the hardware and operation
+```
+
+`int3`, `int6`, `int9`, `int27`, and `int81` are logical bitplane budgets,
+not assumptions that a GPU has native 3-, 6-, 9-, 27-, or 81-bit multiply
+instructions. A runtime stores packed bitplanes and unpacks them into the
+available arithmetic dtype. The checked-in prototype can pack bounded tensors;
+distributed kernels are required before using it for a large field.
+
+Low-bit training uses a high-precision master or residual state when later
+promotion is required:
+
+```text
+master/residual state -> logical int3 view -> forward/backward -> update master
+```
+
+If only the `int3` artifact survives, materializing `int81` increases the
+container size but cannot recover discarded information. Promotion with quality
+recovery requires retained master/residual state, distillation, or new training.
+
+Consumer and Enterprise are precision policies over the same MOIRA identity.
+Consumer defaults to an `int3` core, higher logical precision for reasoning,
+and an FP32 verifier. Enterprise defaults to an `int9` core, `int27` active
+capabilities, an `int81` verifier budget, BF16 arithmetic, and FP64 verification
+where the hardware supports it. Teacher references remain external and must be
+explicitly authorized.
+
+The planning commands are non-allocating:
+
+```bash
+python -m moira elastic policy --profile consumer
+python -m moira elastic policy --profile enterprise
+python -m moira elastic plan --current 3B --target 243B \
+  --profile enterprise --runtime-bits int27
+```
+
+The output is a candidate manifest. It does not pretend that a local machine
+has allocated or trained the target capacity. Promotion still requires
+checkpoint signatures, held-out capability scores, hardware/resource checks,
+and rollback.
+
 Phase 0 excludes:
 
 - 3B pretraining;
 - long stable M1 learning curves and precision comparisons;
-- canonical ternary materialization;
+- custom bitplane materialization kernels for large tensors;
 - autonomous adapter or core promotion;
 - production deployment switching;
 - external network tools;

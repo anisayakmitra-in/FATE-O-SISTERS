@@ -145,6 +145,38 @@ identity; the JSONL and observation files themselves must be held out by the
 caller. This remains bounded local training/evaluation; it does not fetch Hub
 weights, execute robotics, or claim a trained 3B/AGI system.
 
+## Elastic capacity and custom bitplane precision
+
+MOIRA now has a planning contract for one identity that can grow with
+hardware-supported resources:
+
+```text
+parameters: 3B -> 6B -> 9B -> 27B -> 81B -> 243B -> ...
+logical bits: int3 -> int6 -> int9 -> int27 -> int81 -> int243 -> ...
+```
+
+These are separate axes. A `3B` model is not a `3-bit` model, and `int81` is a
+logical packed-bit budget rather than a claim that a GPU has native 81-bit
+matrix multiplication. Consumer and Enterprise policies select different
+logical precision per capability while keeping one MOIRA model identity:
+
+```powershell
+python -m moira elastic policy --profile consumer
+python -m moira elastic policy --profile enterprise
+python -m moira elastic plan `
+  --current 3B `
+  --target 243B `
+  --profile enterprise `
+  --runtime-bits int27
+```
+
+The plan is non-allocating and records every growth step, target storage
+estimate, capability precision policy, arithmetic dtype, and the requirement
+for training and promotion. Low-bit training can use retained master or
+residual state; turning an `int3` artifact into an `int81` container alone does
+not recover information discarded during quantization. Large-field packed
+kernels and distributed training remain future implementation work.
+
 Successful commands write one compact JSON object to standard output. Expected argument, configuration, filesystem, and checkpoint failures write an error to standard error and exit with status 2. Keep the complete run directory for automatic recovery and resume; a checkpoint tensor file by itself is not the whole run state.
 
 Run the research tests with pytest's cache disabled:
@@ -158,6 +190,7 @@ python -m pytest research/tests -p no:cacheprovider
 | Path | Purpose |
 | --- | --- |
 | `research/src/moira/` | Executable PyTorch CPU reference and CLI |
+| `research/src/moira/elastic.py` | Unbounded capacity plans, custom bitplane views, and profile policies |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
 | `research/configs/m1-sources.toml` | M1 dataset, model, and evaluation source catalog |

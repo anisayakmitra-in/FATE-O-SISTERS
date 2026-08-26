@@ -118,6 +118,38 @@ def test_m1_capability_evaluation_command_is_registered() -> None:
     assert "--split" in result.stdout
 
 
+def test_elastic_policy_and_unbounded_growth_plan_cli() -> None:
+    policy = _output_json(_run_cli("elastic", "policy", "--profile", "enterprise"))
+    assert policy["bit_precision_ladder"] == [
+        "int3",
+        "int6",
+        "int9",
+        "int27",
+        "int81",
+    ]
+    assert policy["unbounded_parameter_growth"] is True
+    assert policy["precision_policy"]["verifier_bits"] == "int81"
+
+    plan = _output_json(
+        _run_cli(
+            "elastic",
+            "plan",
+            "--current",
+            "3B",
+            "--target",
+            "243B",
+            "--profile",
+            "consumer",
+            "--runtime-bits",
+            "int6",
+        )
+    )
+    assert plan["runtime_bits"] == "int6"
+    assert plan["growth"]["target"] == "243B"
+    assert plan["growth"]["unbounded_growth"] is True
+    assert plan["status"] == "plan-only-no-target-allocation"
+
+
 def test_train_verify_evaluate_and_auto_resume_cli(cli_root: Path) -> None:
     run_dir = cli_root / "training-run"
     trained = _run_cli(

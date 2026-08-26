@@ -37,6 +37,12 @@ from .config import (
     TrainingConfig,
 )
 from .dataset import SourceCatalog, iter_jsonl_examples
+from .elastic import (
+    BIT_PRECISION_LADDER,
+    CANONICAL_PARAMETER_LADDER,
+    PrecisionPolicy,
+    build_elastic_plan,
+)
 from .model import MoiraModel
 from .m1_train import (
     evaluate_m1_capabilities,
@@ -104,6 +110,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "describe", help="Describe a deployment profile without changing state."
     )
     describe.add_argument("profile", choices=("consumer", "enterprise"))
+
+    elastic = commands.add_parser(
+        "elastic",
+        help="Plan unbounded parameter growth and custom bitplane precision.",
+    )
+    elastic_commands = elastic.add_subparsers(
+        dest="elastic_command", required=True
+    )
+    elastic_policy = elastic_commands.add_parser(
+        "policy", help="Show the Consumer or Enterprise precision policy."
+    )
+    elastic_policy.add_argument(
+        "--profile", required=True, choices=("consumer", "enterprise")
+    )
+    elastic_plan = elastic_commands.add_parser(
+        "plan", help="Plan a growth tier without allocating the target weights."
+    )
+    elastic_plan.add_argument("--current", default="3B")
+    elastic_plan.add_argument("--target", required=True)
+    elastic_plan.add_argument(
+        "--profile", required=True, choices=("consumer", "enterprise")
+    )
+    elastic_plan.add_argument(
+        "--runtime-bits",
+        help="Override the profile core level, for example int3, int9, or int81.",
+    )
 
     m1 = commands.add_parser(
         "m1", help="Inspect the fixed M1 model surface without downloading weights."
@@ -693,6 +725,35 @@ def _matches_annotation(value: object, annotation: object) -> bool:
     return isinstance(annotation, type) and type(value) is annotation
 
 
+def _elastic_policy(profile: str) -> dict[str, object]:
+    policy = PrecisionPolicy.for_profile(profile)
+    return {
+        "architecture": "MOIRA-precision-lattice-v1",
+        "profile": profile,
+        "precision_policy": policy.to_dict(),
+        "parameter_growth_ladder": [
+            f"{value // 1_000_000_000}B" for value in CANONICAL_PARAMETER_LADDER
+        ],
+        "bit_precision_ladder": [f"int{value}" for value in BIT_PRECISION_LADDER],
+        "unbounded_parameter_growth": True,
+        "weights_allocated": False,
+    }
+
+
+def _elastic_plan(
+    current: str,
+    target: str,
+    profile: str,
+    runtime_bits: str | None,
+) -> dict[str, object]:
+    return build_elastic_plan(
+        current,
+        target,
+        profile=profile,
+        runtime_bits=runtime_bits,
+    ).to_dict()
+
+
 def _describe_deployment(profile: str) -> dict[str, object]:
     descriptions = {
         "consumer": (
@@ -704,6 +765,7 @@ def _describe_deployment(profile: str) -> dict[str, object]:
             "tenant isolation, audit sinks, training queues, and explicit cost budgets."
         ),
     }
+    policy = _elastic_policy(profile)
     return {
         "implemented_in_phase_0": False,
         "model": "MOIRA",
@@ -712,6 +774,10 @@ def _describe_deployment(profile: str) -> dict[str, object]:
         "status": "architecture contract only",
         "description": descriptions[profile],
         "switch_command_available": False,
+        "precision_policy": policy["precision_policy"],
+        "parameter_growth_ladder": policy["parameter_growth_ladder"],
+        "bit_precision_ladder": policy["bit_precision_ladder"],
+        "unbounded_parameter_growth": True,
     }
 
 
@@ -893,6 +959,17 @@ def _evaluate(
 def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
     if arguments.command == "deployment":
         return _describe_deployment(arguments.profile)
+    if arguments.command == "elastic":
+        if arguments.elastic_command == "policy":
+            return _elastic_policy(arguments.profile)
+        if arguments.elastic_command == "plan":
+            return _elastic_plan(
+                arguments.current,
+                arguments.target,
+                arguments.profile,
+                arguments.runtime_bits,
+            )
+        raise ValueError("unknown elastic command")
     if arguments.command == "m1":
         if arguments.m1_command == "inspect":
             return _m1_inspect(arguments.device)
