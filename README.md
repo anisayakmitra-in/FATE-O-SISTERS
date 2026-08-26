@@ -20,6 +20,7 @@ The Python reference contains:
 - bounded JSONL normalization with source revisions, licenses, split assignment, and record hashes;
 - pure-PyTorch vision and feature capsule encoders for image, audio, time-series, structured, graph, and robotics inputs;
 - an M1 meta-device parameter check, equal-parameter component ablations, and a bounded in-memory JSONL training path;
+- checkpointed capability-prefix training, resume, and no-update held-out evaluation;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -96,9 +97,9 @@ python -m moira m1 train-jsonl `
 ```
 
 This text/code path writes no checkpoint; it is a bounded data-to-loss smoke
-path. Long stable curves, held-out evaluation, and precision comparisons remain
-M1 exit gates. The capability path below adds bounded checkpoint resume for
-vision and feature observations.
+path. Long stable curves and precision comparisons remain M1 exit gates. The
+capability path below adds bounded checkpoint resume and held-out evaluation
+for vision and feature observations.
 
 For a caller-owned capability slice, provide a CPU-readable `torch.save` tensor
 of observations alongside the normalized JSONL rows. Vision uses
@@ -121,8 +122,28 @@ python -m moira m1 train-capabilities `
 ```
 
 Pass `--resume` with the same manifest and checkpoint to continue at the next
-sample cursor. This command is still bounded local training; it does not fetch
-Hub weights, execute robotics, or claim a trained 3B/AGI system.
+sample cursor. Keep a separate, caller-owned JSONL/tensor slice for evaluation
+and score it without changing the checkpoint:
+
+```powershell
+python -m moira m1 evaluate-capabilities `
+  --catalog research/configs/m1-sources.toml `
+  --source chartqa `
+  --path C:\data\chartqa-eval.jsonl `
+  --observations C:\data\chartqa-eval-images.pt `
+  --modality vision `
+  --checkpoint C:\runs\moira-m1\vision.pt `
+  --split eval `
+  --batch-size 1 `
+  --device cuda
+```
+
+The evaluator loads and validates the exact model, loom, source, shape, and
+scope manifest, reports token-weighted loss plus per-batch losses, and sets
+`weights_updated` to `false`. The `--split` value records the held-out slice
+identity; the JSONL and observation files themselves must be held out by the
+caller. This remains bounded local training/evaluation; it does not fetch Hub
+weights, execute robotics, or claim a trained 3B/AGI system.
 
 Successful commands write one compact JSON object to standard output. Expected argument, configuration, filesystem, and checkpoint failures write an error to standard error and exit with status 2. Keep the complete run directory for automatic recovery and resume; a checkpoint tensor file by itself is not the whole run state.
 

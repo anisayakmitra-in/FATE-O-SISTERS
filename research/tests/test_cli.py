@@ -108,6 +108,16 @@ def test_m1_inspect_and_catalog_validation_are_read_only() -> None:
     assert catalog["weights_or_datasets_downloaded"] is False
 
 
+def test_m1_capability_evaluation_command_is_registered() -> None:
+    result = _run_cli("m1", "evaluate-capabilities", "--help")
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "evaluate-capabilities" in result.stdout
+    assert "--checkpoint" in result.stdout
+    assert "--split" in result.stdout
+
+
 def test_train_verify_evaluate_and_auto_resume_cli(cli_root: Path) -> None:
     run_dir = cli_root / "training-run"
     trained = _run_cli(

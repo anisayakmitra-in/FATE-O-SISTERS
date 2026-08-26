@@ -171,6 +171,20 @@ class M1TrainingResult:
     capability_parameters: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class M1EvaluationResult:
+    loss: float
+    batches: int
+    samples: int
+    tokens: int
+    losses: tuple[float, ...]
+    checkpoint_path: Path
+    checkpoint_step: int
+    lineage_id: str
+    trainable_parameters: int
+    capability_parameters: int
+
+
 class ByteTokenizer:
     """Small deterministic UTF-8 tokenizer that fits inside the M1 vocabulary."""
 
@@ -365,6 +379,7 @@ def iter_cataloged_capability_examples(
     *,
     source_id: str,
     max_records: int,
+    split: str = "train",
 ) -> Iterator[DatasetExample]:
     """Stream vision/audio/structured/robotics examples from a cataloged JSONL."""
     catalog = SourceCatalog.from_toml(catalog_path)
@@ -380,7 +395,7 @@ def iter_cataloged_capability_examples(
     return iter_jsonl_examples(
         jsonl_path,
         source_id=source_id,
-        split="train",
+        split=split,
         preprocess_version="m1-v1",
         split_seed=0,
         max_records=max_records,
@@ -486,50 +501,17 @@ def train_m1_capabilities(
     model weights.
     """
     _validate_m1_limits(steps=steps, batch_size=batch_size, device=device)
-    if not isinstance(modality, str) or not modality.strip():
-        raise ValueError("modality must be non-empty")
-    if not isinstance(scope_id, str) or not scope_id.strip():
-        raise ValueError("scope_id must be non-empty")
-    if (
-        not isinstance(observations, Tensor)
-        or not observations.is_floating_point()
-        or observations.ndim not in {3, 4}
-        or observations.shape[0] <= 0
-        or not bool(torch.isfinite(observations).all())
-    ):
-        raise ValueError("observations must be finite floating [N,T,F] or [N,3,H,W]")
-    if modality == "vision":
-        if observations.ndim != 4 or observations.shape[1] != 3:
-            raise ValueError("vision observations must be RGB [N,3,H,W]")
-    elif observations.ndim != 3 or observations.shape[1] <= 0 or observations.shape[2] <= 0:
-        raise ValueError("feature observations must be [N,T,F]")
     config = model_config or ModelConfig.m1_cpu()
-    model = MoiraModel(config).to(device=device, dtype=torch.float32)
-    observations = observations.to(device=device, dtype=torch.float32)
-    loom = CapabilityLoom(
+    observations, model, loom, optimizer, manifest = _build_capability_components(
+        observations,
+        config=config,
+        source_id=source_id,
         modality=modality,
-        capsule_width=config.capsule_width,
-        d_model=config.d_model,
-        feature_dim=None if modality == "vision" else int(observations.shape[-1]),
-        patch_size=patch_size,
+        device=device,
         max_slots=max_slots,
-    ).to(device=device, dtype=torch.float32)
-    optimizer = AdamW(
-        list(model.parameters()) + list(loom.parameters()),
-        lr=3e-4,
-        weight_decay=0.01,
-        foreach=False,
+        patch_size=patch_size,
+        scope_id=scope_id,
     )
-    manifest = {
-        "model_config": asdict(config),
-        "source_id": source_id,
-        "modality": modality,
-        "sequence_length": config.max_seq_len,
-        "observation_shape": list(observations.shape[1:]),
-        "max_slots": max_slots,
-        "patch_size": patch_size,
-        "scope_id": scope_id,
-    }
     examples = tuple(
         iter_cataloged_capability_examples(
             catalog_path,
@@ -582,13 +564,17 @@ def train_m1_capabilities(
         )
         optimizer.zero_grad(set_to_none=True)
         output = model.forward_with_prefix(
-            batch.input_ids,
+            batch.input_ids.to(device),
             batch.prefix_hidden,
             mode=CognitiveMode.ATROPOS,
-            valid_tokens=batch.valid_tokens,
+            valid_tokens=batch.valid_tokens.to(device),
             tokens_include_prefix=True,
         )
-        loss = _masked_loss(output.logits, batch.targets, batch.loss_mask)
+        loss = _masked_loss(
+            output.logits,
+            batch.targets.to(device),
+            batch.loss_mask.to(device),
+        )
         if not bool(torch.isfinite(loss)):
             raise ValueError("M1 capability training loss became non-finite")
         loss.backward()
@@ -634,6 +620,121 @@ def train_m1_capabilities(
     )
 
 
+def evaluate_m1_capabilities(
+    catalog_path: str | Path,
+    jsonl_path: str | Path,
+    observations: Tensor,
+    *,
+    source_id: str,
+    modality: str,
+    checkpoint_path: str | Path,
+    batch_size: int = 1,
+    device: str = "cpu",
+    model_config: ModelConfig | None = None,
+    max_slots: int = 16,
+    patch_size: int = 16,
+    scope_id: str = "local",
+    split: str = "eval",
+    max_records: int | None = None,
+) -> M1EvaluationResult:
+    """Score held-out capability rows without updating model or loom weights."""
+    _validate_m1_limits(steps=1, batch_size=batch_size, device=device)
+    if not isinstance(split, str) or not split.strip():
+        raise ValueError("split must be non-empty")
+    if max_records is None:
+        max_records = (
+            int(observations.shape[0]) if isinstance(observations, Tensor) else 0
+        )
+    if type(max_records) is not int or not 0 < max_records <= 100_000:
+        raise ValueError("max_records must be between 1 and 100000")
+    config = model_config or ModelConfig.m1_cpu()
+    observations, model, loom, optimizer, manifest = _build_capability_components(
+        observations,
+        config=config,
+        source_id=source_id,
+        modality=modality,
+        device=device,
+        max_slots=max_slots,
+        patch_size=patch_size,
+        scope_id=scope_id,
+    )
+    loaded = load_m1_checkpoint(
+        checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        loom=loom,
+        expected_manifest=manifest,
+    )
+    examples = tuple(
+        iter_cataloged_capability_examples(
+            catalog_path,
+            jsonl_path,
+            source_id=source_id,
+            max_records=max_records,
+            split=split,
+        )
+    )
+    if not examples:
+        raise ValueError("held-out capability data is empty")
+    if len(examples) > observations.shape[0]:
+        raise ValueError("held-out observations ended before the JSONL records")
+    model.eval()
+    loom.eval()
+    weighted_loss = 0.0
+    token_count = 0
+    batch_losses: list[float] = []
+    with torch.no_grad():
+        for start in range(0, len(examples), batch_size):
+            end = min(start + batch_size, len(examples))
+            batch_examples = tuple(examples[start:end])
+            prefix_hidden = loom(
+                observations[start:end],
+                batch_examples,
+                scope_id=scope_id,
+            )
+            batch = build_capability_batch(
+                batch_examples,
+                prefix_hidden=prefix_hidden,
+                sequence_length=config.max_seq_len,
+            )
+            output = model.forward_with_prefix(
+                batch.input_ids.to(device),
+                batch.prefix_hidden,
+                mode=CognitiveMode.ATROPOS,
+                valid_tokens=batch.valid_tokens.to(device),
+                tokens_include_prefix=True,
+            )
+            loss_mask = batch.loss_mask.to(device)
+            loss = _masked_loss(output.logits, batch.targets.to(device), loss_mask)
+            if not bool(torch.isfinite(loss)):
+                raise ValueError("M1 capability evaluation loss became non-finite")
+            current_tokens = int(loss_mask.sum().item())
+            weighted_loss += float(loss.item()) * current_tokens
+            token_count += current_tokens
+            batch_losses.append(float(loss.item()))
+    if token_count <= 0:
+        raise ValueError("held-out capability data has no target tokens")
+    return M1EvaluationResult(
+        loss=weighted_loss / token_count,
+        batches=len(batch_losses),
+        samples=len(examples),
+        tokens=token_count,
+        losses=tuple(batch_losses),
+        checkpoint_path=loaded.checkpoint_path,
+        checkpoint_step=loaded.global_step,
+        lineage_id=loaded.lineage_id,
+        trainable_parameters=model.parameter_ledger().total_trainable,
+        capability_parameters=sum(
+            parameter.numel()
+            for parameter in {
+                id(parameter): parameter
+                for parameter in loom.parameters()
+                if parameter.requires_grad
+            }.values()
+        ),
+    )
+
+
 def _validate_m1_limits(*, steps: int, batch_size: int, device: str) -> None:
     if type(steps) is not int or not 0 < steps <= M1_MAX_STEPS:
         raise ValueError("steps must be between 1 and the M1 step limit")
@@ -643,6 +744,67 @@ def _validate_m1_limits(*, steps: int, batch_size: int, device: str) -> None:
         raise ValueError("M1 device must be cpu or cuda")
     if device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA is not available")
+
+
+def _build_capability_components(
+    observations: Tensor,
+    *,
+    config: ModelConfig,
+    source_id: str,
+    modality: str,
+    device: str,
+    max_slots: int,
+    patch_size: int,
+    scope_id: str,
+) -> tuple[Tensor, MoiraModel, CapabilityLoom, AdamW, dict[str, object]]:
+    if not isinstance(modality, str) or not modality.strip():
+        raise ValueError("modality must be non-empty")
+    if not isinstance(scope_id, str) or not scope_id.strip():
+        raise ValueError("scope_id must be non-empty")
+    if (
+        not isinstance(observations, Tensor)
+        or not observations.is_floating_point()
+        or observations.ndim not in {3, 4}
+        or observations.shape[0] <= 0
+        or not bool(torch.isfinite(observations).all())
+    ):
+        raise ValueError("observations must be finite floating [N,T,F] or [N,3,H,W]")
+    if modality == "vision":
+        if observations.ndim != 4 or observations.shape[1] != 3:
+            raise ValueError("vision observations must be RGB [N,3,H,W]")
+    elif (
+        observations.ndim != 3
+        or observations.shape[1] <= 0
+        or observations.shape[2] <= 0
+    ):
+        raise ValueError("feature observations must be [N,T,F]")
+    model = MoiraModel(config).to(device=device, dtype=torch.float32)
+    observations = observations.to(device=device, dtype=torch.float32)
+    loom = CapabilityLoom(
+        modality=modality,
+        capsule_width=config.capsule_width,
+        d_model=config.d_model,
+        feature_dim=None if modality == "vision" else int(observations.shape[-1]),
+        patch_size=patch_size,
+        max_slots=max_slots,
+    ).to(device=device, dtype=torch.float32)
+    optimizer = AdamW(
+        list(model.parameters()) + list(loom.parameters()),
+        lr=3e-4,
+        weight_decay=0.01,
+        foreach=False,
+    )
+    manifest = {
+        "model_config": asdict(config),
+        "source_id": source_id,
+        "modality": modality,
+        "sequence_length": config.max_seq_len,
+        "observation_shape": list(observations.shape[1:]),
+        "max_slots": max_slots,
+        "patch_size": patch_size,
+        "scope_id": scope_id,
+    }
+    return observations, model, loom, optimizer, manifest
 
 
 def _masked_loss(logits: Tensor, targets: Tensor, loss_mask: Tensor) -> Tensor:

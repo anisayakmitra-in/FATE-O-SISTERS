@@ -38,7 +38,11 @@ from .config import (
 )
 from .dataset import SourceCatalog, iter_jsonl_examples
 from .model import MoiraModel
-from .m1_train import train_m1_capabilities, train_m1_jsonl
+from .m1_train import (
+    evaluate_m1_capabilities,
+    train_m1_capabilities,
+    train_m1_jsonl,
+)
 from .synthetic import SyntheticStream
 from .train import (
     _build_components,
@@ -139,6 +143,27 @@ def _build_parser() -> argparse.ArgumentParser:
     m1_capabilities.add_argument("--max-slots", default=16, type=int)
     m1_capabilities.add_argument("--patch-size", default=16, type=int)
     m1_capabilities.add_argument("--scope-id", default="local")
+    m1_evaluate = m1_commands.add_parser(
+        "evaluate-capabilities",
+        help="Evaluate a held-out capability checkpoint without updating weights.",
+    )
+    m1_evaluate.add_argument("--catalog", required=True, type=Path)
+    m1_evaluate.add_argument("--source", required=True)
+    m1_evaluate.add_argument("--path", required=True, type=Path)
+    m1_evaluate.add_argument("--observations", required=True, type=Path)
+    m1_evaluate.add_argument(
+        "--modality",
+        required=True,
+        choices=("vision", "audio", "time-series", "structured", "robotics"),
+    )
+    m1_evaluate.add_argument("--checkpoint", required=True, type=Path)
+    m1_evaluate.add_argument("--split", default="eval")
+    m1_evaluate.add_argument("--max-records", type=int)
+    m1_evaluate.add_argument("--batch-size", default=1, type=int)
+    m1_evaluate.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    m1_evaluate.add_argument("--max-slots", default=16, type=int)
+    m1_evaluate.add_argument("--patch-size", default=16, type=int)
+    m1_evaluate.add_argument("--scope-id", default="local")
 
     dataset = commands.add_parser(
         "dataset", help="Validate manifest-first local dataset metadata and samples."
@@ -478,6 +503,56 @@ def _m1_train_capabilities(
         "steps": result.steps,
         "tokens": result.tokens,
         "trainable_parameters": result.trainable_parameters,
+    }
+
+
+def _m1_evaluate_capabilities(
+    catalog_path: Path,
+    source_id: str,
+    jsonl_path: Path,
+    observations_path: Path,
+    modality: str,
+    checkpoint_path: Path,
+    split: str,
+    max_records: int | None,
+    batch_size: int,
+    device: str,
+    max_slots: int,
+    patch_size: int,
+    scope_id: str,
+) -> dict[str, object]:
+    observations = _load_m1_observations(observations_path)
+    result = evaluate_m1_capabilities(
+        catalog_path,
+        jsonl_path,
+        observations,
+        source_id=source_id,
+        modality=modality,
+        checkpoint_path=checkpoint_path,
+        batch_size=batch_size,
+        device=device,
+        max_slots=max_slots,
+        patch_size=patch_size,
+        scope_id=scope_id,
+        split=split,
+        max_records=max_records,
+    )
+    return {
+        "batch_losses": list(result.losses),
+        "batches": result.batches,
+        "capability_parameters": result.capability_parameters,
+        "checkpoint": str(result.checkpoint_path.resolve()),
+        "checkpoint_step": result.checkpoint_step,
+        "device": device,
+        "lineage_id": result.lineage_id,
+        "loss": result.loss,
+        "modality": modality,
+        "phase": "M1",
+        "samples": result.samples,
+        "split": split,
+        "tokens": result.tokens,
+        "trainable_parameters": result.trainable_parameters,
+        "weights_updated": False,
     }
 
 
@@ -842,6 +917,22 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 arguments.device,
                 arguments.checkpoint,
                 arguments.resume,
+                arguments.max_slots,
+                arguments.patch_size,
+                arguments.scope_id,
+            )
+        if arguments.m1_command == "evaluate-capabilities":
+            return _m1_evaluate_capabilities(
+                arguments.catalog,
+                arguments.source,
+                arguments.path,
+                arguments.observations,
+                arguments.modality,
+                arguments.checkpoint,
+                arguments.split,
+                arguments.max_records,
+                arguments.batch_size,
+                arguments.device,
                 arguments.max_slots,
                 arguments.patch_size,
                 arguments.scope_id,

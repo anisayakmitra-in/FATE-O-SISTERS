@@ -211,6 +211,32 @@ rows. The checkpoint binds the model, capability loom, optimizer, RNG, loss
 history, cursor, and source/shape manifest. Add `--resume` to continue the
 same bounded run; a changed source or observation contract is rejected.
 
+Keep a second Kaggle input slice for held-out scoring. The evaluator loads the
+same checkpoint manifest, performs a no-gradient pass, and never updates model
+or loom weights:
+
+```bash
+%%bash
+set -euo pipefail
+source /kaggle/working/moira-m0-env.sh
+
+python -m moira m1 evaluate-capabilities \
+  --catalog "$REPO/research/configs/m1-sources.toml" \
+  --source chartqa \
+  --path /kaggle/input/moira-m1-eval/chartqa-eval.jsonl \
+  --observations /kaggle/input/moira-m1-eval/chartqa-eval-images.pt \
+  --modality vision \
+  --checkpoint /kaggle/working/moira-m1/vision.pt \
+  --split eval \
+  --batch-size 1 \
+  --device cuda
+```
+
+The JSON output includes token-weighted and per-batch loss, checkpoint step,
+lineage, sample/token counts, and `weights_updated=false`. The `eval` label is
+metadata; keep the rows and observations physically separate from the training
+slice when producing a capability curve.
+
 ## Continue the run
 
 Choose one resume policy. Automatic recovery selects the latest compatible

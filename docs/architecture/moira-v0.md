@@ -282,6 +282,7 @@ train_m1_jsonl(...) -> M1TrainingResult
 CapabilityLoom(...) -> Tensor
 build_capability_batch(...) -> CapabilityBatch
 train_m1_capabilities(...) -> M1TrainingResult
+evaluate_m1_capabilities(...) -> M1EvaluationResult
 save_m1_checkpoint(...) -> Path
 load_m1_checkpoint(...) -> M1LoadedCheckpoint
 ```
@@ -295,12 +296,14 @@ path; the core `MoiraModel` parameter ledger remains unchanged. The capability
 trainer saves and resumes a bounded model-plus-loom checkpoint with an exact
 source/shape manifest. `python -m moira m1 inspect` verifies the fixed
 33,032,562-parameter surface on the meta device and checks that Thread, Spool,
-and Knot leave-one-out ablations keep the same parameter count.
+and Knot leave-one-out ablations keep the same parameter count. The held-out
+capability evaluator loads that manifest and reports token-weighted and
+per-batch losses without updating the model or loom.
 
 Phase 0 excludes:
 
 - 3B pretraining;
-- long stable M1 learning curves and held-out capability evaluation;
+- long stable M1 learning curves and precision comparisons;
 - canonical ternary materialization;
 - autonomous adapter or core promotion;
 - production deployment switching;

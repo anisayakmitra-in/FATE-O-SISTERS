@@ -129,10 +129,9 @@ python -m moira m1 train-jsonl `
 ```
 
 The step and batch limits are deliberately small. Checkpoint size limits,
-resume semantics, tokenizer versioning, GPU precision, held-out evaluation,
-and equal-parameter learning curves remain M1 exit work for this text-only
-smoke path. The existing checkpointed trainer remains the M0 deterministic
-reference.
+resume semantics, tokenizer versioning, GPU precision, and equal-parameter
+learning curves remain M1 exit work for this text-only smoke path. The existing
+checkpointed trainer remains the M0 deterministic reference.
 
 ### Capability-prefix training and resume
 
@@ -166,3 +165,30 @@ does not download Hugging Face weights or silently mix licenses.
 Do not place private conversations in a foundation corpus by accident. Keep
 consent, tenant scope, deletion policy, source revision, preprocessing version,
 split seed, and content hash beside every materialized dataset slice.
+
+### Held-out capability evaluation
+
+Evaluation consumes a separate, caller-owned JSONL/tensor slice. The evaluator
+loads the checkpoint's exact source, modality, observation-shape, prefix, and
+scope manifest before scoring; a mismatch fails closed. Use `--split eval` to
+label the held-out slice in the result, and do not reuse training rows when
+reporting a capability curve:
+
+```powershell
+python -m moira m1 evaluate-capabilities `
+  --catalog research/configs/m1-sources.toml `
+  --source chartqa `
+  --path C:\data\chartqa-eval.jsonl `
+  --observations C:\data\chartqa-eval-images.pt `
+  --modality vision `
+  --checkpoint C:\runs\moira-m1\vision.pt `
+  --split eval `
+  --batch-size 1 `
+  --device cuda
+```
+
+This command performs a no-gradient pass and never calls an optimizer step. It
+returns the token-weighted loss, per-batch losses, checkpoint step, lineage,
+sample/token counts, and `weights_updated=false`. It is a reproducible
+evaluation primitive, not evidence of a long stable learning curve or a
+benchmark result.

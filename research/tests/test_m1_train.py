@@ -12,6 +12,7 @@ from moira.m1_train import (
     CapabilityLoom,
     build_capability_batch,
     build_causal_batch,
+    evaluate_m1_capabilities,
     iter_cataloged_text_examples,
     train_m1_capabilities,
 )
@@ -115,6 +116,7 @@ def test_capability_batch_runs_through_the_model_prefix_boundary() -> None:
 
 def test_capability_training_writes_and_resumes_a_bounded_checkpoint() -> None:
     jsonl_path = Path("research") / f".m1-capability-{uuid.uuid4().hex}.jsonl"
+    eval_jsonl_path = Path("research") / f".m1-capability-eval-{uuid.uuid4().hex}.jsonl"
     checkpoint_path = Path("research") / f".m1-checkpoint-{uuid.uuid4().hex}.pt"
     try:
         jsonl_path.write_text(
@@ -125,6 +127,30 @@ def test_capability_training_writes_and_resumes_a_bounded_checkpoint() -> None:
                     ),
                     json.dumps(
                         {"id": "chart-b", "query": "where?", "image": "b.png", "label": ["2"]}
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        eval_jsonl_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "chart-eval-a",
+                            "query": "what?",
+                            "image": "eval-a.png",
+                            "label": ["3"],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "id": "chart-eval-b",
+                            "query": "where?",
+                            "image": "eval-b.png",
+                            "label": ["4"],
+                        }
                     ),
                 ]
             )
@@ -165,6 +191,30 @@ def test_capability_training_writes_and_resumes_a_bounded_checkpoint() -> None:
         assert resumed.steps == 2
         assert len(resumed.losses) == 2
         assert all(torch.isfinite(torch.tensor(resumed.losses)))
+        checkpoint_bytes = checkpoint_path.read_bytes()
+        evaluation = evaluate_m1_capabilities(
+            "research/configs/m1-sources.toml",
+            eval_jsonl_path,
+            torch.rand(2, 3, 4, 4),
+            source_id="chartqa",
+            modality="vision",
+            checkpoint_path=checkpoint_path,
+            batch_size=1,
+            model_config=config,
+            patch_size=2,
+            max_slots=3,
+            split="eval",
+        )
+        assert evaluation.checkpoint_step == 2
+        assert evaluation.batches == 2
+        assert evaluation.samples == 2
+        assert evaluation.tokens > 0
+        assert len(evaluation.losses) == 2
+        assert evaluation.loss > 0
+        assert evaluation.capability_parameters == resumed.capability_parameters
+        assert evaluation.trainable_parameters == resumed.trainable_parameters
+        assert checkpoint_path.read_bytes() == checkpoint_bytes
     finally:
         jsonl_path.unlink(missing_ok=True)
+        eval_jsonl_path.unlink(missing_ok=True)
         checkpoint_path.unlink(missing_ok=True)
