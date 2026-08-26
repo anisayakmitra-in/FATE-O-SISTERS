@@ -268,6 +268,7 @@ ThreadLocalAttention.forward(...) -> Tensor
 SpoolRecurrent.forward(...) -> tuple[Tensor, SpoolState]
 KnotLandmarkAttention.forward(...) -> Tensor
 MoiraModel.forward(...) -> MoiraOutput
+MoiraModel.forward_with_prefix(...) -> MoiraOutput
 save_checkpoint(...) -> None
 load_checkpoint(...) -> CheckpointState
 train_until(...) -> TrainingState
@@ -278,20 +279,28 @@ VisionPatchEncoder(...) -> tuple[CapabilityCapsule, ...]
 FeatureCapsuleEncoder(...) -> tuple[CapabilityCapsule, ...]
 CapsuleProjector(...) -> Tensor
 train_m1_jsonl(...) -> M1TrainingResult
+CapabilityLoom(...) -> Tensor
+build_capability_batch(...) -> CapabilityBatch
+train_m1_capabilities(...) -> M1TrainingResult
+save_m1_checkpoint(...) -> Path
+load_m1_checkpoint(...) -> M1LoadedCheckpoint
 ```
 
 The reference package lives under `research/src/moira`. CPU tests use tiny dimensions and deterministic seeds. A synthetic next-token task provides the first smoke-training command. Kaggle uses the same command and writes resumable checkpoints containing model, optimizer, scheduler, random-number-generator, data-cursor, configuration, and manifest state.
 
 The M1 JSONL path reads caller-owned text or code records through the source
 catalog, uses a deterministic UTF-8 byte tokenizer, and runs a bounded
-in-memory step. It writes no checkpoint. `python -m moira m1 inspect` verifies
-the fixed 33,032,562-parameter surface on the meta device and checks that
-Thread, Spool, and Knot leave-one-out ablations keep the same parameter count.
+in-memory step. `CapabilityLoom` adds a separate, typed vision/feature prefix
+path; the core `MoiraModel` parameter ledger remains unchanged. The capability
+trainer saves and resumes a bounded model-plus-loom checkpoint with an exact
+source/shape manifest. `python -m moira m1 inspect` verifies the fixed
+33,032,562-parameter surface on the meta device and checks that Thread, Spool,
+and Knot leave-one-out ablations keep the same parameter count.
 
 Phase 0 excludes:
 
 - 3B pretraining;
-- stable M1 learning curves and checkpoint resume;
+- long stable M1 learning curves and held-out capability evaluation;
 - canonical ternary materialization;
 - autonomous adapter or core promotion;
 - production deployment switching;

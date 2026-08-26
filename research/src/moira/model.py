@@ -461,6 +461,152 @@ class MoiraModel(nn.Module):
         batch, length = self._validate_tokens(tokens)
         if not isinstance(mode, CognitiveMode):
             raise ValueError("mode must be a CognitiveMode")
+        mode_index = {
+            CognitiveMode.CLOTHO: 0,
+            CognitiveMode.LACHESIS: 1,
+            CognitiveMode.ATROPOS: 2,
+        }.get(mode)
+        hidden = self.embedding_dropout(
+            self.token_embedding(tokens) + self.mode_embedding.weight[mode_index]
+        )
+        return self._run_hidden(
+            hidden,
+            mode=mode,
+            valid_tokens=valid_tokens,
+            source_lengths=source_lengths,
+            state=state,
+            ablate=ablate,
+        )
+
+    def forward_with_prefix(
+        self,
+        tokens: Tensor,
+        prefix_hidden: Tensor,
+        *,
+        mode: CognitiveMode,
+        valid_tokens: Tensor | None = None,
+        source_lengths: Tensor | None = None,
+        state: MoiraState | None = None,
+        ablate: frozenset[str] | None = None,
+        tokens_include_prefix: bool = False,
+    ) -> MoiraOutput:
+        """Run causal decoding with a fixed-capacity capability prefix.
+
+        ``prefix_hidden`` is supplied by the external capability loom.  The
+        core model keeps its original parameter surface: prefix slots are
+        projected into ``d_model`` before they cross this boundary and share
+        the same cognitive visibility mask as token positions. By default
+        ``tokens`` contains only text positions. A packed batch that already
+        contains dummy prefix slots can set ``tokens_include_prefix=True``;
+        those leading token IDs are ignored and only their validity mask is
+        checked.
+        """
+        batch, input_length = self._validate_tokens(tokens)
+        prefix_length = self._validate_prefix_hidden(
+            prefix_hidden, batch=batch, device=tokens.device
+        )
+        if type(tokens_include_prefix) is not bool:
+            raise ValueError("tokens_include_prefix must be a boolean")
+        if tokens_include_prefix:
+            if input_length <= prefix_length:
+                raise ValueError("prefix must leave at least one token position")
+            token_length = input_length - prefix_length
+            token_inputs = tokens[:, prefix_length:]
+            combined_length = input_length
+        else:
+            token_length = input_length
+            token_inputs = tokens
+            combined_length = prefix_length + token_length
+            if combined_length > self.config.max_seq_len:
+                raise ValueError("prefix and token sequence exceed max_seq_len")
+        if valid_tokens is None:
+            valid_tokens = torch.ones(
+                (batch, combined_length if tokens_include_prefix else token_length),
+                dtype=torch.bool,
+                device=tokens.device,
+            )
+        else:
+            valid_shapes = {(batch, token_length)}
+            if tokens_include_prefix:
+                valid_shapes.add((batch, combined_length))
+            if (
+                not isinstance(valid_tokens, Tensor)
+                or valid_tokens.dtype is not torch.bool
+                or valid_tokens.shape not in valid_shapes
+                or valid_tokens.device != tokens.device
+            ):
+                raise ValueError(
+                    "valid_tokens must be bool [batch, token or combined sequence] "
+                    "on tokens.device"
+                )
+        if tokens_include_prefix and valid_tokens.shape[1] == combined_length:
+            if not bool(valid_tokens[:, :prefix_length].all()):
+                raise ValueError("combined valid_tokens must keep prefix slots valid")
+            valid_tokens = valid_tokens[:, prefix_length:]
+        if bool(torch.any(~valid_tokens[:, :-1] & valid_tokens[:, 1:])):
+            raise ValueError("valid_tokens must be right-padded")
+        if source_lengths is not None:
+            if (
+                not isinstance(source_lengths, Tensor)
+                or source_lengths.dtype is not torch.int64
+                or source_lengths.shape != (batch,)
+                or source_lengths.device != tokens.device
+            ):
+                raise ValueError(
+                    "source_lengths must be int64 [batch] on tokens.device"
+                )
+            if bool(torch.any(source_lengths < 0)) or bool(
+                torch.any(source_lengths > valid_tokens.sum(dim=1))
+            ):
+                raise ValueError("source_lengths must fit the token sequence")
+            source_lengths = source_lengths + prefix_length
+        if not isinstance(mode, CognitiveMode):
+            raise ValueError("mode must be a CognitiveMode")
+        mode_index = {
+            CognitiveMode.CLOTHO: 0,
+            CognitiveMode.LACHESIS: 1,
+            CognitiveMode.ATROPOS: 2,
+        }.get(mode)
+        token_hidden = self.embedding_dropout(
+            self.token_embedding(token_inputs) + self.mode_embedding.weight[mode_index]
+        )
+        prefix_hidden = self.embedding_dropout(
+            prefix_hidden + self.mode_embedding.weight[mode_index]
+        )
+        combined_hidden = torch.cat((prefix_hidden, token_hidden), dim=1)
+        combined_valid = torch.cat(
+            (
+                torch.ones(
+                    (batch, prefix_length), dtype=torch.bool, device=tokens.device
+                ),
+                valid_tokens,
+            ),
+            dim=1,
+        )
+        return self._run_hidden(
+            combined_hidden,
+            mode=mode,
+            valid_tokens=combined_valid,
+            source_lengths=source_lengths,
+            state=state,
+            ablate=ablate,
+        )
+
+    def _run_hidden(
+        self,
+        hidden: Tensor,
+        *,
+        mode: CognitiveMode,
+        valid_tokens: Tensor | None,
+        source_lengths: Tensor | None,
+        state: MoiraState | None,
+        ablate: frozenset[str] | None,
+    ) -> MoiraOutput:
+        batch, length = _validate_hidden("hidden", hidden, self.config.d_model, self)
+        if length > self.config.max_seq_len:
+            raise ValueError("hidden sequence exceeds max_seq_len")
+        if not isinstance(mode, CognitiveMode):
+            raise ValueError("mode must be a CognitiveMode")
         if ablate is None:
             ablate = frozenset()
         if not isinstance(ablate, frozenset) or not ablate.issubset(
@@ -469,16 +615,16 @@ class MoiraModel(nn.Module):
             raise ValueError("ablate must be a subset of thread, spool, and knot")
         if valid_tokens is None:
             valid_tokens = torch.ones(
-                (batch, length), dtype=torch.bool, device=tokens.device
+                (batch, length), dtype=torch.bool, device=hidden.device
             )
         elif (
             not isinstance(valid_tokens, Tensor)
             or valid_tokens.dtype is not torch.bool
             or valid_tokens.shape != (batch, length)
-            or valid_tokens.device != tokens.device
+            or valid_tokens.device != hidden.device
         ):
             raise ValueError(
-                "valid_tokens must be bool [batch, sequence] on tokens.device"
+                "valid_tokens must be bool [batch, sequence] on hidden.device"
             )
         if bool(torch.any(~valid_tokens[:, :-1] & valid_tokens[:, 1:])):
             raise ValueError("valid_tokens must be right-padded")
@@ -506,14 +652,6 @@ class MoiraModel(nn.Module):
             spool_states = state.spools
             pulse_state = state.pulse
 
-        mode_index = {
-            CognitiveMode.CLOTHO: 0,
-            CognitiveMode.LACHESIS: 1,
-            CognitiveMode.ATROPOS: 2,
-        }[mode]
-        hidden = self.embedding_dropout(
-            self.token_embedding(tokens) + self.mode_embedding.weight[mode_index]
-        )
         next_spools = []
         for block, spool_state in zip(self.blocks, spool_states):
             hidden, next_spool = block(
@@ -594,6 +732,27 @@ class MoiraModel(nn.Module):
         ):
             raise ValueError("tokens must contain in-range vocabulary IDs")
         return batch, length
+
+    def _validate_prefix_hidden(
+        self, prefix_hidden: object, *, batch: int, device: torch.device
+    ) -> int:
+        if (
+            not isinstance(prefix_hidden, Tensor)
+            or not prefix_hidden.is_floating_point()
+            or prefix_hidden.ndim != 3
+            or prefix_hidden.shape[0] != batch
+            or prefix_hidden.shape[1] <= 0
+            or prefix_hidden.shape[2] != self.config.d_model
+            or prefix_hidden.device != device
+            or prefix_hidden.dtype != self.token_embedding.weight.dtype
+            or prefix_hidden.device.type == "meta"
+            or not bool(torch.isfinite(prefix_hidden).all())
+        ):
+            raise ValueError(
+                "prefix_hidden must be finite floating [batch, prefix, d_model] "
+                "matching the model device and dtype"
+            )
+        return int(prefix_hidden.shape[1])
 
 
 def _landmark_spans(

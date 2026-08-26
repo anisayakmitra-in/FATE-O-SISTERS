@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 import platform
 import stat
 import sys
@@ -37,7 +38,7 @@ from .config import (
 )
 from .dataset import SourceCatalog, iter_jsonl_examples
 from .model import MoiraModel
-from .m1_train import train_m1_jsonl
+from .m1_train import train_m1_capabilities, train_m1_jsonl
 from .synthetic import SyntheticStream
 from .train import (
     _build_components,
@@ -117,6 +118,27 @@ def _build_parser() -> argparse.ArgumentParser:
     m1_train.add_argument("--steps", default=1, type=int)
     m1_train.add_argument("--batch-size", default=1, type=int)
     m1_train.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    m1_capabilities = m1_commands.add_parser(
+        "train-capabilities",
+        help="Train bounded vision/audio/structured capability prefixes on local tensors.",
+    )
+    m1_capabilities.add_argument("--catalog", required=True, type=Path)
+    m1_capabilities.add_argument("--source", required=True)
+    m1_capabilities.add_argument("--path", required=True, type=Path)
+    m1_capabilities.add_argument("--observations", required=True, type=Path)
+    m1_capabilities.add_argument(
+        "--modality",
+        required=True,
+        choices=("vision", "audio", "time-series", "structured", "robotics"),
+    )
+    m1_capabilities.add_argument("--steps", default=1, type=int)
+    m1_capabilities.add_argument("--batch-size", default=1, type=int)
+    m1_capabilities.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    m1_capabilities.add_argument("--checkpoint", type=Path)
+    m1_capabilities.add_argument("--resume", action="store_true")
+    m1_capabilities.add_argument("--max-slots", default=16, type=int)
+    m1_capabilities.add_argument("--patch-size", default=16, type=int)
+    m1_capabilities.add_argument("--scope-id", default="local")
 
     dataset = commands.add_parser(
         "dataset", help="Validate manifest-first local dataset metadata and samples."
@@ -406,6 +428,80 @@ def _m1_train(
         "trainable_parameters": result.trainable_parameters,
         "checkpoint_written": False,
     }
+
+
+def _m1_train_capabilities(
+    catalog_path: Path,
+    source_id: str,
+    jsonl_path: Path,
+    observations_path: Path,
+    modality: str,
+    steps: int,
+    batch_size: int,
+    device: str,
+    checkpoint_path: Path | None,
+    resume: bool,
+    max_slots: int,
+    patch_size: int,
+    scope_id: str,
+) -> dict[str, object]:
+    observations = _load_m1_observations(observations_path)
+    result = train_m1_capabilities(
+        catalog_path,
+        jsonl_path,
+        observations,
+        source_id=source_id,
+        modality=modality,
+        steps=steps,
+        batch_size=batch_size,
+        device=device,
+        checkpoint_path=checkpoint_path,
+        resume=resume,
+        max_slots=max_slots,
+        patch_size=patch_size,
+        scope_id=scope_id,
+    )
+    return {
+        "capability_parameters": result.capability_parameters,
+        "checkpoint": (
+            str(result.checkpoint_path.resolve())
+            if result.checkpoint_path is not None
+            else None
+        ),
+        "checkpoint_written": result.checkpoint_path is not None,
+        "device": device,
+        "final_loss": result.final_loss,
+        "losses": list(result.losses),
+        "modality": modality,
+        "phase": "M1",
+        "samples": result.samples,
+        "steps": result.steps,
+        "tokens": result.tokens,
+        "trainable_parameters": result.trainable_parameters,
+    }
+
+
+def _load_m1_observations(path: Path) -> torch.Tensor:
+    try:
+        status = path.stat()
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("M1 observations must be a regular file")
+        if status.st_size <= 0 or status.st_size > 512 * 1024 * 1024:
+            raise ValueError("M1 observations exceed the 512 MiB input limit")
+        value = torch.load(path, map_location="cpu", weights_only=True)
+    except (OSError, RuntimeError, EOFError, pickle.UnpicklingError, ValueError) as error:
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError("M1 observations cannot be loaded safely") from error
+    if (
+        not isinstance(value, torch.Tensor)
+        or not value.is_floating_point()
+        or value.ndim not in {3, 4}
+        or value.shape[0] <= 0
+        or not bool(torch.isfinite(value).all())
+    ):
+        raise ValueError("M1 observations must be finite floating [N,T,F] or [N,3,H,W]")
+    return value
 
 
 def _dataset_validate(catalog_path: Path) -> dict[str, object]:
@@ -733,6 +829,22 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 arguments.steps,
                 arguments.batch_size,
                 arguments.device,
+            )
+        if arguments.m1_command == "train-capabilities":
+            return _m1_train_capabilities(
+                arguments.catalog,
+                arguments.source,
+                arguments.path,
+                arguments.observations,
+                arguments.modality,
+                arguments.steps,
+                arguments.batch_size,
+                arguments.device,
+                arguments.checkpoint,
+                arguments.resume,
+                arguments.max_slots,
+                arguments.patch_size,
+                arguments.scope_id,
             )
         raise ValueError("unknown M1 command")
     if arguments.command == "dataset":

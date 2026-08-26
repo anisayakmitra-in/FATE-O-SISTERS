@@ -95,8 +95,34 @@ python -m moira m1 train-jsonl `
   --device cpu
 ```
 
-This path writes no checkpoint. It is a data-to-loss smoke path; M1 checkpoint
-resume, held-out curves, and GPU precision remain exit gates.
+This text/code path writes no checkpoint; it is a bounded data-to-loss smoke
+path. Long stable curves, held-out evaluation, and precision comparisons remain
+M1 exit gates. The capability path below adds bounded checkpoint resume for
+vision and feature observations.
+
+For a caller-owned capability slice, provide a CPU-readable `torch.save` tensor
+of observations alongside the normalized JSONL rows. Vision uses
+`[records, 3, height, width]`; audio, time-series, structured, and robotics
+use `[records, time, features]`. The loom projects each observation into a
+bounded prefix and the M1 checkpoint includes the core model, loom, optimizer,
+loss history, cursor, and manifest:
+
+```powershell
+python -m moira m1 train-capabilities `
+  --catalog research/configs/m1-sources.toml `
+  --source chartqa `
+  --path C:\data\chartqa-slice.jsonl `
+  --observations C:\data\chartqa-images.pt `
+  --modality vision `
+  --steps 1 `
+  --batch-size 1 `
+  --checkpoint C:\runs\moira-m1\vision.pt `
+  --device cuda
+```
+
+Pass `--resume` with the same manifest and checkpoint to continue at the next
+sample cursor. This command is still bounded local training; it does not fetch
+Hub weights, execute robotics, or claim a trained 3B/AGI system.
 
 Successful commands write one compact JSON object to standard output. Expected argument, configuration, filesystem, and checkpoint failures write an error to standard error and exit with status 2. Keep the complete run directory for automatic recovery and resume; a checkpoint tensor file by itself is not the whole run state.
 
@@ -121,7 +147,7 @@ python -m pytest research/tests -p no:cacheprovider
 
 ## Research boundary
 
-The architecture document records proposals for an exact 3B root model, governed threefold growth, consumer and enterprise placement, specialist capability fields, adapters, retrieval, quantization, and later GPU work. The current M1 work covers source contracts, capability boundaries, a fixed 33M parameter surface, equal-parameter ablations, and a bounded in-memory training path. It does not establish stable M1 learning, a checkpointed M1 run, or any 3B lineage.
+The architecture document records proposals for an exact 3B root model, governed threefold growth, consumer and enterprise placement, specialist capability fields, adapters, retrieval, quantization, and later GPU work. The current M1 work covers source contracts, capability boundaries, a fixed 33M parameter surface, equal-parameter ablations, bounded text training, and checkpointed capability-prefix training. It does not establish a long stable M1 curve, a 3B lineage, or any AGI claim.
 
 For a hosted notebook run, follow the [Kaggle M0 guide](docs/guides/kaggle-m0.md). For the model contract and milestone criteria, read the [MOIRA v0 architecture](docs/architecture/moira-v0.md).
 

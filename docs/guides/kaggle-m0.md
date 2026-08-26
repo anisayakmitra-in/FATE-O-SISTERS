@@ -184,9 +184,32 @@ python -m moira m1 train-jsonl \
 ```
 
 The command reports loss, token count, and the 33,032,562-parameter surface.
-It keeps the model in memory and writes no checkpoint. Vision, audio,
-robotics, and time-series rows have typed adapters, but this causal command
-accepts text and code only.
+It keeps the text-only model in memory and writes no checkpoint. For a
+capability slice, store a caller-owned tensor as a Kaggle input (`.pt`) and
+run the checkpointed prefix path; no Hub weight download is required:
+
+```bash
+%%bash
+set -euo pipefail
+source /kaggle/working/moira-m0-env.sh
+
+python -m moira m1 train-capabilities \
+  --catalog "$REPO/research/configs/m1-sources.toml" \
+  --source chartqa \
+  --path /kaggle/input/moira-m1-slice/chartqa-slice.jsonl \
+  --observations /kaggle/input/moira-m1-slice/chartqa-images.pt \
+  --modality vision \
+  --steps 1 \
+  --batch-size 1 \
+  --checkpoint /kaggle/working/moira-m1/vision.pt \
+  --device cuda
+```
+
+The observation contract is RGB `[records, 3, height, width]` for vision and
+`[records, time, features]` for audio, time-series, structured, or robotics
+rows. The checkpoint binds the model, capability loom, optimizer, RNG, loss
+history, cursor, and source/shape manifest. Add `--resume` to continue the
+same bounded run; a changed source or observation contract is rejected.
 
 ## Continue the run
 

@@ -22,10 +22,21 @@ from .ledger import ParameterLedger, ParameterSubsystem, build_parameter_ledger
 from .loom import CapsuleProjector, FeatureCapsuleEncoder, VisionPatchEncoder
 from .m1_train import (
     ByteTokenizer,
+    CapabilityBatch,
+    CapabilityLoom,
     CausalBatch,
     M1TrainingResult,
+    build_capability_batch,
     build_causal_batch,
+    iter_cataloged_capability_examples,
+    train_m1_capabilities,
     train_m1_jsonl,
+)
+from .m1_checkpoint import (
+    M1LoadedCheckpoint,
+    checkpoint_manifest_hash,
+    load_m1_checkpoint,
+    save_m1_checkpoint,
 )
 
 __all__ = [
@@ -47,10 +58,19 @@ __all__ = [
     "FeatureCapsuleEncoder",
     "CapsuleProjector",
     "ByteTokenizer",
+    "CapabilityBatch",
+    "CapabilityLoom",
     "CausalBatch",
     "M1TrainingResult",
+    "build_capability_batch",
     "build_causal_batch",
+    "iter_cataloged_capability_examples",
+    "train_m1_capabilities",
     "train_m1_jsonl",
+    "M1LoadedCheckpoint",
+    "checkpoint_manifest_hash",
+    "load_m1_checkpoint",
+    "save_m1_checkpoint",
     "ParameterLedger",
     "ParameterSubsystem",
     "TrainingConfig",

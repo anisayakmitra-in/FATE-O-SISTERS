@@ -130,8 +130,38 @@ python -m moira m1 train-jsonl `
 
 The step and batch limits are deliberately small. Checkpoint size limits,
 resume semantics, tokenizer versioning, GPU precision, held-out evaluation,
-and equal-parameter learning curves remain M1 exit work. The existing
-checkpointed trainer remains the M0 deterministic reference.
+and equal-parameter learning curves remain M1 exit work for this text-only
+smoke path. The existing checkpointed trainer remains the M0 deterministic
+reference.
+
+### Capability-prefix training and resume
+
+Capability rows can now cross the model boundary through a bounded prefix. The
+JSONL record supplies the target and provenance; a caller-owned `.pt` tensor
+supplies the observation. Use RGB `[N, 3, H, W]` tensors for `vision`, or
+`[N, T, F]` tensors for `audio`, `time-series`, `structured`, and `robotics`:
+
+```powershell
+python -m moira m1 train-capabilities `
+  --catalog research/configs/m1-sources.toml `
+  --source chartqa `
+  --path C:\data\chartqa-slice.jsonl `
+  --observations C:\data\chartqa-images.pt `
+  --modality vision `
+  --steps 1 `
+  --batch-size 1 `
+  --checkpoint C:\runs\moira-m1\vision.pt `
+  --device cuda
+```
+
+`CapabilityLoom` uses the pure-PyTorch vision or feature encoder and a
+trainable capsule projector. `MoiraModel.forward_with_prefix` prepends those
+slots without changing the canonical 33,032,562-parameter core ledger. Each
+checkpoint is an atomic, CPU-portable artifact containing model, loom,
+optimizer, RNG, loss history, cursor, and an exact JSON manifest. Resume with
+the same command plus `--resume`; changing the source, observation shape,
+modality, or model config is rejected. This remains a bounded local path: it
+does not download Hugging Face weights or silently mix licenses.
 
 Do not place private conversations in a foundation corpus by accident. Keep
 consent, tenant scope, deletion policy, source revision, preprocessing version,

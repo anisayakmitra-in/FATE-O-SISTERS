@@ -118,11 +118,32 @@ def test_m1_catalog_contains_datasets_and_teacher_references() -> None:
             "text",
         ),
         (
+            "facebook-voxpopuli",
+            {"audio": {"path": "sample.wav"}, "raw_text": "hello"},
+            "audio",
+            "audio",
+            "text",
+        ),
+        (
+            "google-fleurs",
+            {"audio": {"path": "sample.wav"}, "transcription": "hello"},
+            "audio",
+            "audio",
+            "text",
+        ),
+        (
             "lerobot-pusht",
             {"observation.state": [1.0, 2.0], "action": [3.0, 4.0]},
             "robotics",
             "state",
             "action",
+        ),
+        (
+            "open-graph-benchmark",
+            {"task": "classify graph", "label": 1},
+            "structured",
+            "text",
+            "target",
         ),
     ],
 )

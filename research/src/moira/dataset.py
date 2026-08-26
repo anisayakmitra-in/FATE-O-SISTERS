@@ -386,6 +386,16 @@ def normalize_row(
         if not isinstance(transcription, str) or not transcription.strip():
             raise ValueError("Minds14 row requires a transcription")
         inputs, targets, modality = {"audio": audio_ref}, {"text": transcription}, "audio"
+    elif source_id in {"facebook-voxpopuli", "google-fleurs"}:
+        audio = row.get("audio", row.get("path"))
+        audio_ref = _audio_reference(audio)
+        transcription = row.get(
+            "transcription",
+            row.get("raw_text", row.get("normalized_text", row.get("text"))),
+        )
+        if not isinstance(transcription, str) or not transcription.strip():
+            raise ValueError("speech row requires a transcription or text field")
+        inputs, targets, modality = {"audio": audio_ref}, {"text": transcription}, "audio"
     elif source_id == "chartqa":
         query = _string_field(row, "query")
         image = row.get("image")
@@ -406,6 +416,16 @@ def normalize_row(
         if not _numeric_sequence(state) or not _numeric_sequence(action):
             raise ValueError("PushT row requires numeric observation.state and action")
         inputs, targets, modality = {"state": list(state)}, {"action": list(action)}, "robotics"
+    elif source_id == "open-graph-benchmark":
+        prompt = row.get("text", row.get("task", "graph prediction"))
+        target = row.get("target", row.get("label", row.get("y")))
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("graph row requires a text or task field")
+        if target is None:
+            raise ValueError("graph row requires a target, label, or y field")
+        inputs = {"text": prompt}
+        targets = {"text": target} if isinstance(target, str) else {"target": target}
+        modality = "structured"
     else:
         text = row.get("text", row.get("prompt", row.get("input")))
         target = row.get("target", row.get("response", row.get("output", "")))
