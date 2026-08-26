@@ -76,7 +76,9 @@ relative files from that directory:
 
 Absolute paths, `..` traversal, missing files, non-regular files, path escapes,
 symlinks, junctions, and hard links are rejected. The worker reads and hashes
-every output rather than trusting digests reported by the backend. The
+every output rather than trusting digests reported by the backend. It walks
+the complete staging directory and rejects undeclared files, so the byte
+budget covers every accepted output. The
 resulting `CandidateRecord`
 contains those hashes, the verified parent lineage, and the selection-only
 evaluation result. Adding that record to `CandidateSearch` is a separate
@@ -108,12 +110,9 @@ The v1 worker is a single-process local validation boundary. Its issued
 requests and results are held in memory, and failed staging directories are
 retained for inspection. The registered backend is trusted application code;
 without an OS sandbox it can still write outside the staging directory. The
-worker validates only the files it accepts as candidate outputs. It does not
-include a LoRA, full-checkpoint, prompt, routing, or
-architecture mutation backend. It does not persist work leases, recover a job
+worker ships with the bounded PEFT LoRA backend described in
+[lora-candidates.md](lora-candidates.md). It does not include a full-checkpoint,
+prompt, routing, or architecture mutation backend. It does not persist work leases, recover a job
 after process failure, distribute work to Kaggle or enterprise nodes, validate
-manifest schemas, sign artifacts, or activate weights.
-
-The next implementation should add one concrete bounded backend—LoRA is the
-smallest useful target—while preserving the same request, native permit,
-staging, content-addressing, evaluation, and promotion boundaries.
+every possible backend-specific manifest schema, sign artifacts, or activate
+weights.

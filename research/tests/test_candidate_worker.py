@@ -311,6 +311,31 @@ def test_worker_rejects_budget_overrun(candidate_root: Path) -> None:
         worker.result(request.work_id)
 
 
+def test_worker_rejects_undeclared_workspace_files(candidate_root: Path) -> None:
+    prepared = _request(candidate_root)
+    _, _, _, request, active = prepared
+
+    def backend(work, workspace: Path) -> CandidateWorkerOutput:
+        output = _output(workspace)
+        (workspace / "undeclared.log").write_text("not accounted", encoding="utf-8")
+        return output
+
+    worker = CandidateWorker(
+        backend,
+        active_checkpoint=active,
+        staging_root=candidate_root / "staging",
+        clock_ms=lambda: 100,
+    )
+    _issue(worker, prepared)
+
+    execution = _execute(_kernel(worker, max_effects=1), request)
+
+    assert execution.receipt.outcome == "failed"
+    assert execution.error_code == "ValueError"
+    with pytest.raises(ValueError, match="unavailable"):
+        worker.result(request.work_id)
+
+
 def test_worker_detects_active_checkpoint_change(candidate_root: Path) -> None:
     prepared = _request(candidate_root)
     _, _, _, request, active = prepared
@@ -474,6 +499,7 @@ def test_candidate_output_paths_and_contract_fail_closed() -> None:
     contract = candidate_worker_contract()
     assert contract["requires_native_one_use_effect_permit"] is True
     assert contract["accepts_commands_from_request"] is False
+    assert contract["rejects_undeclared_output_files"] is True
     assert contract["os_read_only_mount_required_for_prevention"] is True
     assert contract["can_authorize"] is False
     assert contract["can_promote"] is False

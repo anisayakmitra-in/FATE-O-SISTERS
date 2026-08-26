@@ -468,6 +468,17 @@ class CandidateWorker:
                 output.metric_file,
             )
         )
+        declared_files = {
+            Path(name).as_posix()
+            for name in (
+                output.artifact_file,
+                output.creation_manifest_file,
+                output.evaluation_manifest_file,
+                output.metric_file,
+            )
+        }
+        if _workspace_files(workspace) != declared_files:
+            raise ValueError("candidate workspace contains undeclared output files")
         sizes = tuple(path.stat().st_size for path in paths)
         output_bytes = sum(sizes)
         if output_bytes > request.budget.max_output_bytes:
@@ -546,6 +557,7 @@ def candidate_worker_contract() -> dict[str, object]:
         "requires_native_one_use_effect_permit": True,
         "accepts_commands_from_request": False,
         "dedicated_staging_workspace": True,
+        "rejects_undeclared_output_files": True,
         "hashes_output_artifacts": True,
         "checks_active_checkpoint_before_and_after": True,
         "os_read_only_mount_required_for_prevention": True,
@@ -567,6 +579,22 @@ def _workspace_file(workspace: Path, relative: str) -> Path:
         raise ValueError("candidate output escapes its staging workspace")
     _regular_file(candidate, "candidate output")
     return candidate
+
+
+def _workspace_files(workspace: Path) -> set[str]:
+    files: set[str] = set()
+    try:
+        for candidate in workspace.rglob("*"):
+            is_junction = getattr(candidate, "is_junction", lambda: False)
+            if candidate.is_symlink() or is_junction():
+                raise ValueError("candidate workspace may not contain links")
+            if candidate.is_dir():
+                continue
+            _regular_file(candidate, "candidate output")
+            files.add(candidate.relative_to(workspace).as_posix())
+    except OSError as error:
+        raise ValueError("candidate workspace cannot be inspected") from error
+    return files
 
 
 def _regular_file(path: Path, name: str) -> None:

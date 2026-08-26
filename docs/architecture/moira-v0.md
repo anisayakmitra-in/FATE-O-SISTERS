@@ -366,6 +366,14 @@ checkpoint change; preventing one requires a read-only mount or equivalent OS
 isolation. The resulting candidate record remains non-authorizing and
 non-promoting.
 
+The first trainer behind that boundary is a bounded PEFT LoRA backend. It binds
+the exact base checkpoint, licensed train and selection data, model surface,
+optimizer settings, and dependency versions. It trains only projection LoRA
+tensors and writes one adapter-only safetensors artifact plus creation,
+selection-evaluation, and metric manifests. Its evaluation is selection data,
+not the sealed promotion holdout. See
+[`lora-candidates.md`](../guides/lora-candidates.md).
+
 Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. The native MOIRA Agent Layer may coordinate these tasks under explicit role leases. External effects require a locally valid single-use permit and, when policy requires it, direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
 
 ## 9. Deployment profiles

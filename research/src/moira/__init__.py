@@ -99,6 +99,14 @@ from .candidate_worker import (
     candidate_worker_contract,
     prepare_candidate_work,
 )
+from .lora_backend import (
+    LORA_BACKEND_PROTOCOL,
+    LORA_DATASET_PROTOCOL,
+    LoraCandidateBackend,
+    LoraDatasetBundle,
+    LoraTrainingConfig,
+    lora_backend_contract,
+)
 from .agent_train import (
     AGENT_ACTION_OBJECTIVE,
     AGENT_TRAJECTORY_SCHEMA_VERSION,
@@ -295,6 +303,12 @@ __all__ = [
     "CandidateWorkerOutput",
     "candidate_worker_contract",
     "prepare_candidate_work",
+    "LORA_BACKEND_PROTOCOL",
+    "LORA_DATASET_PROTOCOL",
+    "LoraCandidateBackend",
+    "LoraDatasetBundle",
+    "LoraTrainingConfig",
+    "lora_backend_contract",
     "AGENT_ACTION_OBJECTIVE",
     "AGENT_TRAJECTORY_SCHEMA_VERSION",
     "AgentActionEvaluation",

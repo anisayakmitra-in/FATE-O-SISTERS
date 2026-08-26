@@ -31,6 +31,8 @@ The Python reference contains:
   score-plus-novelty selection, and non-promoting receipts;
 - a permit-gated candidate-work boundary that replays search evidence, confines
   accepted outputs to staging, enforces resource budgets, and hashes artifacts;
+- a bounded PEFT LoRA candidate backend with content-addressed train and
+  selection data, adapter-only safetensors output, and immutable base checks;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -392,6 +394,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/src/moira/context.py` | Deterministic scoped context admission, budgeting, and receipts |
 | `research/src/moira/candidate_search.py` | Bounded candidate archive and deterministic research selection |
 | `research/src/moira/candidate_worker.py` | One-shot native-agent boundary for staged candidate work |
+| `research/src/moira/lora_backend.py` | Bounded PEFT LoRA candidate trainer and selection evaluator |
 | `research/src/moira/agent_data.py` | Agent trajectory provenance, consent, license, split, and content-manifest gate |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
@@ -403,6 +406,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
 | `docs/guides/candidate-search.md` | Candidate-search contract, selection algorithm, and promotion boundary |
 | `docs/guides/candidate-worker.md` | Permit, staging, budget, artifact, and isolation contract for candidate work |
+| `docs/guides/lora-candidates.md` | LoRA dataset, training, artifact, and evaluation contract |
 | `kaggle/` | Private Kaggle M2 FP32 train-save-resume script |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 
