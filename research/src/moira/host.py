@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import sys
+from typing import TextIO
 import uuid
 
 from .agent import (
@@ -69,8 +71,11 @@ class CallbackHarnessAdapter:
 class StandaloneConsolePort:
     """Minimal terminal port for MOIRA without any surrounding harness."""
 
+    def __init__(self, *, output: TextIO | None = None) -> None:
+        self._output = output if output is not None else sys.stdout
+
     def emit(self, text: str) -> None:
-        print(text)
+        print(text, file=self._output)
 
     def ask(self, question: str) -> str:
         return input(f"{question}\n> ")

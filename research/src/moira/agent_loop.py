@@ -226,6 +226,7 @@ class MoiraAgentRuntime:
                     )
                 )
 
+        self._kernel.close_lease(lease_id)
         return AgentRunResult(
             AgentRunStatus.STEP_BUDGET_EXHAUSTED,
             max_steps,

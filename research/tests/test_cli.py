@@ -1,10 +1,12 @@
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 
 import pytest
@@ -91,6 +93,109 @@ def test_agent_inspect_reports_native_authority_boundary() -> None:
         "hermes-agent",
         "local",
     ]
+
+
+def test_agent_run_ollama_uses_local_structured_api_and_finishes(
+    cli_root: Path,
+) -> None:
+    requests: list[dict[str, object]] = []
+    (cli_root / "evidence.txt").write_text("needle\n", encoding="utf-8")
+
+    class OllamaHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            requests.append(json.loads(self.rfile.read(length)))
+            if len(requests) == 1:
+                action_value = {
+                    "kind": "use_tool",
+                    "text": "",
+                    "tool_id": "workspace.search",
+                    "target": "needle",
+                    "payload_text": "",
+                }
+            else:
+                action_value = {
+                    "kind": "finish",
+                    "text": "The read-only task is complete.",
+                    "tool_id": "",
+                    "target": "",
+                    "payload_text": "",
+                }
+            action = json.dumps(action_value)
+            response = json.dumps({"message": {"content": action}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), OllamaHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = _run_cli(
+            "agent",
+            "run-ollama",
+            "--model",
+            "moira-test:latest",
+            "--task",
+            "Inspect the workspace without changing it.",
+            "--workspace",
+            cli_root,
+            "--base-url",
+            f"http://127.0.0.1:{server.server_port}",
+            "--max-steps",
+            2,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert result.stderr == "The read-only task is complete.\n"
+    assert output["status"] == "completed"
+    assert output["read_only"] is True
+    assert output["model"] == "moira-test:latest"
+    assert output["steps"] == 2
+    assert output["effects"] == 1
+    assert len(output["receipts"]) == 1
+    assert len(requests) == 2
+    assert requests[0]["model"] == "moira-test:latest"
+    assert requests[0]["stream"] is False
+    assert requests[0]["format"]["additionalProperties"] is False
+    second_context = json.loads(requests[1]["messages"][1]["content"])
+    assert second_context["observations"][-1] == {
+        "content": "evidence.txt:1:needle",
+        "kind": "tool_result",
+    }
+
+
+def test_agent_run_ollama_rejects_effect_budget_above_step_budget(
+    cli_root: Path,
+) -> None:
+    result = _run_cli(
+        "agent",
+        "run-ollama",
+        "--model",
+        "moira-test:latest",
+        "--task",
+        "Inspect the workspace.",
+        "--workspace",
+        cli_root,
+        "--max-steps",
+        1,
+        "--max-effects",
+        2,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "max_effects must be between 0 and max_steps" in result.stderr
 
 
 def test_deployment_switch_persists_policy_without_changing_weights(

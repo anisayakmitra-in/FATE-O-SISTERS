@@ -195,6 +195,13 @@ process. Standalone agency therefore consists of the downloaded MOIRA weights
 plus the MOIRA companion runtime. Open-source harnesses may implement the same
 host interface, but they are optional and cannot expand the native policy.
 
+The implemented standalone profile is deliberately read-only. It registers
+`workspace.read` and `workspace.search`, confines paths to an operator-selected
+regular directory, rejects links and parent traversal, bounds files, scanned
+bytes, file counts, matches, action steps, and effects, and sends tool results
+back as untrusted observations. Write, terminal, browser, and network tools are
+not registered in this profile.
+
 ## 6. Parameter accounting
 
 Every artifact reports separate counts:

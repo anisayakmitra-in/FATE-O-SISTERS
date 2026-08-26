@@ -231,6 +231,26 @@ runtime, which connects the Ollama model to the same policy, approval, tool, and
 receipt layer. A third-party harness may host that interface, but none is
 required by MOIRA's architecture.
 
+The first standalone command is executable now. It exposes only bounded file
+reading and literal text search below one selected workspace:
+
+```powershell
+$env:PYTHONPATH = (Resolve-Path "research/src").Path
+$moiraModel = "<published-moira-ollama-tag>"
+python -m moira agent run-ollama `
+  --model $moiraModel `
+  --task "Inspect this repository and summarize its architecture." `
+  --workspace (Resolve-Path ".") `
+  --max-steps 8
+```
+
+Ollama must already be installed, running on `127.0.0.1:11434`, and have the
+named MOIRA artifact pulled. This repository does not yet publish that trained
+artifact. The command refuses remote Ollama URLs, absolute or escaping file
+targets, links, non-registered tools, writes, and terminal execution. See
+[`docs/guides/ollama-agent.md`](docs/guides/ollama-agent.md) for the exact
+runtime contract.
+
 ## Elastic capacity and custom bitplane precision
 
 MOIRA now has a planning contract for one identity that can grow with

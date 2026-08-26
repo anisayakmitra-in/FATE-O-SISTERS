@@ -41,6 +41,7 @@ from .host import (
     HarnessCallbacks,
     StandaloneConsolePort,
 )
+from .local_tools import ReadOnlyWorkspace
 from .ollama import (
     ACTION_SCHEMA,
     DEFAULT_OLLAMA_URL,
@@ -163,6 +164,7 @@ __all__ = [
     "CallbackHarnessAdapter",
     "HarnessCallbacks",
     "StandaloneConsolePort",
+    "ReadOnlyWorkspace",
     "ACTION_SCHEMA",
     "DEFAULT_OLLAMA_URL",
     "OllamaConfig",

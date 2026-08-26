@@ -17,6 +17,7 @@ import tempfile
 import tomllib
 from types import NoneType
 from typing import TypeVar, get_args
+import uuid
 
 import numpy as np
 import torch
@@ -28,7 +29,8 @@ from .checkpoint import (
     verify_checkpoint,
 )
 from .ablation import assert_equal_parameter_surface
-from .agent import agent_contract
+from .agent import AgentPolicy, AgentRole, MoiraAgentKernel, agent_contract
+from .agent_loop import MoiraAgentRuntime
 from .config import (
     DataConfig,
     ModelConfig,
@@ -45,6 +47,9 @@ from .elastic import (
     PrecisionPolicy,
     build_elastic_plan,
 )
+from .host import StandaloneConsolePort
+from .local_tools import ReadOnlyWorkspace
+from .masks import CognitiveMode
 from .model import MoiraModel
 from .m1_train import (
     evaluate_m1_capabilities,
@@ -53,6 +58,7 @@ from .m1_train import (
 )
 from .scale_probe import run_scale_probe
 from .qat import run_moira_qat_smoke
+from .ollama import DEFAULT_OLLAMA_URL, OllamaConfig, OllamaCognition
 from .synthetic import SyntheticStream
 from .train import (
     _build_components,
@@ -111,6 +117,27 @@ def _build_parser() -> argparse.ArgumentParser:
     agent_commands.add_parser(
         "inspect", help="Show roles, orientations, budgets, and authority boundaries."
     )
+    run_ollama = agent_commands.add_parser(
+        "run-ollama",
+        help="Run a read-only native MOIRA agent using local Ollama inference.",
+    )
+    run_ollama.add_argument("--model", required=True)
+    run_ollama.add_argument("--task", required=True)
+    run_ollama.add_argument("--workspace", type=Path, required=True)
+    run_ollama.add_argument(
+        "--mode",
+        choices=tuple(mode.value for mode in CognitiveMode),
+        default=CognitiveMode.LACHESIS.value,
+    )
+    run_ollama.add_argument(
+        "--role",
+        choices=tuple(role.value for role in AgentRole),
+        default=AgentRole.PLANNER.value,
+    )
+    run_ollama.add_argument("--max-steps", type=int, default=8)
+    run_ollama.add_argument("--max-effects", type=int)
+    run_ollama.add_argument("--base-url", default=DEFAULT_OLLAMA_URL)
+    run_ollama.add_argument("--timeout", type=float, default=60.0)
 
     deployment = commands.add_parser(
         "deployment", help="Inspect future deployment profile contracts."
@@ -1059,10 +1086,103 @@ def _evaluate(
     }
 
 
+def _run_ollama_agent(
+    *,
+    model: str,
+    task: str,
+    workspace: Path,
+    mode: str,
+    role: str,
+    max_steps: int,
+    max_effects: int | None,
+    base_url: str,
+    timeout: float,
+) -> dict[str, object]:
+    if (
+        not isinstance(max_steps, int)
+        or isinstance(max_steps, bool)
+        or max_steps <= 0
+        or max_steps > 1_000
+    ):
+        raise ValueError("max_steps must be between 1 and 1000")
+    effective_max_effects = min(4, max_steps) if max_effects is None else max_effects
+    if (
+        not isinstance(effective_max_effects, int)
+        or isinstance(effective_max_effects, bool)
+        or effective_max_effects < 0
+        or effective_max_effects > max_steps
+    ):
+        raise ValueError("max_effects must be between 0 and max_steps")
+
+    selected_mode = CognitiveMode(mode)
+    selected_role = AgentRole(role)
+    local_workspace = ReadOnlyWorkspace(workspace)
+    tools = local_workspace.tools()
+    actions = frozenset(tool.action for tool in tools)
+    kernel = MoiraAgentKernel(
+        AgentPolicy(policy_version=1, allowed_actions=actions),
+    )
+    for tool in tools:
+        kernel.register_tool(tool)
+
+    task_id = f"ollama-task-{uuid.uuid4().hex}"
+    lease_id = f"ollama-lease-{uuid.uuid4().hex}"
+    kernel.open_lease(
+        lease_id=lease_id,
+        task_id=task_id,
+        scope_id=str(local_workspace.root),
+        mode=selected_mode,
+        role=selected_role,
+        max_turns=max_steps,
+        max_effects=effective_max_effects,
+        allowed_actions=tuple(sorted(actions)),
+    )
+    result = MoiraAgentRuntime(kernel).run(
+        lease_id=lease_id,
+        task_id=task_id,
+        task=task,
+        mode=selected_mode,
+        role=selected_role,
+        cognition=OllamaCognition(
+            OllamaConfig(
+                model=model,
+                base_url=base_url,
+                timeout_seconds=timeout,
+            )
+        ),
+        port=StandaloneConsolePort(output=sys.stderr),
+        max_steps=max_steps,
+    )
+    return {
+        "agent_protocol": "moira-agent-protocol-v1",
+        "effects": len(result.receipts),
+        "model": model,
+        "mode": selected_mode.value,
+        "read_only": True,
+        "receipts": [receipt.receipt_id for receipt in result.receipts],
+        "role": selected_role.value,
+        "status": result.status.value,
+        "steps": result.steps,
+        "workspace": str(local_workspace.root),
+    }
+
+
 def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
     if arguments.command == "agent":
         if arguments.agent_command == "inspect":
             return agent_contract()
+        if arguments.agent_command == "run-ollama":
+            return _run_ollama_agent(
+                model=arguments.model,
+                task=arguments.task,
+                workspace=arguments.workspace,
+                mode=arguments.mode,
+                role=arguments.role,
+                max_steps=arguments.max_steps,
+                max_effects=arguments.max_effects,
+                base_url=arguments.base_url,
+                timeout=arguments.timeout,
+            )
         raise ValueError("unknown agent command")
     if arguments.command == "deployment":
         if arguments.deployment_command == "describe":
