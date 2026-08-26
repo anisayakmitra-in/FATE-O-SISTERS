@@ -27,6 +27,8 @@ The Python reference contains:
   turn and effect budgets, request-bound permits, and receipts;
 - deterministic lease-scoped agent context assembly with typed source, trust,
   classification, provenance, expiry, budget, and digest receipts;
+- bounded deterministic candidate search with immutable lineage, failure-evidence,
+  score-plus-novelty selection, and non-promoting receipts;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -386,6 +388,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/src/moira/qat.py` | Master-retained INT3/INT6/INT9/INT27 weight-QAT and continuation checkpoint |
 | `research/src/moira/deployment.py` | Atomic local Consumer/Enterprise profile selection |
 | `research/src/moira/context.py` | Deterministic scoped context admission, budgeting, and receipts |
+| `research/src/moira/candidate_search.py` | Bounded candidate archive and deterministic research selection |
 | `research/src/moira/agent_data.py` | Agent trajectory provenance, consent, license, split, and content-manifest gate |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
@@ -395,6 +398,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `docs/guides/free-compute.md` | Current free compute routes and their limits |
 | `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
 | `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
+| `docs/guides/candidate-search.md` | Candidate-search contract, selection algorithm, and promotion boundary |
 | `kaggle/` | Private Kaggle M2 FP32 train-save-resume script |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 

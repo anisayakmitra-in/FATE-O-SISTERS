@@ -343,6 +343,16 @@ volatile task state
 
 Raw conversations do not trigger immediate gradient updates. Private or changing facts stay in deletable retrieval memory. Stable repeated behavior may produce an adapter dataset after consent and curation. Core training begins only when evaluation shows a capacity problem that memory, tools, and adapters cannot solve.
 
+Candidate search is a bounded research operation below training and promotion.
+It archives content-addressed prompt, adapter, routing, curriculum,
+architecture, or checkpoint candidates; links them to typed failure evidence;
+and selects mutation parents using validation score plus a child-count novelty
+penalty. A seeded selection receipt binds the population, ordering, weights, and
+draws. That receipt can nominate work for a separate trainer, but it cannot
+execute a mutation, authorize an effect, activate weights, or promote a
+checkpoint. Selection validation is reusable search feedback and is not the
+sealed holdout used for promotion.
+
 Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. The native MOIRA Agent Layer may coordinate these tasks under explicit role leases. External effects require a locally valid single-use permit and, when policy requires it, direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
 
 ## 9. Deployment profiles
