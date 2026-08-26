@@ -31,9 +31,11 @@ from .checkpoint import (
 from .ablation import assert_equal_parameter_surface
 from .agent import AgentPolicy, AgentRole, MoiraAgentKernel, agent_contract
 from .agent_loop import MoiraAgentRuntime
+from .agent_data import load_agent_dataset_manifest
 from .agent_train import (
     AGENT_ACTION_OBJECTIVE,
     evaluate_agent_jsonl,
+    load_agent_trajectories,
     train_agent_jsonl,
 )
 from .config import (
@@ -123,6 +125,16 @@ def _build_parser() -> argparse.ArgumentParser:
     agent_commands.add_parser(
         "inspect", help="Show roles, orientations, budgets, and authority boundaries."
     )
+    inspect_agent_data = agent_commands.add_parser(
+        "inspect-data",
+        help="Validate one agent trajectory provenance manifest without training.",
+    )
+    inspect_agent_data.add_argument("--manifest", type=Path, required=True)
+    inspect_agent_data.add_argument(
+        "--split",
+        choices=("train", "evaluation"),
+        required=True,
+    )
     run_ollama = agent_commands.add_parser(
         "run-ollama",
         help="Run a read-only native MOIRA agent using local Ollama inference.",
@@ -164,7 +176,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "train-actions",
         help="Train the proof-scale shared decoder on canonical agent trajectories.",
     )
-    train_actions.add_argument("--path", type=Path, required=True)
+    train_actions.add_argument("--manifest", type=Path, required=True)
     train_actions.add_argument("--checkpoint", type=Path, required=True)
     train_actions.add_argument("--steps", type=int, default=1)
     train_actions.add_argument("--batch-size", type=int, default=1)
@@ -174,8 +186,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "evaluate-actions",
         help="Evaluate a checkpoint on distinct held-out action trajectories.",
     )
-    evaluate_actions.add_argument("--path", type=Path, required=True)
-    evaluate_actions.add_argument("--training-path", type=Path, required=True)
+    evaluate_actions.add_argument("--manifest", type=Path, required=True)
+    evaluate_actions.add_argument("--training-manifest", type=Path, required=True)
     evaluate_actions.add_argument("--checkpoint", type=Path, required=True)
     evaluate_actions.add_argument("--batch-size", type=int, default=1)
     evaluate_actions.add_argument("--max-records", type=int, default=128)
@@ -1239,7 +1251,7 @@ def _run_ollama_agent(
 
 
 def _train_agent_actions(
-    path: Path,
+    manifest: Path,
     checkpoint: Path,
     *,
     steps: int,
@@ -1247,8 +1259,9 @@ def _train_agent_actions(
     device: str,
     resume: bool,
 ) -> dict[str, object]:
+    dataset = load_agent_dataset_manifest(manifest, expected_split="train")
     result = train_agent_jsonl(
-        path,
+        manifest,
         steps=steps,
         batch_size=batch_size,
         device=device,
@@ -1257,9 +1270,13 @@ def _train_agent_actions(
     )
     return {
         "checkpoint": str(checkpoint.resolve()),
+        "dataset_id": dataset.dataset_id,
+        "dataset_manifest_sha256": dataset.manifest_sha256,
+        "dataset_sha256": dataset.trajectory_sha256,
         "final_loss": result.final_loss,
         "model_surface": "agent-smoke",
         "objective": AGENT_ACTION_OBJECTIVE,
+        "provenance_class": dataset.provenance_class,
         "samples": result.samples,
         "steps": result.steps,
         "tokens": result.tokens,
@@ -1268,9 +1285,36 @@ def _train_agent_actions(
     }
 
 
+def _inspect_agent_data(manifest: Path, *, split: str) -> dict[str, object]:
+    dataset = load_agent_dataset_manifest(manifest, expected_split=split)
+    load_agent_trajectories(
+        dataset.trajectory_path,
+        max_records=1,
+        expected_records=dataset.record_count,
+        expected_sha256=dataset.trajectory_sha256,
+    )
+    return {
+        "consent_verified": dataset.consent_verified,
+        "contains_personal_data": dataset.contains_personal_data,
+        "dataset_id": dataset.dataset_id,
+        "deletion_policy": dataset.deletion_policy,
+        "license_verified": dataset.license_verified,
+        "manifest": str(dataset.manifest_path),
+        "manifest_sha256": dataset.manifest_sha256,
+        "provenance_class": dataset.provenance_class,
+        "record_count": dataset.record_count,
+        "redistribution_allowed": dataset.redistribution_allowed,
+        "source_revision": dataset.source_revision,
+        "split": dataset.split,
+        "tenant_scope": dataset.tenant_scope,
+        "trajectory": str(dataset.trajectory_path),
+        "trajectory_sha256": dataset.trajectory_sha256,
+    }
+
+
 def _evaluate_agent_actions(
-    path: Path,
-    training_path: Path,
+    manifest: Path,
+    training_manifest: Path,
     checkpoint: Path,
     *,
     batch_size: int,
@@ -1279,8 +1323,8 @@ def _evaluate_agent_actions(
     device: str,
 ) -> dict[str, object]:
     result = evaluate_agent_jsonl(
-        path,
-        training_path=training_path,
+        manifest,
+        training_manifest_path=training_manifest,
         checkpoint_path=checkpoint,
         batch_size=batch_size,
         max_records=max_records,
@@ -1292,7 +1336,10 @@ def _evaluate_agent_actions(
         "canonical_validity": result.canonical_validity,
         "checkpoint": str(result.checkpoint_path.resolve()),
         "checkpoint_step": result.checkpoint_step,
+        "evaluation_dataset_id": result.evaluation_dataset_id,
         "evaluation_dataset_sha256": result.evaluation_dataset_sha256,
+        "evaluation_manifest_sha256": result.evaluation_manifest_sha256,
+        "evaluation_provenance_class": result.evaluation_provenance_class,
         "exact_action_accuracy": result.exact_action_accuracy,
         "held_out": result.held_out,
         "loss": result.loss,
@@ -1305,7 +1352,10 @@ def _evaluate_agent_actions(
         "tokens": result.tokens,
         "tool_selection_accuracy": result.tool_selection_accuracy,
         "tool_selection_samples": result.tool_selection_samples,
+        "training_dataset_id": result.training_dataset_id,
         "training_dataset_sha256": result.training_dataset_sha256,
+        "training_manifest_sha256": result.training_manifest_sha256,
+        "training_provenance_class": result.training_provenance_class,
         "trainable_parameters": result.trainable_parameters,
         "weights_updated": False,
     }
@@ -1315,6 +1365,11 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
     if arguments.command == "agent":
         if arguments.agent_command == "inspect":
             return agent_contract()
+        if arguments.agent_command == "inspect-data":
+            return _inspect_agent_data(
+                arguments.manifest,
+                split=arguments.split,
+            )
         if arguments.agent_command == "run-ollama":
             return _run_ollama_agent(
                 model=arguments.model,
@@ -1332,7 +1387,7 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
             )
         if arguments.agent_command == "train-actions":
             return _train_agent_actions(
-                arguments.path,
+                arguments.manifest,
                 arguments.checkpoint,
                 steps=arguments.steps,
                 batch_size=arguments.batch_size,
@@ -1341,8 +1396,8 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
             )
         if arguments.agent_command == "evaluate-actions":
             return _evaluate_agent_actions(
-                arguments.path,
-                arguments.training_path,
+                arguments.manifest,
+                arguments.training_manifest,
                 arguments.checkpoint,
                 batch_size=arguments.batch_size,
                 max_records=arguments.max_records,

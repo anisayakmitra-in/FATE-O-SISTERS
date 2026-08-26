@@ -235,23 +235,25 @@ exact-resume, held-out evaluation, and checkpoint contracts:
 
 ```powershell
 python -m moira agent train-actions `
-  --path research/tests/fixtures/agent-trajectories.jsonl `
+  --manifest research/tests/fixtures/agent-trajectories.manifest.json `
   --checkpoint research/runs/agent-actions.pt `
   --steps 1
 
 python -m moira agent evaluate-actions `
-  --path research/tests/fixtures/agent-trajectories-held-out.jsonl `
-  --training-path research/tests/fixtures/agent-trajectories.jsonl `
+  --manifest research/tests/fixtures/agent-trajectories-held-out.manifest.json `
+  --training-manifest research/tests/fixtures/agent-trajectories.manifest.json `
   --checkpoint research/runs/agent-actions.pt `
   --max-records 4
 ```
 
-The evaluator refuses identical files, reused record IDs, and repeated
+Bare action JSONL files cannot enter the CLI. Their exact manifests declare the
+split, source class, content digest, record count, license or consent review,
+tenant scope, personal-data status, redistribution status, and deletion policy.
+The evaluator also refuses identical files, reused record IDs, and repeated
 model-visible prompts. It reports teacher-forced loss and token accuracy plus
 greedy termination, schema, canonical JSON, exact-action, action-kind, and
-tool-selection metrics. The two
-bundled four-record files are deterministic schema fixtures, not useful agent
-training data or a benchmark. See
+tool-selection metrics. The two bundled four-record files are deterministic
+schema fixtures, not useful agent training data or a benchmark. See
 [`docs/guides/agent-action-training.md`](docs/guides/agent-action-training.md).
 
 For an Ollama download, the weights provide cognition and structured action
@@ -367,6 +369,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/src/moira/elastic.py` | Unbounded capacity plans, custom bitplane views, and profile policies |
 | `research/src/moira/qat.py` | Master-retained INT3/INT6/INT9/INT27 weight-QAT and continuation checkpoint |
 | `research/src/moira/deployment.py` | Atomic local Consumer/Enterprise profile selection |
+| `research/src/moira/agent_data.py` | Agent trajectory provenance, consent, license, split, and content-manifest gate |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
 | `research/configs/m1-sources.toml` | M1 dataset, model, and evaluation source catalog |

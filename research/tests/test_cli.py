@@ -14,15 +14,19 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "research" / "configs" / "m0-smoke.toml"
-AGENT_TRAJECTORY_PATH = (
-    REPOSITORY_ROOT / "research" / "tests" / "fixtures" / "agent-trajectories.jsonl"
-)
-AGENT_HELD_OUT_PATH = (
+AGENT_TRAIN_MANIFEST = (
     REPOSITORY_ROOT
     / "research"
     / "tests"
     / "fixtures"
-    / "agent-trajectories-held-out.jsonl"
+    / "agent-trajectories.manifest.json"
+)
+AGENT_HELD_OUT_MANIFEST = (
+    REPOSITORY_ROOT
+    / "research"
+    / "tests"
+    / "fixtures"
+    / "agent-trajectories-held-out.manifest.json"
 )
 
 
@@ -407,8 +411,8 @@ def test_agent_action_training_and_evaluation_cli_are_checkpointed(
         _run_cli(
             "agent",
             "train-actions",
-            "--path",
-            AGENT_TRAJECTORY_PATH,
+            "--manifest",
+            AGENT_TRAIN_MANIFEST,
             "--checkpoint",
             checkpoint,
             "--steps",
@@ -420,10 +424,10 @@ def test_agent_action_training_and_evaluation_cli_are_checkpointed(
         _run_cli(
             "agent",
             "evaluate-actions",
-            "--path",
-            AGENT_HELD_OUT_PATH,
-            "--training-path",
-            AGENT_TRAJECTORY_PATH,
+            "--manifest",
+            AGENT_HELD_OUT_MANIFEST,
+            "--training-manifest",
+            AGENT_TRAIN_MANIFEST,
             "--checkpoint",
             checkpoint,
             "--max-records",
@@ -441,7 +445,13 @@ def test_agent_action_training_and_evaluation_cli_are_checkpointed(
     assert evaluation["objective"] == "moira-agent-action-json-v2"
     assert evaluation["weights_updated"] is False
     assert evaluation["held_out"] is True
-    assert evaluation["training_dataset_sha256"] != evaluation["evaluation_dataset_sha256"]
+    assert evaluation["training_dataset_id"] == "moira-agent-fixture-train-v1"
+    assert evaluation["evaluation_dataset_id"] == (
+        "moira-agent-fixture-evaluation-v1"
+    )
+    assert evaluation["training_manifest_sha256"] != (
+        evaluation["evaluation_manifest_sha256"]
+    )
     assert evaluation["checkpoint_step"] == 1
     assert evaluation["samples"] == 4
     assert 0.0 <= evaluation["token_accuracy"] <= 1.0
@@ -449,6 +459,28 @@ def test_agent_action_training_and_evaluation_cli_are_checkpointed(
     assert 0.0 <= evaluation["exact_action_accuracy"] <= 1.0
     assert evaluation["tool_selection_samples"] == 1
     assert checkpoint.read_bytes() == before_evaluation
+
+
+def test_agent_data_manifest_cli_preflights_without_training() -> None:
+    result = _output_json(
+        _run_cli(
+            "agent",
+            "inspect-data",
+            "--manifest",
+            AGENT_TRAIN_MANIFEST,
+            "--split",
+            "train",
+        )
+    )
+
+    assert result["dataset_id"] == "moira-agent-fixture-train-v1"
+    assert result["split"] == "train"
+    assert result["provenance_class"] == "synthetic"
+    assert result["record_count"] == 4
+    assert result["contains_personal_data"] is False
+    assert result["license_verified"] is False
+    assert result["consent_verified"] is False
+    assert len(result["manifest_sha256"]) == 64
 
 
 def test_deployment_switch_persists_policy_without_changing_weights(

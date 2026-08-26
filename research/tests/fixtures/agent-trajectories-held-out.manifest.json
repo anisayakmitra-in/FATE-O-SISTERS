@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "dataset_id": "moira-agent-fixture-evaluation-v1",
+  "split": "evaluation",
+  "trajectory_file": "agent-trajectories-held-out.jsonl",
+  "trajectory_sha256": "2a5878b73df5319969a19a2382fb073e4f2e345b5c9b81dcd9f3751f57c95310",
+  "record_count": 4,
+  "provenance_class": "synthetic",
+  "source_uri": "synthetic://moira/agent-fixture-evaluation-v1",
+  "source_revision": "fixture-v1",
+  "license": "N/A",
+  "license_url": "N/A",
+  "license_verified": false,
+  "consent_reference": "N/A",
+  "consent_verified": false,
+  "tenant_scope": "public",
+  "contains_personal_data": false,
+  "redistribution_allowed": true,
+  "deletion_policy": "regenerate-from-versioned-fixture"
+}

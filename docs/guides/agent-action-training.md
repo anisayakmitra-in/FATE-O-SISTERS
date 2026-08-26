@@ -4,6 +4,54 @@ MOIRA uses one decoder for language and agent actions. Agent supervision does
 not call a teacher model at runtime and does not add a separate policy head.
 Each example presents bounded task state and trains the next canonical action.
 
+## Dataset provenance manifest
+
+The CLI accepts a JSON manifest, not a bare trajectory file. The manifest and
+trajectory must be regular local files. `trajectory_file` is resolved below the
+manifest directory; absolute paths, parent traversal, symlinks, digest drift,
+and record-count drift fail closed.
+
+```json
+{
+  "schema_version": 1,
+  "dataset_id": "moira-agent-fixture-train-v1",
+  "split": "train",
+  "trajectory_file": "agent-trajectories.jsonl",
+  "trajectory_sha256": "16e5380e4660b809aeebc43ac6c5340cfc1721c9319c959f4deda3bb8fc816fa",
+  "record_count": 4,
+  "provenance_class": "synthetic",
+  "source_uri": "synthetic://moira/agent-fixture-train-v1",
+  "source_revision": "fixture-v1",
+  "license": "N/A",
+  "license_url": "N/A",
+  "license_verified": false,
+  "consent_reference": "N/A",
+  "consent_verified": false,
+  "tenant_scope": "public",
+  "contains_personal_data": false,
+  "redistribution_allowed": true,
+  "deletion_policy": "regenerate-from-versioned-fixture"
+}
+```
+
+Supported provenance classes are `synthetic`, `licensed-public`,
+`owner-consented`, and `enterprise-consented`. Licensed-public manifests need
+an HTTPS source, a named license, an HTTPS license reference, and
+`license_verified: true`. Consented manifests need an owner or tenant URI, a
+non-public scope, a consent reference, and `consent_verified: true`. Personal
+data requires an actionable deletion policy. A review flag records the
+operator's audit assertion; the offline loader cannot authenticate an external
+license or consent system. Raw conversations never become training data merely
+because a manifest can represent consent.
+
+Validate a manifest and its referenced artifact without allocating a model:
+
+```powershell
+python -m moira agent inspect-data `
+  --manifest research/tests/fixtures/agent-trajectories.manifest.json `
+  --split train
+```
+
 ## Trajectory record
 
 The input is JSONL. Every record must contain exactly these fields:
@@ -80,7 +128,7 @@ The bundled fixture contains four synthetic examples, one per action kind:
 
 ```powershell
 python -m moira agent train-actions `
-  --path research/tests/fixtures/agent-trajectories.jsonl `
+  --manifest research/tests/fixtures/agent-trajectories.manifest.json `
   --checkpoint research/runs/agent-actions.pt `
   --steps 1 `
   --batch-size 1 `
@@ -91,7 +139,7 @@ Resume to a later total step:
 
 ```powershell
 python -m moira agent train-actions `
-  --path research/tests/fixtures/agent-trajectories.jsonl `
+  --manifest research/tests/fixtures/agent-trajectories.manifest.json `
   --checkpoint research/runs/agent-actions.pt `
   --steps 4 `
   --batch-size 1 `
@@ -100,16 +148,17 @@ python -m moira agent train-actions `
 ```
 
 `--steps` is the desired total checkpoint step, not the number of additional
-steps. The data file digest, model configuration, tokenizer, sequence length,
-agent protocol, and objective are bound into the checkpoint manifest. A changed
-trajectory file cannot silently resume the old run.
+steps. The semantic provenance-manifest digest, trajectory digest, dataset ID,
+record count, source revision, privacy flags, model configuration, tokenizer,
+sequence length, agent protocol, and objective are bound into the checkpoint.
+A changed manifest or trajectory cannot silently resume the old run.
 
 ## Evaluation
 
 ```powershell
 python -m moira agent evaluate-actions `
-  --path research/tests/fixtures/agent-trajectories-held-out.jsonl `
-  --training-path research/tests/fixtures/agent-trajectories.jsonl `
+  --manifest research/tests/fixtures/agent-trajectories-held-out.manifest.json `
+  --training-manifest research/tests/fixtures/agent-trajectories.manifest.json `
   --checkpoint research/runs/agent-actions.pt `
   --max-records 4 `
   --max-new-tokens 128 `
@@ -117,11 +166,11 @@ python -m moira agent evaluate-actions `
   --device cpu
 ```
 
-`--training-path` reconstructs the exact checkpoint manifest. Its SHA-256 digest
-must differ from the evaluation file digest, so accidentally scoring the
-training file as held out fails before checkpoint inference. The bounded audit
-also rejects reused record IDs and identical model-visible prompts across the
-training and evaluation files.
+`--training-manifest` reconstructs the exact checkpoint lineage. Both its
+semantic manifest digest and trajectory digest must differ from evaluation, so
+accidentally scoring the training data as held out fails before inference. The
+bounded audit also rejects reused record IDs and identical model-visible
+prompts across the two manifested datasets.
 
 Evaluation reports target-only loss and teacher-forced action-token accuracy.
 It also greedily decodes each action under its selected sister orientation and

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,8 +24,14 @@ from moira.masks import CognitiveMode
 
 
 FIXTURE = Path("research/tests/fixtures/agent-trajectories.jsonl")
+TRAIN_MANIFEST = Path(
+    "research/tests/fixtures/agent-trajectories.manifest.json"
+)
 HELD_OUT_FIXTURE = Path(
     "research/tests/fixtures/agent-trajectories-held-out.jsonl"
+)
+HELD_OUT_MANIFEST = Path(
+    "research/tests/fixtures/agent-trajectories-held-out.manifest.json"
 )
 
 
@@ -106,13 +113,13 @@ def test_agent_training_exactly_resumes_and_evaluates_without_mutation() -> None
     try:
         torch.manual_seed(20260826)
         first = train_agent_jsonl(
-            FIXTURE,
+            TRAIN_MANIFEST,
             steps=1,
             checkpoint_path=checkpoint,
             model_config=config,
         )
         resumed = train_agent_jsonl(
-            FIXTURE,
+            TRAIN_MANIFEST,
             steps=4,
             checkpoint_path=checkpoint,
             resume=True,
@@ -120,7 +127,7 @@ def test_agent_training_exactly_resumes_and_evaluates_without_mutation() -> None
         )
         torch.manual_seed(20260826)
         train_agent_jsonl(
-            FIXTURE,
+            TRAIN_MANIFEST,
             steps=4,
             checkpoint_path=uninterrupted,
             model_config=config,
@@ -129,8 +136,8 @@ def test_agent_training_exactly_resumes_and_evaluates_without_mutation() -> None
         uninterrupted_payload = torch.load(uninterrupted, weights_only=True)
         before_evaluation = checkpoint.read_bytes()
         evaluation = evaluate_agent_jsonl(
-            HELD_OUT_FIXTURE,
-            training_path=FIXTURE,
+            HELD_OUT_MANIFEST,
+            training_manifest_path=TRAIN_MANIFEST,
             checkpoint_path=checkpoint,
             max_records=4,
             max_new_tokens=4,
@@ -147,12 +154,34 @@ def test_agent_training_exactly_resumes_and_evaluates_without_mutation() -> None
         assert resumed_payload["manifest"]["action_visibility"] == (
             "bidirectional-source-causal-target-v1"
         )
+        assert resumed_payload["manifest"]["dataset_id"] == (
+            "moira-agent-fixture-train-v1"
+        )
+        dataset_manifest_sha256 = resumed_payload["manifest"][
+            "dataset_manifest_sha256"
+        ]
+        assert len(dataset_manifest_sha256) == 64
+        assert dataset_manifest_sha256 == uninterrupted_payload["manifest"][
+            "dataset_manifest_sha256"
+        ]
+        assert resumed_payload["manifest"]["provenance_class"] == "synthetic"
+        assert resumed_payload["manifest"]["license_verified"] is False
+        assert resumed_payload["manifest"]["consent_verified"] is False
         assert resumed_payload["losses"] == uninterrupted_payload["losses"]
         for name, tensor in resumed_payload["model_state"].items():
             assert torch.equal(tensor, uninterrupted_payload["model_state"][name])
         assert evaluation.samples == 4
         assert evaluation.held_out is True
-        assert evaluation.training_dataset_sha256 != evaluation.evaluation_dataset_sha256
+        assert evaluation.training_dataset_id == "moira-agent-fixture-train-v1"
+        assert evaluation.evaluation_dataset_id == (
+            "moira-agent-fixture-evaluation-v1"
+        )
+        assert evaluation.training_manifest_sha256 != (
+            evaluation.evaluation_manifest_sha256
+        )
+        assert evaluation.training_dataset_sha256 != (
+            evaluation.evaluation_dataset_sha256
+        )
         assert evaluation.tokens > 0
         assert evaluation.loss > 0
         assert 0.0 <= evaluation.token_accuracy <= 1.0
@@ -189,11 +218,11 @@ def test_agent_generation_uses_selected_orientation_and_scores_exact_action() ->
     }
 
 
-def test_agent_evaluation_rejects_training_data_as_held_out() -> None:
-    with pytest.raises(ValueError, match="held out"):
+def test_agent_evaluation_rejects_a_training_manifest_as_evaluation() -> None:
+    with pytest.raises(ValueError, match="wrong split"):
         evaluate_agent_jsonl(
-            FIXTURE,
-            training_path=FIXTURE,
+            TRAIN_MANIFEST,
+            training_manifest_path=TRAIN_MANIFEST,
             checkpoint_path=Path("research/missing-agent-checkpoint.pt"),
             max_records=1,
             max_new_tokens=4,
@@ -202,19 +231,58 @@ def test_agent_evaluation_rejects_training_data_as_held_out() -> None:
 
 def test_agent_evaluation_rejects_rows_copied_from_training() -> None:
     path = Path("research") / f".agent-overlap-{uuid.uuid4().hex}.jsonl"
+    manifest_path = Path("research") / f".agent-overlap-{uuid.uuid4().hex}.json"
     value = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
     try:
-        path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        content = (json.dumps(value) + "\n").encode("utf-8")
+        path.write_bytes(content)
+        manifest = json.loads(HELD_OUT_MANIFEST.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "dataset_id": "moira-agent-overlap-evaluation",
+                "trajectory_file": path.name,
+                "trajectory_sha256": hashlib.sha256(content).hexdigest(),
+                "record_count": 1,
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with pytest.raises(ValueError, match="overlap"):
             evaluate_agent_jsonl(
-                path,
-                training_path=FIXTURE,
+                manifest_path,
+                training_manifest_path=TRAIN_MANIFEST,
                 checkpoint_path=Path("research/missing-agent-checkpoint.pt"),
                 max_records=1,
                 max_new_tokens=4,
             )
     finally:
         path.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+
+
+def test_agent_training_validates_manifested_rows_beyond_the_requested_slice() -> None:
+    identifier = uuid.uuid4().hex
+    path = Path("research") / f".agent-tail-{identifier}.jsonl"
+    manifest_path = Path("research") / f".agent-tail-{identifier}.json"
+    first = FIXTURE.read_text(encoding="utf-8").splitlines()[0]
+    content = f"{first}\n{{not-json}}\n".encode("utf-8")
+    try:
+        path.write_bytes(content)
+        manifest = json.loads(TRAIN_MANIFEST.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "dataset_id": "moira-agent-invalid-tail",
+                "trajectory_file": path.name,
+                "trajectory_sha256": hashlib.sha256(content).hexdigest(),
+                "record_count": 2,
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="invalid agent trajectory JSON"):
+            train_agent_jsonl(manifest_path, steps=1)
+    finally:
+        path.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
 
 
 def test_agent_trajectory_rejects_unavailable_tool_action() -> None:
@@ -239,3 +307,28 @@ def test_agent_trajectory_rejects_unknown_fields() -> None:
             load_agent_trajectories(path, max_records=1)
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_agent_trajectory_rejects_duplicate_json_keys() -> None:
+    path = Path("research") / f".agent-duplicate-{uuid.uuid4().hex}.jsonl"
+    raw = FIXTURE.read_text(encoding="utf-8").splitlines()[0].replace(
+        '"task_id":"task-search",',
+        '"task_id":"task-search","task_id":"other",',
+        1,
+    )
+    try:
+        path.write_text(raw + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="invalid agent trajectory JSON"):
+            load_agent_trajectories(path, max_records=1)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_agent_trajectory_rechecks_manifest_digest_when_consumed() -> None:
+    with pytest.raises(ValueError, match="changed after manifest validation"):
+        load_agent_trajectories(
+            FIXTURE,
+            max_records=1,
+            expected_records=4,
+            expected_sha256="0" * 64,
+        )

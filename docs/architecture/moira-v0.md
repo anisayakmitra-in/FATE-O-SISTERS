@@ -224,6 +224,16 @@ source/causal visibility boundary: prompt positions are bidirectional, while
 action positions can see the prompt and earlier action bytes only. This avoids
 future-action leakage when a Clotho-oriented task learns to act.
 
+Action JSONL is not accepted by the training CLI without an exact local
+provenance manifest. The manifest binds the artifact digest and record count to
+one `train` or `evaluation` split and one source class: synthetic,
+licensed-public, owner-consented, or enterprise-consented. It also records the
+source revision, license and consent review state, tenant scope, personal-data
+status, redistribution status, and deletion policy. Licensed data requires a
+reviewed HTTPS license reference. Consented data requires a reviewed consent
+reference and a non-public owner or tenant scope. These are local audit claims,
+not cryptographic proof that an external grant is genuine.
+
 The objective uses the existing shared token embedding, TSK blocks, Pulse, and
 tied output projection. It does not create a separate policy network, action
 head, or parameter copy, so it preserves the model's parameter ledger and the
@@ -234,11 +244,13 @@ drifting independently.
 The local `agent-smoke` surface has 114,366 trainable parameters and a 768-token
 context. It verifies deterministic batching, target-only masks, optimizer
 updates, bit-exact resume, fail-closed checkpoint manifests, no-update
-evaluation, and all four action kinds. Evaluation requires a dataset digest
-different from training and measures greedy termination, schema validity,
-canonical encoding, exact action, action kind, and tool selection. It does not
-establish autonomous-agent quality. Scaling requires a consented trajectory
-corpus, task-completion and safety evaluations, and then M1/M2/3B runs.
+evaluation, and all four action kinds. The checkpoint binds the semantic
+manifest digest and the trajectory digest. Evaluation requires distinct
+training and evaluation manifests, datasets, record IDs, and model-visible
+prompts, then measures greedy termination, schema validity, canonical encoding,
+exact action, action kind, and tool selection. It does not establish
+autonomous-agent quality. Scaling requires a consented trajectory corpus,
+task-completion and safety evaluations, and then M1/M2/3B runs.
 
 ## 6. Parameter accounting
 

@@ -38,6 +38,12 @@ from .agent_loop import (
     agent_action_to_mapping,
     validate_agent_action,
 )
+from .agent_data import (
+    AGENT_DATASET_MANIFEST_VERSION,
+    MAX_AGENT_DATASET_RECORDS,
+    AgentDatasetManifest,
+    load_agent_dataset_manifest,
+)
 from .agent_train import (
     AGENT_ACTION_OBJECTIVE,
     AGENT_TRAJECTORY_SCHEMA_VERSION,
@@ -181,6 +187,10 @@ __all__ = [
     "agent_action_from_mapping",
     "agent_action_to_mapping",
     "validate_agent_action",
+    "AGENT_DATASET_MANIFEST_VERSION",
+    "MAX_AGENT_DATASET_RECORDS",
+    "AgentDatasetManifest",
+    "load_agent_dataset_manifest",
     "AGENT_ACTION_OBJECTIVE",
     "AGENT_TRAJECTORY_SCHEMA_VERSION",
     "AgentActionEvaluation",

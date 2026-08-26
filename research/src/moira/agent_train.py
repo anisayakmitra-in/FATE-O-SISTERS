@@ -18,6 +18,7 @@ from .agent_loop import (
     agent_action_from_mapping,
     agent_action_to_mapping,
 )
+from .agent_data import AgentDatasetManifest, load_agent_dataset_manifest
 from .config import ModelConfig
 from .dataset import DatasetExample
 from .m1_checkpoint import load_m1_checkpoint
@@ -79,6 +80,12 @@ class AgentActionEvaluation:
     checkpoint_step: int
     checkpoint_path: Path
     trainable_parameters: int
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    training_manifest_sha256: str
+    evaluation_manifest_sha256: str
+    training_provenance_class: str
+    evaluation_provenance_class: str
     training_dataset_sha256: str
     evaluation_dataset_sha256: str
     held_out: bool
@@ -104,11 +111,25 @@ class AgentActionGeneration:
 
 
 def load_agent_trajectories(
-    path: str | Path, *, max_records: int
+    path: str | Path,
+    *,
+    max_records: int,
+    expected_records: int | None = None,
+    expected_sha256: str | None = None,
 ) -> tuple[AgentTrajectory, ...]:
     """Load a bounded exact-schema JSONL trajectory set without network access."""
     if type(max_records) is not int or max_records <= 0:
         raise ValueError("max_records must be a positive integer")
+    if expected_records is not None and (
+        type(expected_records) is not int or expected_records <= 0
+    ):
+        raise ValueError("expected_records must be a positive integer")
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("expected_sha256 must be a lowercase SHA-256 digest")
     source = Path(path)
     try:
         status = source.stat()
@@ -121,16 +142,22 @@ def load_agent_trajectories(
 
     trajectories: list[AgentTrajectory] = []
     identifiers: set[str] = set()
+    record_total = 0
+    digest = hashlib.sha256()
     try:
         with source.open("rb") as handle:
             for line_number, raw_line in enumerate(handle, start=1):
+                digest.update(raw_line)
                 if not raw_line.strip():
                     continue
                 if len(raw_line) > _MAX_TRAJECTORY_RECORD_BYTES:
                     raise ValueError("agent trajectory record exceeds its size budget")
                 try:
-                    value = json.loads(raw_line)
-                except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                    value = json.loads(
+                        raw_line,
+                        object_pairs_hook=_unique_json_object,
+                    )
+                except (UnicodeError, ValueError, RecursionError) as error:
                     raise ValueError(
                         f"invalid agent trajectory JSON at line {line_number}"
                     ) from error
@@ -138,13 +165,23 @@ def load_agent_trajectories(
                 if trajectory.record_id in identifiers:
                     raise ValueError("agent trajectory record IDs must be unique")
                 identifiers.add(trajectory.record_id)
-                trajectories.append(trajectory)
-                if len(trajectories) >= max_records:
+                record_total += 1
+                if len(trajectories) < max_records:
+                    trajectories.append(trajectory)
+                if (
+                    expected_records is None
+                    and expected_sha256 is None
+                    and len(trajectories) >= max_records
+                ):
                     break
     except OSError as error:
         raise ValueError("agent trajectory file could not be read") from error
     if not trajectories:
         raise ValueError("agent trajectory file contains no records")
+    if expected_records is not None and record_total != expected_records:
+        raise ValueError("agent trajectory record count does not match its manifest")
+    if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+        raise ValueError("agent trajectory content changed after manifest validation")
     return tuple(trajectories)
 
 
@@ -199,7 +236,7 @@ def trajectory_examples(
 
 
 def train_agent_jsonl(
-    path: str | Path,
+    manifest_path: str | Path,
     *,
     steps: int = 1,
     batch_size: int = 1,
@@ -208,16 +245,20 @@ def train_agent_jsonl(
     resume: bool = False,
     model_config: ModelConfig | None = None,
 ) -> M1TrainingResult:
-    """Train MOIRA's shared decoder on canonical structured agent actions."""
+    """Train on a provenance-manifested structured-action JSONL dataset."""
     config = model_config or ModelConfig.agent_smoke()
+    dataset = load_agent_dataset_manifest(manifest_path, expected_split="train")
     trajectories = load_agent_trajectories(
-        path, max_records=steps * batch_size
+        dataset.trajectory_path,
+        max_records=steps * batch_size,
+        expected_records=dataset.record_count,
+        expected_sha256=dataset.trajectory_sha256,
     )
     _validate_trajectory_context(trajectories, config)
     examples = trajectory_examples(trajectories)
     return train_causal_examples(
         examples,
-        manifest=_agent_manifest(path, config),
+        manifest=_agent_manifest(dataset, config),
         steps=steps,
         batch_size=batch_size,
         device=device,
@@ -230,9 +271,9 @@ def train_agent_jsonl(
 
 
 def evaluate_agent_jsonl(
-    path: str | Path,
+    manifest_path: str | Path,
     *,
-    training_path: str | Path,
+    training_manifest_path: str | Path,
     checkpoint_path: str | Path,
     batch_size: int = 1,
     max_records: int = 128,
@@ -250,12 +291,27 @@ def evaluate_agent_jsonl(
     if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 256:
         raise ValueError("max_new_tokens must be between 1 and 256")
     config = model_config or ModelConfig.agent_smoke()
-    training_sha256 = _sha256_file(training_path)
-    evaluation_sha256 = _sha256_file(path)
-    if training_sha256 == evaluation_sha256:
+    training_dataset = load_agent_dataset_manifest(
+        training_manifest_path,
+        expected_split="train",
+    )
+    evaluation_dataset = load_agent_dataset_manifest(
+        manifest_path,
+        expected_split="evaluation",
+    )
+    if (
+        training_dataset.manifest_sha256 == evaluation_dataset.manifest_sha256
+        or training_dataset.trajectory_sha256
+        == evaluation_dataset.trajectory_sha256
+    ):
         raise ValueError("agent evaluation data must be held out from training")
-    trajectories = load_agent_trajectories(path, max_records=max_records)
-    _assert_held_out(training_path, trajectories)
+    trajectories = load_agent_trajectories(
+        evaluation_dataset.trajectory_path,
+        max_records=max_records,
+        expected_records=evaluation_dataset.record_count,
+        expected_sha256=evaluation_dataset.trajectory_sha256,
+    )
+    _assert_held_out(training_dataset, trajectories)
     _validate_trajectory_context(trajectories, config)
     examples = trajectory_examples(trajectories, split="evaluation")
     model = MoiraModel(config).to(device=device, dtype=torch.float32)
@@ -265,7 +321,7 @@ def evaluate_agent_jsonl(
         model=model,
         optimizer=optimizer,
         loom=None,
-        expected_manifest=_agent_manifest(training_path, config),
+        expected_manifest=_agent_manifest(training_dataset, config),
     )
     tokenizer = ByteTokenizer()
     weighted_loss = 0.0
@@ -321,8 +377,14 @@ def evaluate_agent_jsonl(
         checkpoint_step=loaded.global_step,
         checkpoint_path=loaded.checkpoint_path,
         trainable_parameters=model.parameter_ledger().total_trainable,
-        training_dataset_sha256=training_sha256,
-        evaluation_dataset_sha256=evaluation_sha256,
+        training_dataset_id=training_dataset.dataset_id,
+        evaluation_dataset_id=evaluation_dataset.dataset_id,
+        training_manifest_sha256=training_dataset.manifest_sha256,
+        evaluation_manifest_sha256=evaluation_dataset.manifest_sha256,
+        training_provenance_class=training_dataset.provenance_class,
+        evaluation_provenance_class=evaluation_dataset.provenance_class,
+        training_dataset_sha256=training_dataset.trajectory_sha256,
+        evaluation_dataset_sha256=evaluation_dataset.trajectory_sha256,
         held_out=True,
         termination_rate=_rate(generations, "terminated"),
         schema_validity=_rate(generations, "schema_valid"),
@@ -437,12 +499,14 @@ def _validate_trajectory_context(
 
 
 def _assert_held_out(
-    training_path: str | Path,
+    training_dataset: AgentDatasetManifest,
     evaluation: tuple[AgentTrajectory, ...],
 ) -> None:
     training = load_agent_trajectories(
-        training_path,
+        training_dataset.trajectory_path,
         max_records=_MAX_HELD_OUT_TRAINING_RECORDS + 1,
+        expected_records=training_dataset.record_count,
+        expected_sha256=training_dataset.trajectory_sha256,
     )
     if len(training) > _MAX_HELD_OUT_TRAINING_RECORDS:
         raise ValueError("agent training file exceeds the held-out audit limit")
@@ -462,7 +526,10 @@ def _assert_held_out(
 def _parse_trajectory(value: object) -> AgentTrajectory:
     if not isinstance(value, Mapping) or set(value) != _TRAJECTORY_FIELDS:
         raise ValueError("agent trajectory fields do not match the exact schema")
-    if value["schema_version"] != AGENT_TRAJECTORY_SCHEMA_VERSION:
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != AGENT_TRAJECTORY_SCHEMA_VERSION
+    ):
         raise ValueError("agent trajectory schema version is invalid")
     record_id = _bounded_text("record_id", value["record_id"], 256)
     task_id = _bounded_text("task_id", value["task_id"], 256)
@@ -523,7 +590,10 @@ def _parse_observation(value: object) -> AgentObservation:
     )
 
 
-def _agent_manifest(path: str | Path, config: ModelConfig) -> dict[str, object]:
+def _agent_manifest(
+    dataset: AgentDatasetManifest,
+    config: ModelConfig,
+) -> dict[str, object]:
     return {
         "model_config": asdict(config),
         "source_id": "moira-agent-trajectories",
@@ -534,19 +604,8 @@ def _agent_manifest(path: str | Path, config: ModelConfig) -> dict[str, object]:
         "action_visibility": "bidirectional-source-causal-target-v1",
         "sequence_length": config.max_seq_len,
         "tokenizer": "utf8-byte-v1",
-        "dataset_sha256": _sha256_file(path),
+        **dataset.checkpoint_fields(),
     }
-
-
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with Path(path).open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as error:
-        raise ValueError("agent trajectory file could not be hashed") from error
-    return digest.hexdigest()
 
 
 def _bounded_text(name: str, value: Any, maximum: int) -> str:
@@ -564,6 +623,15 @@ def _canonical_json(value: object) -> str:
     return json.dumps(
         value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("JSON object keys must be unique")
+        value[key] = item
+    return value
 
 
 __all__ = [
