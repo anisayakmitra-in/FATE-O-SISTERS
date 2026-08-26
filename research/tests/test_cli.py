@@ -31,7 +31,9 @@ def cli_root() -> Iterator[Path]:
         shutil.rmtree(root)
 
 
-def _run_cli(*arguments: object) -> subprocess.CompletedProcess[str]:
+def _run_cli(
+    *arguments: object, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     source_path = str(REPOSITORY_ROOT / "research" / "src")
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -43,6 +45,7 @@ def _run_cli(*arguments: object) -> subprocess.CompletedProcess[str]:
         env=environment,
         capture_output=True,
         text=True,
+        input=input_text,
         timeout=60,
         check=False,
     )
@@ -160,6 +163,8 @@ def test_agent_run_ollama_uses_local_structured_api_and_finishes(
     assert result.stderr == "The read-only task is complete.\n"
     assert output["status"] == "completed"
     assert output["read_only"] is True
+    assert output["profile"] == "read-only"
+    assert output["enabled_tools"] == ["workspace.read", "workspace.search"]
     assert output["model"] == "moira-test:latest"
     assert output["steps"] == 2
     assert output["effects"] == 1
@@ -173,6 +178,171 @@ def test_agent_run_ollama_uses_local_structured_api_and_finishes(
         "content": "evidence.txt:1:needle",
         "kind": "tool_result",
     }
+
+
+def test_agent_run_ollama_requires_exact_approval_for_workspace_write(
+    cli_root: Path,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    class OllamaHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            requests.append(json.loads(self.rfile.read(length)))
+            if len(requests) == 1:
+                action_value = {
+                    "kind": "use_tool",
+                    "text": "",
+                    "tool_id": "workspace.write",
+                    "target": "answer.txt",
+                    "payload_text": "approved content",
+                }
+            else:
+                action_value = {
+                    "kind": "finish",
+                    "text": "Write complete.",
+                    "tool_id": "",
+                    "target": "",
+                    "payload_text": "",
+                }
+            action = json.dumps(action_value)
+            response = json.dumps({"message": {"content": action}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), OllamaHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = _run_cli(
+            "agent",
+            "run-ollama",
+            "--model",
+            "moira-test:latest",
+            "--task",
+            "Write the approved answer.",
+            "--workspace",
+            cli_root,
+            "--base-url",
+            f"http://127.0.0.1:{server.server_port}",
+            "--max-steps",
+            2,
+            "--allow-write",
+            input_text="yes\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["profile"] == "developer"
+    assert output["read_only"] is False
+    assert output["effects"] == 1
+    assert "workspace.write" in output["enabled_tools"]
+    assert (cli_root / "answer.txt").read_text(encoding="utf-8") == (
+        "approved content"
+    )
+    assert "filesystem_write:write" in result.stderr
+    assert "Payload: 16 bytes, sha256:" in result.stderr
+    assert "Approve? [y/N]" in result.stderr
+    second_context = json.loads(requests[1]["messages"][1]["content"])
+    assert second_context["observations"][-1] == {
+        "content": "wrote 16 bytes to answer.txt",
+        "kind": "tool_result",
+    }
+
+
+def test_agent_run_ollama_requires_approval_for_allowlisted_process(
+    cli_root: Path,
+) -> None:
+    requests: list[dict[str, object]] = []
+    command_target = json.dumps(
+        {
+            "command": sys.executable,
+            "args": ["-c", "print('agent-process-ok')"],
+        }
+    )
+
+    class OllamaHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            requests.append(json.loads(self.rfile.read(length)))
+            if len(requests) == 1:
+                action_value = {
+                    "kind": "use_tool",
+                    "text": "",
+                    "tool_id": "process.run",
+                    "target": command_target,
+                    "payload_text": "",
+                }
+            else:
+                action_value = {
+                    "kind": "finish",
+                    "text": "Process complete.",
+                    "tool_id": "",
+                    "target": "",
+                    "payload_text": "",
+                }
+            action = json.dumps(action_value)
+            response = json.dumps({"message": {"content": action}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), OllamaHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = _run_cli(
+            "agent",
+            "run-ollama",
+            "--model",
+            "moira-test:latest",
+            "--task",
+            "Run the approved process.",
+            "--workspace",
+            cli_root,
+            "--base-url",
+            f"http://127.0.0.1:{server.server_port}",
+            "--max-steps",
+            2,
+            "--allow-command",
+            sys.executable,
+            input_text="yes\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["profile"] == "developer"
+    assert output["effects"] == 1
+    assert "process.run" in output["enabled_tools"]
+    assert "process:run" in result.stderr
+    assert "Payload: 0 bytes, sha256:" in result.stderr
+    assert "Request: sha256:" in result.stderr
+    second_context = json.loads(requests[1]["messages"][1]["content"])
+    observation = second_context["observations"][-1]
+    assert observation["kind"] == "tool_result"
+    process_result = json.loads(observation["content"])
+    assert process_result["command"] == sys.executable
+    assert process_result["exit_code"] == 0
+    assert process_result["output"].strip() == "agent-process-ok"
 
 
 def test_agent_run_ollama_rejects_effect_budget_above_step_budget(
@@ -196,6 +366,27 @@ def test_agent_run_ollama_rejects_effect_budget_above_step_budget(
     assert result.returncode == 2
     assert result.stdout == ""
     assert "max_effects must be between 0 and max_steps" in result.stderr
+
+
+def test_agent_run_ollama_rejects_unavailable_allowlisted_command(
+    cli_root: Path,
+) -> None:
+    result = _run_cli(
+        "agent",
+        "run-ollama",
+        "--model",
+        "moira-test:latest",
+        "--task",
+        "Run a command.",
+        "--workspace",
+        cli_root,
+        "--allow-command",
+        "definitely-not-a-real-moira-command",
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "allowlisted command is unavailable" in result.stderr
 
 
 def test_deployment_switch_persists_policy_without_changing_weights(

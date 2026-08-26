@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from moira.local_tools import ReadOnlyWorkspace
+from moira.local_tools import DeveloperWorkspace, ReadOnlyWorkspace
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -81,3 +81,42 @@ def test_workspace_search_caps_returned_matches(workspace_root: Path) -> None:
         b"matches.txt:1:x",
         b"matches.txt:2:x",
     ]
+
+
+def test_developer_workspace_atomically_creates_and_replaces_files(
+    workspace_root: Path,
+) -> None:
+    path = workspace_root / "result.txt"
+    path.write_bytes(b"old")
+    workspace = DeveloperWorkspace(workspace_root)
+
+    assert workspace.write("result.txt", b"new") == b"wrote 3 bytes to result.txt"
+    assert workspace.write("created.txt", b"created") == (
+        b"wrote 7 bytes to created.txt"
+    )
+    assert path.read_bytes() == b"new"
+    assert (workspace_root / "created.txt").read_bytes() == b"created"
+    assert [tool.tool_id for tool in workspace.tools()] == [
+        "workspace.read",
+        "workspace.search",
+        "workspace.write",
+    ]
+    assert not tuple(workspace_root.glob(".moira-write-*.tmp"))
+
+
+@pytest.mark.parametrize("target", ("../outside.txt", ".git/config", "missing/x.txt"))
+def test_developer_workspace_rejects_unsafe_write_targets(
+    workspace_root: Path, target: str
+) -> None:
+    (workspace_root / ".git").mkdir(exist_ok=True)
+    workspace = DeveloperWorkspace(workspace_root)
+
+    with pytest.raises(ValueError):
+        workspace.write(target, b"content")
+
+
+def test_developer_workspace_enforces_write_limit(workspace_root: Path) -> None:
+    workspace = DeveloperWorkspace(workspace_root, write_limit=3)
+
+    with pytest.raises(ValueError, match="write limit"):
+        workspace.write("result.txt", b"four")

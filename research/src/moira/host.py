@@ -78,15 +78,22 @@ class StandaloneConsolePort:
         print(text, file=self._output)
 
     def ask(self, question: str) -> str:
-        return input(f"{question}\n> ")
+        print(f"{question}\n> ", file=self._output, end="", flush=True)
+        return input()
 
     def request_approval(
         self, request: AgentEffectRequest, reason: str
     ) -> OperatorApproval | None:
-        answer = input(
+        print(
             f"MOIRA requests {request.capability}:{request.operation} "
-            f"for {request.target!r}. {reason}. Approve? [y/N]\n> "
+            f"for {request.target!r}. Payload: {request.payload_size} bytes, "
+            f"{request.payload_digest}. Request: {request.request_digest}. "
+            f"{reason}. Approve? [y/N]\n> ",
+            file=self._output,
+            end="",
+            flush=True,
         )
+        answer = input()
         if answer.strip().casefold() not in {"y", "yes"}:
             return None
         return OperatorApproval(

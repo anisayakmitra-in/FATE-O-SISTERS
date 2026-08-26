@@ -49,8 +49,52 @@ The current standalone policy registers two tools:
 
 The selected workspace is resolved before the run. Absolute paths, `..`
 traversal, links and Windows reparse points are rejected. Search does not follow
-linked directories. The runtime does not expose write, delete, shell, browser,
-credential, network, package-management, or model-promotion tools.
+linked directories. This default profile does not expose write, delete, process,
+shell, browser, credential, network, package-management, or model-promotion
+tools.
+
+## Developer profile
+
+Writes and processes are opt-in capabilities. Register them only for a task
+that needs them:
+
+```powershell
+python -m moira agent run-ollama `
+  --model $moiraModel `
+  --task "Make the approved source change and run the focused tests." `
+  --workspace (Resolve-Path ".") `
+  --allow-write `
+  --allow-command git `
+  --allow-command python `
+  --command-timeout 30
+```
+
+`workspace.write` treats `payload_text` as the complete replacement content for
+one file. It has a 1 MiB limit, writes a temporary sibling, flushes it, and uses
+an atomic replace. It may create a file when its parent already exists. It
+rejects escaping paths, links, directories, missing parents, and `.git`.
+
+`process.run` accepts no payload. Its target must be JSON with exactly these
+fields:
+
+```json
+{"command":"git","args":["status","--short"]}
+```
+
+The executable must have been supplied through `--allow-command` before the
+run. MOIRA cannot add commands to that allowlist. Execution uses argv directly,
+never a command shell. The working directory is the selected workspace; stdin
+is closed; the environment is filtered; output defaults to 1 MiB; and timeout
+defaults to 30 seconds.
+
+Allowlisting an interpreter such as Python grants that interpreter's inherent
+capabilities after each exact command is approved. Do that only when the task
+requires it and inspect the displayed argv carefully.
+
+Before either sensitive effect runs, the terminal displays its capability,
+target, payload byte count, payload digest, and full request digest. The
+operator must type `yes`. Declining leaves the effect unexecuted and returns an
+approval-required status.
 
 Each model action consumes one turn. Each tool request consumes one effect,
 including requests denied by policy. The default step budget is eight. The

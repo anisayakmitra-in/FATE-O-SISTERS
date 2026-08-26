@@ -48,7 +48,7 @@ from .elastic import (
     build_elastic_plan,
 )
 from .host import StandaloneConsolePort
-from .local_tools import ReadOnlyWorkspace
+from .local_tools import DeveloperWorkspace, ReadOnlyWorkspace
 from .masks import CognitiveMode
 from .model import MoiraModel
 from .m1_train import (
@@ -59,6 +59,7 @@ from .m1_train import (
 from .scale_probe import run_scale_probe
 from .qat import run_moira_qat_smoke
 from .ollama import DEFAULT_OLLAMA_URL, OllamaConfig, OllamaCognition
+from .process_tools import AllowlistedProcessRunner
 from .synthetic import SyntheticStream
 from .train import (
     _build_components,
@@ -138,6 +139,22 @@ def _build_parser() -> argparse.ArgumentParser:
     run_ollama.add_argument("--max-effects", type=int)
     run_ollama.add_argument("--base-url", default=DEFAULT_OLLAMA_URL)
     run_ollama.add_argument("--timeout", type=float, default=60.0)
+    run_ollama.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Register atomic workspace.write; every request requires approval.",
+    )
+    run_ollama.add_argument(
+        "--allow-command",
+        action="append",
+        default=[],
+        metavar="COMMAND",
+        help=(
+            "Register process.run for this command; repeat to allow more commands. "
+            "Every invocation requires approval."
+        ),
+    )
+    run_ollama.add_argument("--command-timeout", type=float, default=30.0)
 
     deployment = commands.add_parser(
         "deployment", help="Inspect future deployment profile contracts."
@@ -1097,6 +1114,9 @@ def _run_ollama_agent(
     max_effects: int | None,
     base_url: str,
     timeout: float,
+    allow_write: bool,
+    allowed_commands: tuple[str, ...],
+    command_timeout: float,
 ) -> dict[str, object]:
     if (
         not isinstance(max_steps, int)
@@ -1116,11 +1136,32 @@ def _run_ollama_agent(
 
     selected_mode = CognitiveMode(mode)
     selected_role = AgentRole(role)
-    local_workspace = ReadOnlyWorkspace(workspace)
-    tools = local_workspace.tools()
+    local_workspace: ReadOnlyWorkspace
+    if allow_write:
+        local_workspace = DeveloperWorkspace(workspace)
+    else:
+        local_workspace = ReadOnlyWorkspace(workspace)
+    tools = list(local_workspace.tools())
+    if allowed_commands:
+        tools.append(
+            AllowlistedProcessRunner(
+                local_workspace.root,
+                allowed_commands,
+                timeout_seconds=command_timeout,
+            ).tool()
+        )
     actions = frozenset(tool.action for tool in tools)
+    approval_actions = frozenset(
+        action
+        for action in actions
+        if action in {"filesystem_write:write", "process:run"}
+    )
     kernel = MoiraAgentKernel(
-        AgentPolicy(policy_version=1, allowed_actions=actions),
+        AgentPolicy(
+            policy_version=1,
+            allowed_actions=actions,
+            approval_actions=approval_actions,
+        ),
     )
     for tool in tools:
         kernel.register_tool(tool)
@@ -1156,9 +1197,11 @@ def _run_ollama_agent(
     return {
         "agent_protocol": "moira-agent-protocol-v1",
         "effects": len(result.receipts),
+        "enabled_tools": [tool.tool_id for tool in tools],
         "model": model,
         "mode": selected_mode.value,
-        "read_only": True,
+        "profile": "developer" if approval_actions else "read-only",
+        "read_only": not approval_actions,
         "receipts": [receipt.receipt_id for receipt in result.receipts],
         "role": selected_role.value,
         "status": result.status.value,
@@ -1182,6 +1225,9 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 max_effects=arguments.max_effects,
                 base_url=arguments.base_url,
                 timeout=arguments.timeout,
+                allow_write=arguments.allow_write,
+                allowed_commands=tuple(arguments.allow_command),
+                command_timeout=arguments.command_timeout,
             )
         raise ValueError("unknown agent command")
     if arguments.command == "deployment":

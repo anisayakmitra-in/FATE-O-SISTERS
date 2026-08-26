@@ -41,7 +41,7 @@ from .host import (
     HarnessCallbacks,
     StandaloneConsolePort,
 )
-from .local_tools import ReadOnlyWorkspace
+from .local_tools import DeveloperWorkspace, ReadOnlyWorkspace
 from .ollama import (
     ACTION_SCHEMA,
     DEFAULT_OLLAMA_URL,
@@ -50,6 +50,7 @@ from .ollama import (
     ollama_action_request,
     parse_ollama_action,
 )
+from .process_tools import AllowlistedProcessRunner
 from .ablation import (
     AblationResult,
     assert_equal_parameter_surface,
@@ -164,6 +165,7 @@ __all__ = [
     "CallbackHarnessAdapter",
     "HarnessCallbacks",
     "StandaloneConsolePort",
+    "DeveloperWorkspace",
     "ReadOnlyWorkspace",
     "ACTION_SCHEMA",
     "DEFAULT_OLLAMA_URL",
@@ -171,6 +173,7 @@ __all__ = [
     "OllamaCognition",
     "ollama_action_request",
     "parse_ollama_action",
+    "AllowlistedProcessRunner",
     "ModelConfig",
     "AblationResult",
     "equal_parameter_ablation_report",

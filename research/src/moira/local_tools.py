@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import stat
+import tempfile
 
 from .agent import MoiraTool
 
@@ -13,6 +14,7 @@ _DEFAULT_READ_LIMIT = 1024 * 1024
 _DEFAULT_SEARCH_BYTE_LIMIT = 16 * 1024 * 1024
 _DEFAULT_SEARCH_FILE_LIMIT = 2_000
 _DEFAULT_SEARCH_MATCH_LIMIT = 200
+_DEFAULT_WRITE_LIMIT = 1024 * 1024
 
 
 class ReadOnlyWorkspace:
@@ -129,16 +131,7 @@ class ReadOnlyWorkspace:
         return "\n".join(matches).encode("utf-8")
 
     def _regular_file(self, target: str) -> Path:
-        if (
-            not isinstance(target, str)
-            or not target
-            or "\x00" in target
-            or len(target.encode("utf-8")) > 4_096
-        ):
-            raise ValueError("workspace target must be a bounded relative path")
-        relative = Path(target)
-        if relative.is_absolute() or relative.anchor or ".." in relative.parts:
-            raise ValueError("workspace target must stay below the selected root")
+        relative = _relative_target(target)
         candidate = self.root.joinpath(relative)
         current = self.root
         for part in relative.parts:
@@ -155,6 +148,87 @@ class ReadOnlyWorkspace:
         return resolved
 
 
+class DeveloperWorkspace(ReadOnlyWorkspace):
+    """Read-only tools plus an approval-gated atomic write primitive."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        write_limit: int = _DEFAULT_WRITE_LIMIT,
+        **limits: int,
+    ) -> None:
+        super().__init__(root, **limits)
+        self.write_limit = _positive_limit("write_limit", write_limit)
+
+    def tools(self) -> tuple[MoiraTool, MoiraTool, MoiraTool]:
+        return (
+            *super().tools(),
+            MoiraTool(
+                tool_id="workspace.write",
+                capability="filesystem_write",
+                operation="write",
+                target_kind="workspace-relative-path",
+                handler=self.write,
+                description=(
+                    "Atomically replace or create one regular file below the "
+                    "workspace. Payload is the complete new file content. Requires "
+                    "exact operator approval."
+                ),
+            ),
+        )
+
+    def write(self, target: str, payload: bytes) -> bytes:
+        if not isinstance(payload, bytes) or len(payload) > self.write_limit:
+            raise ValueError("workspace write exceeds the write limit")
+        path = self._write_target(target)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=".moira-write-",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        relative = path.relative_to(self.root).as_posix()
+        return f"wrote {len(payload)} bytes to {relative}".encode("utf-8")
+
+    def _write_target(self, target: str) -> Path:
+        relative = _relative_target(target)
+        if relative.parts[0].casefold() == ".git":
+            raise ValueError("workspace writes cannot target Git metadata")
+        parent_relative = Path(*relative.parts[:-1])
+        parent = self.root.joinpath(parent_relative)
+        current = self.root
+        for part in parent_relative.parts:
+            current = current / part
+            if _is_reparse_point(current):
+                raise ValueError("workspace target cannot traverse a link")
+        try:
+            resolved_parent = parent.resolve(strict=True)
+            resolved_parent.relative_to(self.root)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError("workspace write parent is unavailable") from error
+        if not resolved_parent.is_dir():
+            raise ValueError("workspace write parent must be a directory")
+        path = resolved_parent / relative.name
+        if _is_reparse_point(path):
+            raise ValueError("workspace write target cannot be a link")
+        if path.exists() and not path.is_file():
+            raise ValueError("workspace write target must be a regular file")
+        return path
+
+
 def _validate_root(root: Path) -> Path:
     try:
         if _is_reparse_point(root):
@@ -165,6 +239,25 @@ def _validate_root(root: Path) -> Path:
     if not resolved.is_dir():
         raise ValueError("workspace root must be a directory")
     return resolved
+
+
+def _relative_target(target: str) -> Path:
+    if (
+        not isinstance(target, str)
+        or not target
+        or "\x00" in target
+        or len(target.encode("utf-8")) > 4_096
+    ):
+        raise ValueError("workspace target must be a bounded relative path")
+    relative = Path(target)
+    if (
+        relative.is_absolute()
+        or relative.anchor
+        or ".." in relative.parts
+        or relative.name in {"", ".", ".."}
+    ):
+        raise ValueError("workspace target must stay below the selected root")
+    return relative
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -188,4 +281,4 @@ def _require_empty_payload(payload: bytes) -> None:
         raise ValueError("read-only workspace tools do not accept a payload")
 
 
-__all__ = ["ReadOnlyWorkspace"]
+__all__ = ["DeveloperWorkspace", "ReadOnlyWorkspace"]

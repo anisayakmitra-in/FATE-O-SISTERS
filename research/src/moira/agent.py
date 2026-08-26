@@ -64,6 +64,7 @@ class AgentEffectRequest:
     target: str
     payload_digest: str
     request_digest: str
+    payload_size: int = 0
 
     def authorization_payload(self) -> dict[str, object]:
         return {
@@ -78,6 +79,7 @@ class AgentEffectRequest:
             "target_kind": self.target_kind,
             "target": self.target,
             "payload_digest": self.payload_digest,
+            "payload_size": self.payload_size,
         }
 
 
@@ -751,6 +753,16 @@ def agent_contract() -> dict[str, object]:
         "effects_require_registered_tools": True,
         "model_can_authorize_its_own_effects": False,
         "effect_receipt_required": True,
+        "standalone_profiles": {
+            "read-only": ["workspace.read", "workspace.search"],
+            "developer": [
+                "workspace.read",
+                "workspace.search",
+                "workspace.write",
+                "process.run",
+            ],
+        },
+        "developer_effects_require_operator_approval": True,
     }
 
 
@@ -776,6 +788,7 @@ def _effect_request(
         "target_kind": target_kind,
         "target": target,
         "payload_digest": payload_digest,
+        "payload_size": len(payload),
     }
     request_digest = _digest("moira-agent-request-v1", _canonical_bytes(fields))
     return AgentEffectRequest(
@@ -790,6 +803,7 @@ def _effect_request(
         target=target,
         payload_digest=payload_digest,
         request_digest=request_digest,
+        payload_size=len(payload),
     )
 
 

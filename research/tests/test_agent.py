@@ -92,6 +92,10 @@ def test_allowed_effect_requires_exact_agent_permit_and_does_not_execute() -> No
 
     assert len(gateway.requests) == 1
     assert outcome.authorized is not None
+    assert outcome.request.payload_size == len(b'{"limit":4096}')
+    assert outcome.request.authorization_payload()["payload_size"] == len(
+        b'{"limit":4096}'
+    )
     assert outcome.authorized.permit_id == "permit-1"
     assert outcome.authorized.request == gateway.requests[0]
     assert not hasattr(layer, "execute")
@@ -286,6 +290,13 @@ def test_agent_contract_keeps_authority_outside_the_model() -> None:
     assert contract["external_agent_runtime_required"] is False
     assert contract["external_model_required_for_agent_loop"] is False
     assert contract["model_can_authorize_its_own_effects"] is False
+    assert contract["developer_effects_require_operator_approval"] is True
+    assert contract["standalone_profiles"]["developer"] == [
+        "workspace.read",
+        "workspace.search",
+        "workspace.write",
+        "process.run",
+    ]
     assert contract["internal_control_components"] == [
         "RoleScheduler",
         "PolicyEngine",

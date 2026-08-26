@@ -247,7 +247,23 @@ python -m moira agent run-ollama `
 Ollama must already be installed, running on `127.0.0.1:11434`, and have the
 named MOIRA artifact pulled. This repository does not yet publish that trained
 artifact. The command refuses remote Ollama URLs, absolute or escaping file
-targets, links, non-registered tools, writes, and terminal execution. See
+targets, links, and non-registered tools. By default it also refuses writes and
+process execution. An explicit developer profile can add atomic writes and
+predeclared commands:
+
+```powershell
+python -m moira agent run-ollama `
+  --model $moiraModel `
+  --task "Update the approved file and run its tests." `
+  --workspace (Resolve-Path ".") `
+  --allow-write `
+  --allow-command git `
+  --allow-command python
+```
+
+Every write and every individual command remains paused until the operator
+approves its exact request digest. Commands receive an argv array directly;
+there is no shell interpolation. See
 [`docs/guides/ollama-agent.md`](docs/guides/ollama-agent.md) for the exact
 runtime contract.
 
