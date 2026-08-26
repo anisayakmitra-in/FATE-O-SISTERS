@@ -25,6 +25,8 @@ The Python reference contains:
 - checkpointed capability-prefix training, resume, and no-update held-out evaluation;
 - a native model-level agent layer with per-task role leases, registered tools,
   turn and effect budgets, request-bound permits, and receipts;
+- deterministic lease-scoped agent context assembly with typed source, trust,
+  classification, provenance, expiry, budget, and digest receipts;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -224,6 +226,20 @@ can speak without being prompted again, ask the user a necessary question,
 select a registered tool, consume its observation, and finish within a step
 budget.
 
+Every turn now passes through `moira-context-v1`. The runtime converts the task
+and prior observations into labelled fragments, admits only public or
+active-lease-scoped material below the selected classification boundary,
+rejects expired or ambiguous inputs, deduplicates only exact label-aware
+evidence, and applies a conservative UTF-8 byte-token content budget. Required
+task context fails closed; optional material that does not fit is recorded as
+dropped rather than silently truncated. The receipt digest binds the selected
+order, source, trust, classification, scope, assembly time, provenance, and
+content digests. External priority is capped below runtime observations, and
+the newest operational observation is required on its next turn.
+External memory and retrieval remain untrusted until a verified memory store
+and admission path exist.
+See [`docs/guides/agent-context.md`](docs/guides/agent-context.md).
+
 MOIRA now also has a native trainable action objective. It teaches the shared
 decoder to emit the same exact `speak`, `ask_user`, `use_tool`, and `finish`
 objects consumed by the runtime. Each row keeps its selected sister mode
@@ -369,6 +385,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/src/moira/elastic.py` | Unbounded capacity plans, custom bitplane views, and profile policies |
 | `research/src/moira/qat.py` | Master-retained INT3/INT6/INT9/INT27 weight-QAT and continuation checkpoint |
 | `research/src/moira/deployment.py` | Atomic local Consumer/Enterprise profile selection |
+| `research/src/moira/context.py` | Deterministic scoped context admission, budgeting, and receipts |
 | `research/src/moira/agent_data.py` | Agent trajectory provenance, consent, license, split, and content-manifest gate |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |

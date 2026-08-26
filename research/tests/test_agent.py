@@ -289,6 +289,14 @@ def test_agent_contract_keeps_authority_outside_the_model() -> None:
     assert contract["agent_layer_scope"] == "shared-across-task-selected-sisters"
     assert contract["external_agent_runtime_required"] is False
     assert contract["external_model_required_for_agent_loop"] is False
+    assert contract["context_protocol"] == "moira-context-v1"
+    assert contract["context_scope_bound_to_lease"] is True
+    assert contract["context_receipt_binds_labels_and_content"] is True
+    assert contract["context_full_request_preflight_implemented"] is False
+    assert contract["context_external_priority_ceiling"] == 60
+    assert contract["context_latest_observation_required"] is True
+    assert contract["context_persistence_implemented"] is False
+    assert contract["context_compression_implemented"] is False
     assert contract["model_can_authorize_its_own_effects"] is False
     assert contract["developer_effects_require_operator_approval"] is True
     assert contract["standalone_profiles"]["developer"] == [
@@ -299,6 +307,7 @@ def test_agent_contract_keeps_authority_outside_the_model() -> None:
     ]
     assert contract["internal_control_components"] == [
         "RoleScheduler",
+        "ContextAssembler",
         "PolicyEngine",
         "ReferenceMonitor",
         "ToolRegistry",

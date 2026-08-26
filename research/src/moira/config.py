@@ -79,7 +79,7 @@ class ModelConfig:
             spool_rank=8,
             knot_slots=8,
             capsule_width=16,
-            max_seq_len=768,
+            max_seq_len=2_048,
         )
 
     @classmethod

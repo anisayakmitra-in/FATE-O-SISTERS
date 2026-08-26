@@ -173,6 +173,7 @@ The executable `moira-agent-protocol-v1` path follows this sequence:
 ```text
 MOIRA cognition
 -> task-selected orientation and role lease
+-> lease-scoped moira-context-v1 assembly
 -> digest-bound effect request
 -> local policy and optional operator approval
 -> single-use request-bound permit
@@ -189,6 +190,38 @@ it. Request attempts consume the lease effect budget even when denied.
 The trace stores ordered event kinds and domain-separated SHA-256 digests. It
 does not store raw proposal or effect payload text. Tool output is bounded and
 returned to cognition as untrusted observation data, not as policy.
+
+Each cognition turn receives a `moira-context-v1` assembly rather than an
+unbounded raw observation list. The task is a required private fragment bound
+to the lease scope. User replies, model speech, runtime decisions, and tool
+results receive distinct source and trust labels. Optional callers may add only
+user, memory, or retrieval fragments; they cannot claim runtime, task, model,
+or tool provenance, cannot mark data trusted, and cannot make their fragments
+required. Their priority is capped at 60. Runtime observations use priority 80,
+and the newest observation is required at priority 90 on its next turn, so
+optional caller data cannot crowd out the current operational result. Trusted
+memory admission remains unavailable until a verified memory store exists.
+
+Admission accepts public fragments or fragments whose scope exactly matches
+the active lease. It rejects expired material and classifications above the
+runtime boundary, orders required and higher-priority evidence
+deterministically, and deduplicates only when content and its source, trust,
+classification, scope, and provenance are identical. Different provenance or
+trust labels are preserved even when their text matches. Required material
+that is inadmissible or over budget fails the turn. Optional over-budget
+material is dropped without truncation.
+
+The assembly receipt contains included fragment IDs and full labelled-fragment
+digests, typed drop reasons, the scope, boundary, assembly time, budget, and
+tokens used. Its domain-separated SHA-256 digest binds the ordering and
+decisions without copying raw content into the receipt. An injected clock is
+read on every turn, so expiry changes during a run are effective. The current
+budget is the conservative UTF-8 byte-token cost of fragment content.
+Tool-catalog, JSON metadata, system
+instructions, and receipt serialization still consume additional model
+context and need a later whole-request preflight. Context caching, semantic
+compression, persistence, recovery, and external memory storage are not yet
+implemented.
 
 An Ollama model artifact supplies weights and inference, not an operating-system
 process. Standalone agency therefore consists of the downloaded MOIRA weights
@@ -213,10 +246,12 @@ network tools remain unregistered.
 ### 5.2 Native action objective
 
 The runtime action schema is also a decoder training language. Each trajectory
-contains task identity, task text, orientation, temporary role, the registered
-tool catalog, prior observations, and exactly one next action. The model-visible
-prompt excludes the target action. Only the canonical action bytes and EOS
-receive causal loss.
+contains task and scope identity, turn and maximum-step state, task text,
+orientation, temporary role, the registered tool catalog, prior observations,
+and exactly one next action. Training converts the task and observations into
+the same `moira-context-v1` entries and receipt used by native Ollama inference.
+The model-visible prompt excludes the target action. Only the canonical action
+bytes and EOS receive causal loss.
 
 The selected Clotho, Lachesis, or Atropos embedding remains active for each
 trajectory. Structured action supervision separately uses a Lachesis-style
@@ -241,8 +276,8 @@ same 3B-family scale axis. At inference, the exact parser used for Ollama also
 validates training targets, preventing the data and runtime schemas from
 drifting independently.
 
-The local `agent-smoke` surface has 114,366 trainable parameters and a 768-token
-context. It verifies deterministic batching, target-only masks, optimizer
+The local `agent-smoke` surface has 114,366 trainable parameters and a
+2,048-token context. It verifies deterministic batching, target-only masks, optimizer
 updates, bit-exact resume, fail-closed checkpoint manifests, no-update
 evaluation, and all four action kinds. The checkpoint binds the semantic
 manifest digest and the trajectory digest. Evaluation requires distinct

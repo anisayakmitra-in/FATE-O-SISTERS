@@ -3,7 +3,7 @@
   "dataset_id": "moira-agent-fixture-evaluation-v1",
   "split": "evaluation",
   "trajectory_file": "agent-trajectories-held-out.jsonl",
-  "trajectory_sha256": "2a5878b73df5319969a19a2382fb073e4f2e345b5c9b81dcd9f3751f57c95310",
+  "trajectory_sha256": "94b66fb5094c2929f3bad74bc5e383cb80752eed0f112dd5940d5a24c3c9dc30",
   "record_count": 4,
   "provenance_class": "synthetic",
   "source_uri": "synthetic://moira/agent-fixture-evaluation-v1",

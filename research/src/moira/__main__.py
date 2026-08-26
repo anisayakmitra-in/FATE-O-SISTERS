@@ -14,6 +14,7 @@ import platform
 import stat
 import sys
 import tempfile
+import time
 import tomllib
 from types import NoneType
 from typing import TypeVar, get_args
@@ -1233,6 +1234,7 @@ def _run_ollama_agent(
         ),
         port=StandaloneConsolePort(output=sys.stderr),
         max_steps=max_steps,
+        context_clock=lambda: int(time.time()),
     )
     return {
         "agent_protocol": "moira-agent-protocol-v1",

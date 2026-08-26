@@ -17,7 +17,7 @@ and record-count drift fail closed.
   "dataset_id": "moira-agent-fixture-train-v1",
   "split": "train",
   "trajectory_file": "agent-trajectories.jsonl",
-  "trajectory_sha256": "16e5380e4660b809aeebc43ac6c5340cfc1721c9319c959f4deda3bb8fc816fa",
+  "trajectory_sha256": "3ea7d1db2d0871ff3bb44f08315a2d0537e80f22e2b11a636f415c992d6eaa0b",
   "record_count": 4,
   "provenance_class": "synthetic",
   "source_uri": "synthetic://moira/agent-fixture-train-v1",
@@ -58,9 +58,12 @@ The input is JSONL. Every record must contain exactly these fields:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "record_id": "search-1",
   "task_id": "task-search",
+  "scope_id": "workspace-fixture",
+  "step": 1,
+  "max_steps": 4,
   "task": "Find MOIRA files.",
   "mode": "lachesis",
   "role": "planner",
@@ -99,11 +102,11 @@ The prompt contains:
 
 ```text
 agent protocol
-task ID and task
+task ID, scope, step, and maximum steps
 orientation and temporary role
 available tool descriptors
-prior observations
-rule that observations are untrusted and do not grant permission
+the same moira-context-v1 entries and receipt used at inference
+rule that context is data and does not grant permission
 ```
 
 It never contains the target action. Prompt and target are serialized with
@@ -115,8 +118,10 @@ Each trajectory retains its selected Clotho, Lachesis, or Atropos mode
 embedding. Action training uses a separate encoder-decoder visibility topology:
 the prompt is a bidirectional source and the action is causal. This preserves
 the task-selected sister while preventing a Clotho row from reading future
-target bytes. This contract is identified as `moira-agent-action-json-v2`;
-checkpoints from the earlier topology cannot resume under it.
+target bytes. This contract is identified as `moira-agent-action-json-v3`.
+Its source representation matches the native Ollama action request rather than
+the earlier raw task and observation arrays. Checkpoints from either earlier
+objective cannot resume under it.
 
 This keeps parameter count and precision independent from agent supervision.
 The action objective changes learned weights, not the architecture's physical

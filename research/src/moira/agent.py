@@ -16,10 +16,12 @@ import json
 import secrets
 from typing import Callable, Protocol
 
+from .context import CONTEXT_PROTOCOL, MAX_CONTEXT_TOKENS
 from .masks import CognitiveMode
 
 
 AGENT_PROTOCOL = "moira-agent-protocol-v1"
+MAX_EXTERNAL_CONTEXT_PRIORITY = 60
 CONTROL_KERNEL = "moira-agent-kernel-v1"
 _MAX_EFFECT_PAYLOAD_BYTES = 16 * 1024 * 1024
 _MAX_TOOL_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -213,6 +215,10 @@ class MoiraAgentControl:
         state.turns_used += 1
         self._append_trace("turn_recorded", lease_id, proposal.encode("utf-8"))
         return state.turns_used
+
+    def lease(self, lease_id: str) -> AgentLease:
+        """Return the exact active lease bound to one runtime invocation."""
+        return self._active_lease(lease_id).lease
 
     def request_effect(
         self,
@@ -621,6 +627,9 @@ class MoiraAgentKernel:
     def record_turn(self, lease_id: str, proposal: str) -> int:
         return self._layer.record_turn(lease_id, proposal)
 
+    def lease(self, lease_id: str) -> AgentLease:
+        return self._layer.lease(lease_id)
+
     def request_effect(
         self,
         lease_id: str,
@@ -731,6 +740,15 @@ def agent_contract() -> dict[str, object]:
         "external_agent_runtime_required": False,
         "external_model_required_for_agent_loop": False,
         "agent_protocol": AGENT_PROTOCOL,
+        "context_protocol": CONTEXT_PROTOCOL,
+        "context_scope_bound_to_lease": True,
+        "context_receipt_binds_labels_and_content": True,
+        "context_content_token_budget_maximum": MAX_CONTEXT_TOKENS,
+        "context_full_request_preflight_implemented": False,
+        "context_external_priority_ceiling": MAX_EXTERNAL_CONTEXT_PRIORITY,
+        "context_latest_observation_required": True,
+        "context_persistence_implemented": False,
+        "context_compression_implemented": False,
         "orientations": [mode.value for mode in CognitiveMode],
         "roles": [role.value for role in AgentRole],
         "any_orientation_can_hold_any_role": True,
@@ -738,6 +756,7 @@ def agent_contract() -> dict[str, object]:
         "request_digest_binding": True,
         "internal_control_components": [
             "RoleScheduler",
+            "ContextAssembler",
             "PolicyEngine",
             "ReferenceMonitor",
             "ToolRegistry",
@@ -902,6 +921,7 @@ def _decision_dict(decision: AgentDecision) -> dict[str, object]:
 
 __all__ = [
     "AGENT_PROTOCOL",
+    "MAX_EXTERNAL_CONTEXT_PRIORITY",
     "CONTROL_KERNEL",
     "AgentLease",
     "AgentPolicy",

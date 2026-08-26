@@ -71,6 +71,19 @@ def _output_json(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
     return json.loads(result.stdout)
 
 
+def _tool_context_entry(request: dict[str, object]) -> dict[str, object]:
+    context = json.loads(request["messages"][1]["content"])
+    entries = [item for item in context["context"] if item["source"] == "tool"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["trust"] == "untrusted"
+    assert entry["provenance"] == "moira-agent-observation-v1:tool_result"
+    receipt = context["context_receipt"]
+    assert entry["fragment_id"] in receipt["included_ids"]
+    assert entry["fragment_digest"] in receipt["included_digests"]
+    return entry
+
+
 @pytest.mark.parametrize("profile", ("consumer", "enterprise"))
 def test_deployment_descriptions_are_read_only_and_keep_one_identity(
     profile: str,
@@ -103,6 +116,10 @@ def test_agent_inspect_reports_native_authority_boundary() -> None:
     assert output["whole_model_agentic"] is True
     assert output["agent_layer_scope"] == "shared-across-task-selected-sisters"
     assert output["external_agent_runtime_required"] is False
+    assert output["context_protocol"] == "moira-context-v1"
+    assert output["context_scope_bound_to_lease"] is True
+    assert output["context_receipt_binds_labels_and_content"] is True
+    assert output["context_persistence_implemented"] is False
     assert output["model_can_authorize_its_own_effects"] is False
     assert output["optional_hosts"] == [
         "codex",
@@ -187,11 +204,8 @@ def test_agent_run_ollama_uses_local_structured_api_and_finishes(
     assert requests[0]["model"] == "moira-test:latest"
     assert requests[0]["stream"] is False
     assert requests[0]["format"]["additionalProperties"] is False
-    second_context = json.loads(requests[1]["messages"][1]["content"])
-    assert second_context["observations"][-1] == {
-        "content": "evidence.txt:1:needle",
-        "kind": "tool_result",
-    }
+    tool_context = _tool_context_entry(requests[1])
+    assert tool_context["content"] == "evidence.txt:1:needle"
 
 
 def test_agent_run_ollama_requires_exact_approval_for_workspace_write(
@@ -267,11 +281,8 @@ def test_agent_run_ollama_requires_exact_approval_for_workspace_write(
     assert "filesystem_write:write" in result.stderr
     assert "Payload: 16 bytes, sha256:" in result.stderr
     assert "Approve? [y/N]" in result.stderr
-    second_context = json.loads(requests[1]["messages"][1]["content"])
-    assert second_context["observations"][-1] == {
-        "content": "wrote 16 bytes to answer.txt",
-        "kind": "tool_result",
-    }
+    tool_context = _tool_context_entry(requests[1])
+    assert tool_context["content"] == "wrote 16 bytes to answer.txt"
 
 
 def test_agent_run_ollama_requires_approval_for_allowlisted_process(
@@ -350,10 +361,8 @@ def test_agent_run_ollama_requires_approval_for_allowlisted_process(
     assert "process:run" in result.stderr
     assert "Payload: 0 bytes, sha256:" in result.stderr
     assert "Request: sha256:" in result.stderr
-    second_context = json.loads(requests[1]["messages"][1]["content"])
-    observation = second_context["observations"][-1]
-    assert observation["kind"] == "tool_result"
-    process_result = json.loads(observation["content"])
+    tool_context = _tool_context_entry(requests[1])
+    process_result = json.loads(tool_context["content"])
     assert process_result["command"] == sys.executable
     assert process_result["exit_code"] == 0
     assert process_result["output"].strip() == "agent-process-ok"
@@ -437,12 +446,12 @@ def test_agent_action_training_and_evaluation_cli_are_checkpointed(
         )
     )
 
-    assert training["objective"] == "moira-agent-action-json-v2"
+    assert training["objective"] == "moira-agent-action-json-v3"
     assert training["model_surface"] == "agent-smoke"
     assert training["weights_updated"] is True
     assert training["steps"] == 1
     assert training["samples"] == 1
-    assert evaluation["objective"] == "moira-agent-action-json-v2"
+    assert evaluation["objective"] == "moira-agent-action-json-v3"
     assert evaluation["weights_updated"] is False
     assert evaluation["held_out"] is True
     assert evaluation["training_dataset_id"] == "moira-agent-fixture-train-v1"

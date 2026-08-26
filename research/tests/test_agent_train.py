@@ -7,7 +7,11 @@ import uuid
 import pytest
 import torch
 
-from moira.agent_loop import AgentActionKind
+from moira.agent_loop import (
+    AgentActionKind,
+    AgentContext,
+    assemble_agent_context,
+)
 from moira.agent_train import (
     AGENT_ACTION_OBJECTIVE,
     canonical_agent_prompt,
@@ -21,6 +25,8 @@ from moira.agent_train import (
 from moira.config import ModelConfig
 from moira.m1_train import BYTE_OFFSET, EOS_ID, build_causal_batch
 from moira.masks import CognitiveMode
+from moira.context import MAX_CONTEXT_TOKENS, ContextClassification
+from moira.ollama import ollama_action_request
 
 
 FIXTURE = Path("research/tests/fixtures/agent-trajectories.jsonl")
@@ -37,7 +43,7 @@ HELD_OUT_MANIFEST = Path(
 
 class _ScriptedModel:
     def __init__(self, text: str) -> None:
-        self.config = SimpleNamespace(max_seq_len=768)
+        self.config = SimpleNamespace(max_seq_len=2_048)
         self._tokens = [BYTE_OFFSET + value for value in text.encode("utf-8")]
         self._tokens.append(EOS_ID)
         self.modes = []
@@ -76,6 +82,13 @@ def test_agent_trajectory_schema_covers_all_native_action_kinds() -> None:
     target = json.loads(canonical_agent_target(trajectories[0].action))
     assert prompt["agent_protocol"] == "moira-agent-protocol-v1"
     assert "action" not in prompt
+    assert "task" not in prompt
+    assert "observations" not in prompt
+    assert prompt["step"] == 1
+    assert prompt["max_steps"] == 4
+    assert prompt["context"][0]["source"] == "task"
+    assert prompt["context"][0]["content"] == "Find MOIRA files."
+    assert prompt["context_receipt"]["scope_id"] == "workspace-fixture"
     assert prompt["available_tools"][0]["tool_id"] == "workspace.search"
     assert target == {
         "kind": "use_tool",
@@ -84,6 +97,32 @@ def test_agent_trajectory_schema_covers_all_native_action_kinds() -> None:
         "text": "",
         "tool_id": "workspace.search",
     }
+
+
+def test_agent_training_and_ollama_inference_share_the_exact_context_mapping() -> None:
+    trajectory = load_agent_trajectories(FIXTURE, max_records=1)[0]
+    assembly = assemble_agent_context(
+        task_id=trajectory.task_id,
+        task=trajectory.task,
+        scope_id=trajectory.scope_id,
+        observations=trajectory.observations,
+        external_fragments=(),
+        token_budget=MAX_CONTEXT_TOKENS,
+        classification_boundary=ContextClassification.PRIVATE,
+        now=0,
+    )
+    context = AgentContext(
+        task_id=trajectory.task_id,
+        mode=trajectory.mode,
+        role=trajectory.role,
+        step=trajectory.step,
+        max_steps=trajectory.max_steps,
+        available_tools=trajectory.tools,
+        context=assembly,
+    )
+    request = ollama_action_request("moira:test", context)
+
+    assert request["messages"][1]["content"] == canonical_agent_prompt(trajectory)
 
 
 def test_agent_batch_trains_only_on_canonical_action_tokens() -> None:
@@ -304,6 +343,18 @@ def test_agent_trajectory_rejects_unknown_fields() -> None:
     try:
         path.write_text(json.dumps(value) + "\n", encoding="utf-8")
         with pytest.raises(ValueError, match="exact schema"):
+            load_agent_trajectories(path, max_records=1)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_agent_trajectory_requires_an_exact_turn_budget() -> None:
+    path = Path("research") / f".agent-invalid-{uuid.uuid4().hex}.jsonl"
+    value = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+    value["step"] = True
+    try:
+        path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="step budget"):
             load_agent_trajectories(path, max_records=1)
     finally:
         path.unlink(missing_ok=True)
