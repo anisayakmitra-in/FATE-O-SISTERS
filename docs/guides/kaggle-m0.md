@@ -5,14 +5,13 @@ official Kaggle CLI and completing `kaggle auth login`, run:
 
 ```powershell
 research\.venv-cuda\Scripts\kaggle.exe kernels push -p kaggle
-research\.venv-cuda\Scripts\kaggle.exe kernels status anisayakmitra/moira-m1-capacity-and-resume-probe
-research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m1-capacity-and-resume-probe -p research\runs\kaggle-m2
+research\.venv-cuda\Scripts\kaggle.exe kernels status anisayakmitra/moira-m2-fp32-resume-probe
+research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m2-fp32-resume-probe -p research\runs\kaggle-m2
 ```
 
-The private kernel keeps its original Kaggle slug so existing links continue to
-work. It clones the current `main`, prints the resolved commit, checks that the
-PyTorch build supports the assigned GPU, then trains and resumes the fixed
-153,349,122-parameter M2 surface. The exported checkpoint uses FP32 model
+The private kernel clones the current `main`, prints the resolved commit, checks
+that the PyTorch build supports the assigned GPU, then trains and resumes the
+fixed 153,349,122-parameter M2 surface. The exported checkpoint uses FP32 model
 weights and FP32 AdamW state. A two-row fixture checks persistence and cursor
 continuation; it is not a corpus-training or model-quality result.
 

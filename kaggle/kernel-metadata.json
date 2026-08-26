@@ -1,5 +1,5 @@
 {
-  "id": "anisayakmitra/moira-m1-capacity-and-resume-probe",
+  "id": "anisayakmitra/moira-m2-fp32-resume-probe",
   "title": "MOIRA M2 FP32 Resume Probe",
   "code_file": "moira_kaggle.py",
   "language": "python",
