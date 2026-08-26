@@ -105,7 +105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     agent = commands.add_parser(
-        "agent", help="Inspect the bounded PANDORA-AGENT integration contract."
+        "agent", help="Inspect MOIRA's native bounded agent-layer contract."
     )
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     agent_commands.add_parser(

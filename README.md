@@ -23,8 +23,8 @@ The Python reference contains:
   cybersecurity telemetry, time-series, structured, graph, and robotics inputs;
 - an M1 meta-device parameter check, equal-parameter component ablations, and a bounded in-memory JSONL training path;
 - checkpointed capability-prefix training, resume, and no-update held-out evaluation;
-- a bounded PANDORA-AGENT bridge with per-task role leases, turn and effect
-  budgets, request-digest binding, and chained audit events;
+- a native model-level agent layer with per-task role leases, registered tools,
+  turn and effect budgets, request-bound permits, and receipts;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -200,27 +200,36 @@ remediation, ATT&CK mapping, detection engineering, threat-intelligence
 synthesis, and incident analysis. It does not grant network access, credentials,
 scanner control, exploit execution, or permission to act on a target.
 
-## PANDORA-AGENT integration
+## Native MOIRA Agent Layer
 
-Any MOIRA orientation can serve as planner, analyst, executor, reviewer, or
-evaluator for a bounded task. Roles are temporary leases, not permanent sister
-identities. Inspect the executable bridge contract with:
+The whole MOIRA model is agentic. Any task-selected Clotho, Lachesis, or
+Atropos orientation can serve as planner, analyst, executor, reviewer, or
+evaluator. Agency is shared model infrastructure, not a fourth sister and not
+the permanent responsibility of one sister. Inspect the executable contract
+with:
 
 ```powershell
 python -m moira agent inspect
 ```
 
-The Python bridge records a proposal turn, constructs a canonical effect
-request, binds the payload and request with SHA-256 digests, and submits it to a
-caller-provided PANDORA gateway. A local action set limits what may be proposed;
-it is not permission. PANDORA must independently route the request, apply
-policy, issue a request-bound permit, execute the effect, and return its receipt.
-MOIRA exposes no direct effect executor, and denial or approval-required
-decisions do not produce an authorized envelope.
+The native layer records proposal turns, binds effect requests to their payload
+with domain-separated SHA-256 digests, applies a deny-by-default policy, and
+executes only registered tools under a bounded lease. Request-bound permits are
+single-use. Approval-required actions pause until the operator approves the
+exact request. Every attempted execution produces a receipt.
 
-The bridge is executable and unit-tested, but the repositories are not linked
-as a packaged runtime dependency yet. `agent inspect` describes the interface;
-it does not launch PANDORA, call a tool, or make the model autonomous by itself.
+External harnesses are optional I/O hosts. They can restrict MOIRA but cannot
+replace its cognition or expand its local authority. The reference action loop
+can speak without being prompted again, ask the user a necessary question,
+select a registered tool, consume its observation, and finish within a step
+budget.
+
+For an Ollama download, the weights provide cognition and structured action
+selection. A model file cannot directly call the operating system. Real file,
+terminal, browser, or API effects therefore use the small MOIRA companion
+runtime, which connects the Ollama model to the same policy, approval, tool, and
+receipt layer. A third-party harness may host that interface, but none is
+required by MOIRA's architecture.
 
 ## Elastic capacity and custom bitplane precision
 

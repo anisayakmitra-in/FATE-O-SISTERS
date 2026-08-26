@@ -3,7 +3,6 @@
 - Status: approved research design for Phase 0 implementation
 - Repository: `anisayakmitra-in/FATE-O-SISTERS`
 - Pinned parent commit: `9458927c3d2532f1f3e066d9c725297957a08bc7`
-- PANDORA contract reference: `anisayakmitra-in/PANDORA-AGENT@f001dd706a66631ff3c8ba01e21588745a152b72`
 - Canonical model name: MOIRA
 
 ## 1. Scope and claim boundary
@@ -160,38 +159,41 @@ Qwen, Mistral, OLMo, and SmolLM teacher references separately from datasets.
 
 RAG supplies current and private evidence. LoRA and other PEFT methods adapt stable behavior. Neither belongs inside the exact core parameter sequence.
 
-### 5.1 PANDORA-AGENT control layer
+### 5.1 Native model-level agent layer
 
-Agent roles are assigned per task. Clotho, Lachesis, or Atropos may hold any of
-these roles: planner, analyst, executor, reviewer, or evaluator. A role lease
-binds the orientation to one task ID, scope ID, action set, turn budget, and
-effect budget. The lease neither changes model weights nor grants authority.
+Agency belongs to the whole MOIRA model. It is not assigned permanently to one
+sister. Agent roles are selected per task, and Clotho, Lachesis, or Atropos may
+hold any of them: planner, analyst, executor, reviewer, or evaluator. A role
+lease binds the selected orientation to one task ID, scope ID, action set, turn
+budget, and effect budget. The lease neither changes model weights nor grants
+authority.
 
-The executable `moira-pandora-agent-v1` bridge follows this sequence:
+The executable `moira-agent-protocol-v1` path follows this sequence:
 
 ```text
-MOIRA proposal
--> bounded role lease
+MOIRA cognition
+-> task-selected orientation and role lease
 -> digest-bound effect request
--> PANDORA ShadowCouncil routing
--> Parliament decision
--> ReferenceMonitor request-bound permit
--> external effect executor
--> PANDORA effect receipt
+-> local policy and optional operator approval
+-> single-use request-bound permit
+-> registered tool executor
+-> effect receipt and bounded observation
 ```
 
-MOIRA stops at the authorized envelope. It has no effect executor and cannot
-mint a permit. Denied and approval-required decisions stay non-executable. An
-allow decision is accepted only when its request digest exactly matches the
-submitted request and it contains a permit identifier. Request attempts consume
-the lease effect budget even when PANDORA denies them.
+The model cannot add tools, expand its policy, fabricate operator approval, or
+promote its own weights. Denied requests stay non-executable. Approval-required
+requests pause until an exact request-digest approval is supplied. An allow
+decision creates a single-use permit, and only a registered tool may consume
+it. Request attempts consume the lease effect budget even when denied.
 
-The bridge trace stores ordered event kinds and domain-separated SHA-256
-digests. It does not store raw proposal or effect payload text. PANDORA remains
-responsible for its own operation-request conversion, permit consumption,
-execution, receipts, approval storage, and policy audit. The current bridge is
-a typed Python compatibility layer; packaging and starting the Rust PANDORA
-runtime remain separate integration work.
+The trace stores ordered event kinds and domain-separated SHA-256 digests. It
+does not store raw proposal or effect payload text. Tool output is bounded and
+returned to cognition as untrusted observation data, not as policy.
+
+An Ollama model artifact supplies weights and inference, not an operating-system
+process. Standalone agency therefore consists of the downloaded MOIRA weights
+plus the MOIRA companion runtime. Open-source harnesses may implement the same
+host interface, but they are optional and cannot expand the native policy.
 
 ## 6. Parameter accounting
 
@@ -249,7 +251,7 @@ volatile task state
 
 Raw conversations do not trigger immediate gradient updates. Private or changing facts stay in deletable retrieval memory. Stable repeated behavior may produce an adapter dataset after consent and curation. Core training begins only when evaluation shows a capacity problem that memory, tools, and adapters cannot solve.
 
-Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. The PANDORA-AGENT layer may coordinate these tasks under explicit role leases. External effects require a PANDORA permit and, when policy requires it, direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
+Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. The native MOIRA Agent Layer may coordinate these tasks under explicit role leases. External effects require a locally valid single-use permit and, when policy requires it, direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
 
 ## 9. Deployment profiles
 
