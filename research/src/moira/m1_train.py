@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import uuid
@@ -410,38 +411,61 @@ def train_m1_jsonl(
     steps: int = 1,
     batch_size: int = 1,
     device: str = "cpu",
+    checkpoint_path: str | Path | None = None,
+    resume: bool = False,
+    model_config: ModelConfig | None = None,
 ) -> M1TrainingResult:
-    """Run bounded in-memory M1 causal training on a caller-owned JSONL file."""
-    if type(steps) is not int or not 0 < steps <= M1_MAX_STEPS:
-        raise ValueError("steps must be between 1 and the M1 step limit")
-    if type(batch_size) is not int or not 0 < batch_size <= M1_MAX_BATCH_SIZE:
-        raise ValueError("batch_size exceeds the M1 in-memory limit")
-    if device not in {"cpu", "cuda"}:
-        raise ValueError("M1 device must be cpu or cuda")
-    if device == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA is not available")
-    config = ModelConfig.m1_cpu()
+    """Run bounded, optionally resumable M1 causal training on local JSONL."""
+    _validate_m1_limits(steps=steps, batch_size=batch_size, device=device)
+    if resume and checkpoint_path is None:
+        raise ValueError("resume requires checkpoint_path")
+    config = model_config or ModelConfig.m1_cpu()
     model = MoiraModel(config).to(device=device, dtype=torch.float32)
     optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False)
-    examples = iter_cataloged_text_examples(
-        catalog_path,
-        jsonl_path,
-        source_id=source_id,
-        max_records=steps * batch_size,
+    examples = tuple(
+        iter_cataloged_text_examples(
+            catalog_path,
+            jsonl_path,
+            source_id=source_id,
+            max_records=steps * batch_size,
+        )
     )
+    if len(examples) < steps * batch_size:
+        raise ValueError("JSONL source ended before the requested M1 steps")
     tokenizer = ByteTokenizer()
+    manifest = {
+        "model_config": asdict(config),
+        "source_id": source_id,
+        "modality": "text",
+        "sequence_length": config.max_seq_len,
+        "tokenizer": "utf8-byte-v1",
+        "dataset_sha256": _sha256_file(jsonl_path),
+    }
+    lineage_id = uuid.uuid4().hex
+    global_step = 0
+    sample_cursor = 0
+    losses: list[float] = []
+    if resume:
+        loaded = load_m1_checkpoint(
+            checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            loom=None,
+            expected_manifest=manifest,
+        )
+        lineage_id = loaded.lineage_id
+        global_step = loaded.global_step
+        sample_cursor = loaded.sample_cursor
+        losses = list(loaded.losses)
+    if global_step > steps:
+        raise ValueError("requested steps are behind the checkpoint")
+    if sample_cursor + (steps - global_step) * batch_size > len(examples):
+        raise ValueError("checkpoint cursor exceeds the bounded text data")
     model.train()
-    final_loss = 0.0
-    samples = 0
     tokens = 0
-    for _ in range(steps):
-        batch_examples_list: list[DatasetExample] = []
-        for _ in range(batch_size):
-            try:
-                batch_examples_list.append(next(examples))
-            except StopIteration as error:
-                raise ValueError("JSONL source ended before the requested M1 steps") from error
-        batch_examples = tuple(batch_examples_list)
+    while global_step < steps:
+        end = sample_cursor + batch_size
+        batch_examples = examples[sample_cursor:end]
         batch = build_causal_batch(
             batch_examples,
             sequence_length=config.max_seq_len,
@@ -463,16 +487,42 @@ def train_m1_jsonl(
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
         optimizer.step()
-        final_loss = float(loss.detach().cpu().item())
-        samples += batch_size
+        global_step += 1
+        sample_cursor = end
+        losses.append(float(loss.detach().cpu().item()))
         tokens += int(loss_mask.sum().item())
+        if checkpoint_path is not None:
+            save_m1_checkpoint(
+                checkpoint_path,
+                lineage_id=lineage_id,
+                global_step=global_step,
+                sample_cursor=sample_cursor,
+                model=model,
+                optimizer=optimizer,
+                loom=None,
+                losses=tuple(losses),
+                manifest=manifest,
+            )
     return M1TrainingResult(
         steps=steps,
-        samples=samples,
+        samples=sample_cursor,
         tokens=tokens,
-        final_loss=final_loss,
+        final_loss=losses[-1] if losses else 0.0,
         trainable_parameters=model.parameter_ledger().total_trainable,
+        losses=tuple(losses),
+        checkpoint_path=Path(checkpoint_path) if checkpoint_path is not None else None,
     )
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise ValueError("M1 JSONL source cannot be hashed") from error
+    return digest.hexdigest()
 
 
 def train_m1_capabilities(

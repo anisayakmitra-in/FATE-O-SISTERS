@@ -96,10 +96,10 @@ python -m moira m1 train-jsonl `
   --device cpu
 ```
 
-This text/code path writes no checkpoint; it is a bounded data-to-loss smoke
-path. Long stable curves and precision comparisons remain M1 exit gates. The
-capability path below adds bounded checkpoint resume and held-out evaluation
-for vision and feature observations.
+This text/code path can write and resume a bounded checkpoint; it remains a
+small data-to-loss systems run. Long stable curves and precision comparisons
+remain M1 exit gates. The capability path below adds bounded checkpoint resume
+and held-out evaluation for vision and feature observations.
 
 For a caller-owned capability slice, provide a CPU-readable `torch.save` tensor
 of observations alongside the normalized JSONL rows. Vision uses
@@ -220,8 +220,10 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/configs/m1-sources.toml` | M1 dataset, model, and evaluation source catalog |
 | `docs/architecture/moira-v0.md` | Architecture, scope boundaries, and milestone gates |
 | `docs/guides/kaggle-m0.md` | Cell-by-cell Kaggle workflow and artifact rules |
+| `docs/guides/free-compute.md` | Current free compute routes and their limits |
 | `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
 | `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
+| `kaggle/` | Private Kaggle M1 resume and M3 capacity-probe script |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 
 ## Research boundary

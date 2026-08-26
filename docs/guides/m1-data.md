@@ -115,8 +115,8 @@ organ references until a separate alignment contract is measured.
 ## Bounded M1 training path
 
 The M1 JSONL command uses a deterministic UTF-8 byte tokenizer and target-only
-causal loss. It accepts only cataloged text or code sources, runs in memory, and
-does not write a checkpoint:
+causal loss. It accepts only cataloged text or code sources and can write a
+checkpoint at each optimizer boundary:
 
 ```powershell
 python -m moira m1 train-jsonl `
@@ -125,13 +125,28 @@ python -m moira m1 train-jsonl `
   --path C:\data\longcite-slice.jsonl `
   --steps 1 `
   --batch-size 1 `
+  --checkpoint C:\runs\moira-m1\text.pt `
   --device cpu
 ```
 
-The step and batch limits are deliberately small. Checkpoint size limits,
-resume semantics, tokenizer versioning, GPU precision, and equal-parameter
-learning curves remain M1 exit work for this text-only smoke path. The existing
-checkpointed trainer remains the M0 deterministic reference.
+Continue the same dataset and manifest to an absolute step target:
+
+```powershell
+python -m moira m1 train-jsonl `
+  --catalog research/configs/m1-sources.toml `
+  --source zai-longcite-45k `
+  --path C:\data\longcite-slice.jsonl `
+  --steps 2 `
+  --batch-size 1 `
+  --checkpoint C:\runs\moira-m1\text.pt `
+  --resume `
+  --device cpu
+```
+
+The checkpoint binds the model configuration, source ID, tokenizer version,
+sequence length, and SHA-256 digest of the JSONL input. A changed dataset fails
+closed on resume. The step and batch limits remain deliberately small. Long
+learning curves and GPU precision comparisons remain M1 exit work.
 
 ### Capability-prefix training and resume
 

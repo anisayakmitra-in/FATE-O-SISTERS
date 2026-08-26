@@ -1,10 +1,24 @@
 # Run the MOIRA M0 smoke model on Kaggle
 
+The repository also contains a private GPU script. After installing the
+official Kaggle CLI and completing `kaggle auth login`, run:
+
+```powershell
+research\.venv-cuda\Scripts\kaggle.exe kernels push -p kaggle
+research\.venv-cuda\Scripts\kaggle.exe kernels status anisayakmitra/moira-m1-capacity-probe
+research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m1-capacity-probe -p research\runs\kaggle-m1
+```
+
+The script clones the current `main`, prints the resolved commit, runs one M3
+capacity probe with an INT8 optimizer state, then trains and resumes the 33M M1
+FP32 checkpoint. It is private by default. The M3 result is a memory check, not
+a pretrained checkpoint.
+
 This guide runs the deterministic Phase 0 model on Kaggle CPU. The checked-in
 configuration has 24,478 trainable parameters and uses indexed synthetic data.
 It tests the model, checkpoint, verification, evaluation, and exact-resume code
 paths. The repository also provides a separate M1 catalog and bounded JSONL
-smoke path; that path does not write a checkpoint.
+smoke path; that path can now write and resume a bounded text checkpoint.
 
 Phase 0 runs in FP32 on CPU. LoRA, PEFT, 8-bit weights, MoE routing, RAG, RLHF,
 checkpointed real-corpus training, recursive training, deployment switching,
@@ -184,8 +198,8 @@ python -m moira m1 train-jsonl \
 ```
 
 The command reports loss, token count, and the 33,032,562-parameter surface.
-It keeps the text-only model in memory and writes no checkpoint. For a
-capability slice, store a caller-owned tensor as a Kaggle input (`.pt`) and
+It keeps the text-only model in memory unless `--checkpoint` is provided. For
+a capability slice, store a caller-owned tensor as a Kaggle input (`.pt`) and
 run the checkpointed prefix path; no Hub weight download is required:
 
 ```bash

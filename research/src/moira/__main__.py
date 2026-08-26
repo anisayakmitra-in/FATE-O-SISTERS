@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, asdict, fields
 import json
 import math
 import os
@@ -50,6 +50,7 @@ from .m1_train import (
     train_m1_capabilities,
     train_m1_jsonl,
 )
+from .scale_probe import run_scale_probe
 from .qat import run_moira_qat_smoke
 from .synthetic import SyntheticStream
 from .train import (
@@ -180,6 +181,16 @@ def _build_parser() -> argparse.ArgumentParser:
     m1_train.add_argument("--steps", default=1, type=int)
     m1_train.add_argument("--batch-size", default=1, type=int)
     m1_train.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    m1_train.add_argument("--checkpoint", type=Path)
+    m1_train.add_argument("--resume", action="store_true")
+    m1_probe = m1_commands.add_parser(
+        "scale-probe", help="Run one bounded CUDA capacity probe without checkpointing."
+    )
+    m1_probe.add_argument("--milestone", choices=("m1", "m2", "m3"), required=True)
+    m1_probe.add_argument(
+        "--optimizer", choices=("adamw", "adamw8bit"), default="adamw"
+    )
+    m1_probe.add_argument("--sequence-length", default=64, type=int)
     m1_capabilities = m1_commands.add_parser(
         "train-capabilities",
         help="Train bounded vision/audio/structured capability prefixes on local tensors.",
@@ -492,6 +503,8 @@ def _m1_train(
     steps: int,
     batch_size: int,
     device: str,
+    checkpoint_path: Path | None,
+    resume: bool,
 ) -> dict[str, object]:
     result = train_m1_jsonl(
         catalog_path,
@@ -500,8 +513,15 @@ def _m1_train(
         steps=steps,
         batch_size=batch_size,
         device=device,
+        checkpoint_path=checkpoint_path,
+        resume=resume,
     )
     return {
+        "checkpoint": (
+            str(result.checkpoint_path.resolve())
+            if result.checkpoint_path is not None
+            else None
+        ),
         "device": device,
         "final_loss": result.final_loss,
         "phase": "M1",
@@ -509,7 +529,8 @@ def _m1_train(
         "steps": result.steps,
         "tokens": result.tokens,
         "trainable_parameters": result.trainable_parameters,
-        "checkpoint_written": False,
+        "checkpoint_written": result.checkpoint_path is not None,
+        "losses": list(result.losses),
     }
 
 
@@ -1023,6 +1044,16 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 arguments.steps,
                 arguments.batch_size,
                 arguments.device,
+                arguments.checkpoint,
+                arguments.resume,
+            )
+        if arguments.m1_command == "scale-probe":
+            return asdict(
+                run_scale_probe(
+                    arguments.milestone,
+                    optimizer_name=arguments.optimizer,
+                    sequence_length=arguments.sequence_length,
+                )
             )
         if arguments.m1_command == "train-capabilities":
             return _m1_train_capabilities(

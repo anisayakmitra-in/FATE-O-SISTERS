@@ -14,6 +14,7 @@ from moira.m1_train import (
     build_causal_batch,
     evaluate_m1_capabilities,
     iter_cataloged_text_examples,
+    train_m1_jsonl,
     train_m1_capabilities,
 )
 from moira.masks import CognitiveMode
@@ -65,6 +66,70 @@ def test_cataloged_text_iterator_keeps_streaming_contract() -> None:
         assert [example.record_id for example in examples] == ["row-1"]
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_text_training_writes_and_resumes_a_bounded_checkpoint() -> None:
+    jsonl_path = Path("research") / f".m1-text-{uuid.uuid4().hex}.jsonl"
+    checkpoint_path = Path("research") / f".m1-text-{uuid.uuid4().hex}.pt"
+    uninterrupted_path = Path("research") / f".m1-text-{uuid.uuid4().hex}.pt"
+    config = ModelConfig(512, 32, 1, 4, 64, 3, 8, 4, 8, 64)
+    try:
+        jsonl_path.write_text(
+            "\n".join(
+                json.dumps({"id": f"row-{index}", "prompt": "p", "response": "r"})
+                for index in range(2)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        torch.manual_seed(20260826)
+        first = train_m1_jsonl(
+            "research/configs/m1-sources.toml",
+            jsonl_path,
+            source_id="zai-longcite-45k",
+            steps=1,
+            checkpoint_path=checkpoint_path,
+            model_config=config,
+        )
+        resumed = train_m1_jsonl(
+            "research/configs/m1-sources.toml",
+            jsonl_path,
+            source_id="zai-longcite-45k",
+            steps=2,
+            checkpoint_path=checkpoint_path,
+            resume=True,
+            model_config=config,
+        )
+        torch.manual_seed(20260826)
+        train_m1_jsonl(
+            "research/configs/m1-sources.toml",
+            jsonl_path,
+            source_id="zai-longcite-45k",
+            steps=2,
+            checkpoint_path=uninterrupted_path,
+            model_config=config,
+        )
+        resumed_payload = torch.load(checkpoint_path, weights_only=True)
+        uninterrupted_payload = torch.load(uninterrupted_path, weights_only=True)
+        assert first.samples == 1
+        assert resumed.samples == 2
+        assert len(resumed.losses) == 2
+        assert resumed.checkpoint_path == checkpoint_path
+        assert resumed_payload["losses"] == uninterrupted_payload["losses"]
+        for name, tensor in resumed_payload["model_state"].items():
+            assert torch.equal(tensor, uninterrupted_payload["model_state"][name])
+        assert (
+            resumed_payload["optimizer_state"]["param_groups"]
+            == uninterrupted_payload["optimizer_state"]["param_groups"]
+        )
+        for parameter_id, state in resumed_payload["optimizer_state"]["state"].items():
+            reference = uninterrupted_payload["optimizer_state"]["state"][parameter_id]
+            assert state.keys() == reference.keys()
+            assert all(torch.equal(value, reference[key]) for key, value in state.items())
+    finally:
+        jsonl_path.unlink(missing_ok=True)
+        checkpoint_path.unlink(missing_ok=True)
+        uninterrupted_path.unlink(missing_ok=True)
 
 
 def test_capability_batch_runs_through_the_model_prefix_boundary() -> None:

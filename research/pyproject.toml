@@ -17,6 +17,7 @@ training = [
     "safetensors>=0.8,<0.9",
     "torchao>=0.18,<0.19",
     "transformers>=5.15,<6",
+    "bitsandbytes>=0.50,<0.51",
 ]
 
 [tool.pytest.ini_options]

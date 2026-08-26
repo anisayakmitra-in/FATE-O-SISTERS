@@ -452,6 +452,21 @@ def test_phase_zero_cli_rejects_cuda(cli_root: Path) -> None:
     assert "Phase 0 device must be cpu" in result.stderr
 
 
+def test_scale_probe_cli_rejects_sequence_past_milestone_limit() -> None:
+    result = _run_cli(
+        "m1",
+        "scale-probe",
+        "--milestone",
+        "m3",
+        "--sequence-length",
+        "129",
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "sequence_length must fit" in result.stderr
+
+
 def test_train_rejects_a_step_past_the_schedule(cli_root: Path) -> None:
     run_dir = cli_root / "past-schedule-run"
     result = _run_cli(
