@@ -152,6 +152,7 @@ class MoiraAgentControl:
         self._authority = authority
         self._leases: dict[str, _LeaseState] = {}
         self._trace: list[AgentTraceEvent] = []
+        self._requested_requests: set[str] = set()
         self._receipted_requests: set[str] = set()
 
     def open_lease(
@@ -258,6 +259,9 @@ class MoiraAgentControl:
             target=target,
             payload=payload,
         )
+        if request.request_digest in self._requested_requests:
+            raise ValueError("exact MOIRA effect request was already submitted")
+        self._requested_requests.add(request.request_digest)
         state.effects_used += 1
         self._append_trace(
             "effect_requested", lease_id, request.request_digest.encode("ascii")

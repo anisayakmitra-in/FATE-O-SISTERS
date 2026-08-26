@@ -353,6 +353,19 @@ execute a mutation, authorize an effect, activate weights, or promote a
 checkpoint. Selection validation is reusable search feedback and is not the
 sealed holdout used for promotion.
 
+Candidate execution enters the native agent kernel as the exact
+`candidate_training:run` effect. The kernel binds the serialized work request
+to an HMAC-backed one-use permit and a registered backend; the request contains
+no shell command or executable path. Before issuance, the worker replays the
+parent and failure-selection receipts against the current archive and rebuilds
+the request. The backend receives a new digest-named staging directory. The
+worker rejects path escapes and linked outputs, enforces step, sample, token,
+wall, and output budgets, hashes the candidate and its manifests, and checks the
+active checkpoint before and after execution. These checks detect an active
+checkpoint change; preventing one requires a read-only mount or equivalent OS
+isolation. The resulting candidate record remains non-authorizing and
+non-promoting.
+
 Idle autonomy may consolidate authorized memory, run evaluations, prepare candidates, and propose questions within a fixed budget. The native MOIRA Agent Layer may coordinate these tasks under explicit role leases. External effects require a locally valid single-use permit and, when policy requires it, direct approval. MOIRA cannot grant itself credentials, compute, money, data access, or promotion authority.
 
 ## 9. Deployment profiles
@@ -455,6 +468,10 @@ save_qat_checkpoint(...) -> Path
 load_qat_checkpoint(...) -> dict[str, object]
 verify_qat_checkpoint(...) -> dict[str, object]
 switch_deployment_profile(...) -> dict[str, object]
+CandidateSearch.select_parents(...) -> CandidateSelectionReceipt
+CandidateSearch.select_failures(...) -> FailureSelectionReceipt
+prepare_candidate_work(...) -> CandidateWorkRequest
+CandidateWorker.tool(...) -> MoiraTool
 ```
 
 The reference package lives under `research/src/moira`. CPU tests use tiny dimensions and deterministic seeds. A synthetic next-token task provides the first smoke-training command. Kaggle uses the same command and writes resumable checkpoints containing model, optimizer, scheduler, random-number-generator, data-cursor, configuration, and manifest state.

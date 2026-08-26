@@ -97,3 +97,7 @@ immutable active checkpoint
 
 The candidate-search receipt is evidence for the first half of that pipeline.
 It is never an execution permit or promotion approval.
+
+The next boundary is implemented by `CandidateWorker`; see
+[candidate-worker.md](candidate-worker.md). Candidate search still does not
+schedule or execute work itself.

@@ -523,6 +523,39 @@ class CandidateSearch:
             ),
         )
 
+    def verify_parent_selection(
+        self, receipt: CandidateSelectionReceipt
+    ) -> None:
+        if not isinstance(receipt, CandidateSelectionReceipt):
+            raise ValueError("candidate selection receipt is invalid")
+        try:
+            expected = self.select_parents(
+                count=len(receipt.draws),
+                seed=receipt.seed,
+                iteration=receipt.iteration,
+                sharpness=float(receipt.sharpness),
+                midpoint_percentile=float(receipt.midpoint_percentile),
+                novelty_weight=float(receipt.novelty_weight),
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("candidate selection receipt cannot be replayed") from error
+        if receipt != expected:
+            raise ValueError("candidate selection receipt does not match the archive")
+
+    def verify_failure_selection(self, receipt: FailureSelectionReceipt) -> None:
+        if not isinstance(receipt, FailureSelectionReceipt):
+            raise ValueError("failure selection receipt is invalid")
+        try:
+            expected = self.select_failures(
+                receipt.candidate_id,
+                count=len(receipt.selected_failure_ids),
+                seed=receipt.seed,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("failure selection receipt cannot be replayed") from error
+        if receipt != expected:
+            raise ValueError("failure selection receipt does not match the archive")
+
     def _child_counts(self) -> dict[str, int]:
         counts = {candidate_id: 0 for candidate_id in self._candidates}
         for record in self._candidates.values():

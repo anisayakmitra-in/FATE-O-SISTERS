@@ -29,6 +29,8 @@ The Python reference contains:
   classification, provenance, expiry, budget, and digest receipts;
 - bounded deterministic candidate search with immutable lineage, failure-evidence,
   score-plus-novelty selection, and non-promoting receipts;
+- a permit-gated candidate-work boundary that replays search evidence, confines
+  accepted outputs to staging, enforces resource budgets, and hashes artifacts;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
 - a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
 
@@ -389,6 +391,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `research/src/moira/deployment.py` | Atomic local Consumer/Enterprise profile selection |
 | `research/src/moira/context.py` | Deterministic scoped context admission, budgeting, and receipts |
 | `research/src/moira/candidate_search.py` | Bounded candidate archive and deterministic research selection |
+| `research/src/moira/candidate_worker.py` | One-shot native-agent boundary for staged candidate work |
 | `research/src/moira/agent_data.py` | Agent trajectory provenance, consent, license, split, and content-manifest gate |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
@@ -399,6 +402,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
 | `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
 | `docs/guides/candidate-search.md` | Candidate-search contract, selection algorithm, and promotion boundary |
+| `docs/guides/candidate-worker.md` | Permit, staging, budget, artifact, and isolation contract for candidate work |
 | `kaggle/` | Private Kaggle M2 FP32 train-save-resume script |
 | `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
 
