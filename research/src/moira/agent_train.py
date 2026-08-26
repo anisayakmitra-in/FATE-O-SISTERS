@@ -22,8 +22,15 @@ from .config import ModelConfig
 from .dataset import DatasetExample
 from .m1_checkpoint import load_m1_checkpoint
 from .m1_train import (
+    BOS_ID,
+    BYTE_OFFSET,
+    BYTE_VOCAB_SIZE,
     ByteTokenizer,
+    EOS_ID,
     M1TrainingResult,
+    SEP_ID,
+    _causal_source_lengths,
+    _forward_causal_logits,
     _masked_loss,
     build_causal_batch,
     train_causal_examples,
@@ -33,9 +40,10 @@ from .model import MoiraModel
 
 
 AGENT_TRAJECTORY_SCHEMA_VERSION = 1
-AGENT_ACTION_OBJECTIVE = "moira-agent-action-json-v1"
+AGENT_ACTION_OBJECTIVE = "moira-agent-action-json-v2"
 _MAX_TRAJECTORY_FILE_BYTES = 128 * 1024 * 1024
 _MAX_TRAJECTORY_RECORD_BYTES = 1024 * 1024
+_MAX_HELD_OUT_TRAINING_RECORDS = 100_000
 _TRAJECTORY_FIELDS = {
     "schema_version",
     "record_id",
@@ -71,6 +79,28 @@ class AgentActionEvaluation:
     checkpoint_step: int
     checkpoint_path: Path
     trainable_parameters: int
+    training_dataset_sha256: str
+    evaluation_dataset_sha256: str
+    held_out: bool
+    termination_rate: float
+    schema_validity: float
+    canonical_validity: float
+    exact_action_accuracy: float
+    action_kind_accuracy: float
+    tool_selection_accuracy: float | None
+    tool_selection_samples: int
+
+
+@dataclass(frozen=True, slots=True)
+class AgentActionGeneration:
+    record_id: str
+    output_text: str | None
+    terminated: bool
+    schema_valid: bool
+    canonical: bool
+    exact_action: bool
+    action_kind_correct: bool
+    tool_selection_correct: bool | None
 
 
 def load_agent_trajectories(
@@ -142,6 +172,8 @@ def canonical_agent_target(action: AgentAction) -> str:
 
 def trajectory_examples(
     trajectories: tuple[AgentTrajectory, ...],
+    *,
+    split: str = "train",
 ) -> tuple[DatasetExample, ...]:
     if not trajectories or any(
         not isinstance(trajectory, AgentTrajectory) for trajectory in trajectories
@@ -152,7 +184,7 @@ def trajectory_examples(
             record_id=trajectory.record_id,
             source_id="moira-agent-trajectories",
             modality="text",
-            split="train",
+            split=split,
             inputs={"text": canonical_agent_prompt(trajectory)},
             targets={"text": canonical_agent_target(trajectory.action)},
             record_sha256=trajectory.record_sha256,
@@ -181,6 +213,7 @@ def train_agent_jsonl(
     trajectories = load_agent_trajectories(
         path, max_records=steps * batch_size
     )
+    _validate_trajectory_context(trajectories, config)
     examples = trajectory_examples(trajectories)
     return train_causal_examples(
         examples,
@@ -191,28 +224,40 @@ def train_agent_jsonl(
         checkpoint_path=checkpoint_path,
         resume=resume,
         model_config=config,
+        modes=tuple(trajectory.mode for trajectory in trajectories),
+        source_conditioned=True,
     )
 
 
 def evaluate_agent_jsonl(
     path: str | Path,
     *,
+    training_path: str | Path,
     checkpoint_path: str | Path,
     batch_size: int = 1,
     max_records: int = 128,
+    max_new_tokens: int = 128,
     device: str = "cpu",
     model_config: ModelConfig | None = None,
 ) -> AgentActionEvaluation:
-    """Evaluate target-only loss and token accuracy without updating weights."""
+    """Evaluate one checkpoint on a distinct held-out action trajectory file."""
     if type(batch_size) is not int or not 0 < batch_size <= 8:
         raise ValueError("batch_size must be between 1 and 8")
     if device not in {"cpu", "cuda"}:
         raise ValueError("evaluation device must be cpu or cuda")
     if device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA is not available")
+    if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 256:
+        raise ValueError("max_new_tokens must be between 1 and 256")
     config = model_config or ModelConfig.agent_smoke()
+    training_sha256 = _sha256_file(training_path)
+    evaluation_sha256 = _sha256_file(path)
+    if training_sha256 == evaluation_sha256:
+        raise ValueError("agent evaluation data must be held out from training")
     trajectories = load_agent_trajectories(path, max_records=max_records)
-    examples = trajectory_examples(trajectories)
+    _assert_held_out(training_path, trajectories)
+    _validate_trajectory_context(trajectories, config)
+    examples = trajectory_examples(trajectories, split="evaluation")
     model = MoiraModel(config).to(device=device, dtype=torch.float32)
     optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False)
     loaded = load_m1_checkpoint(
@@ -220,7 +265,7 @@ def evaluate_agent_jsonl(
         model=model,
         optimizer=optimizer,
         loom=None,
-        expected_manifest=_agent_manifest(path, config),
+        expected_manifest=_agent_manifest(training_path, config),
     )
     tokenizer = ByteTokenizer()
     weighted_loss = 0.0
@@ -234,21 +279,40 @@ def evaluate_agent_jsonl(
                 sequence_length=config.max_seq_len,
                 tokenizer=tokenizer,
             )
-            output = model(
-                batch.input_ids.to(device),
-                mode=CognitiveMode.ATROPOS,
-                valid_tokens=batch.valid_tokens.to(device),
-            )
             targets = batch.targets.to(device)
             mask = batch.loss_mask.to(device)
-            loss = _masked_loss(output.logits, targets, mask)
+            batch_trajectories = trajectories[start : start + batch_size]
+            logits = _forward_causal_logits(
+                model,
+                batch.input_ids.to(device),
+                valid_tokens=batch.valid_tokens.to(device),
+                modes=tuple(
+                    trajectory.mode for trajectory in batch_trajectories
+                ),
+                source_lengths=_causal_source_lengths(mask),
+            )
+            loss = _masked_loss(logits, targets, mask)
             selected = int(mask.sum().item())
             weighted_loss += float(loss.item()) * selected
-            predictions = output.logits.argmax(dim=-1)
+            predictions = logits.argmax(dim=-1)
             correct += int(((predictions == targets) & mask).sum().item())
             token_count += selected
     if token_count <= 0:
         raise ValueError("agent evaluation selected no target tokens")
+    generations = tuple(
+        generate_agent_action(
+            model,
+            trajectory,
+            max_new_tokens=max_new_tokens,
+            device=device,
+        )
+        for trajectory in trajectories
+    )
+    tool_generations = tuple(
+        generation
+        for generation in generations
+        if generation.tool_selection_correct is not None
+    )
     return AgentActionEvaluation(
         loss=weighted_loss / token_count,
         token_accuracy=correct / token_count,
@@ -257,7 +321,142 @@ def evaluate_agent_jsonl(
         checkpoint_step=loaded.global_step,
         checkpoint_path=loaded.checkpoint_path,
         trainable_parameters=model.parameter_ledger().total_trainable,
+        training_dataset_sha256=training_sha256,
+        evaluation_dataset_sha256=evaluation_sha256,
+        held_out=True,
+        termination_rate=_rate(generations, "terminated"),
+        schema_validity=_rate(generations, "schema_valid"),
+        canonical_validity=_rate(generations, "canonical"),
+        exact_action_accuracy=_rate(generations, "exact_action"),
+        action_kind_accuracy=_rate(generations, "action_kind_correct"),
+        tool_selection_accuracy=(
+            _rate(tool_generations, "tool_selection_correct")
+            if tool_generations
+            else None
+        ),
+        tool_selection_samples=len(tool_generations),
     )
+
+
+def generate_agent_action(
+    model: MoiraModel,
+    trajectory: AgentTrajectory,
+    *,
+    max_new_tokens: int,
+    device: str,
+) -> AgentActionGeneration:
+    """Greedily decode one action using the trajectory's selected orientation."""
+    if not isinstance(trajectory, AgentTrajectory):
+        raise ValueError("trajectory must be an AgentTrajectory")
+    if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 256:
+        raise ValueError("max_new_tokens must be between 1 and 256")
+    tokenizer = ByteTokenizer()
+    prompt_ids = tokenizer.encode(canonical_agent_prompt(trajectory))
+    token_ids = [BOS_ID, *prompt_ids, SEP_ID]
+    source_length = len(token_ids)
+    if len(token_ids) + max_new_tokens > model.config.max_seq_len:
+        raise ValueError("agent prompt leaves insufficient generation context")
+    generated: list[int] = []
+    terminated = False
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            tokens = torch.tensor([token_ids], dtype=torch.int64, device=device)
+            output = model(
+                tokens,
+                mode=trajectory.mode,
+                visibility_mode=CognitiveMode.LACHESIS,
+                valid_tokens=torch.ones_like(tokens, dtype=torch.bool),
+                source_lengths=torch.tensor(
+                    [source_length], dtype=torch.int64, device=device
+                ),
+            )
+            next_id = int(output.logits[0, -1].argmax().item())
+            if next_id == EOS_ID:
+                terminated = True
+                break
+            if not BYTE_OFFSET <= next_id < BYTE_VOCAB_SIZE:
+                generated.append(next_id)
+                break
+            generated.append(next_id)
+            token_ids.append(next_id)
+    output_text: str | None = None
+    if all(BYTE_OFFSET <= token < BYTE_VOCAB_SIZE for token in generated):
+        try:
+            output_text = bytes(token - BYTE_OFFSET for token in generated).decode(
+                "utf-8"
+            )
+        except UnicodeDecodeError:
+            pass
+    return _score_generation(trajectory, output_text, terminated)
+
+
+def _score_generation(
+    trajectory: AgentTrajectory,
+    output_text: str | None,
+    terminated: bool,
+) -> AgentActionGeneration:
+    parsed: AgentAction | None = None
+    if terminated and output_text is not None:
+        try:
+            parsed = agent_action_from_mapping(json.loads(output_text))
+        except (ValueError, json.JSONDecodeError, RecursionError):
+            pass
+    schema_valid = parsed is not None
+    canonical = schema_valid and output_text == canonical_agent_target(parsed)
+    exact_action = schema_valid and parsed == trajectory.action
+    action_kind_correct = schema_valid and parsed.kind is trajectory.action.kind
+    tool_selection_correct: bool | None = None
+    if trajectory.action.tool_id is not None:
+        tool_selection_correct = (
+            schema_valid and parsed.tool_id == trajectory.action.tool_id
+        )
+    return AgentActionGeneration(
+        record_id=trajectory.record_id,
+        output_text=output_text,
+        terminated=terminated,
+        schema_valid=schema_valid,
+        canonical=canonical,
+        exact_action=exact_action,
+        action_kind_correct=action_kind_correct,
+        tool_selection_correct=tool_selection_correct,
+    )
+
+
+def _rate(values: tuple[object, ...], field: str) -> float:
+    return sum(bool(getattr(value, field)) for value in values) / len(values)
+
+
+def _validate_trajectory_context(
+    trajectories: tuple[AgentTrajectory, ...], config: ModelConfig
+) -> None:
+    for trajectory in trajectories:
+        prompt_bytes = len(canonical_agent_prompt(trajectory).encode("utf-8"))
+        target_bytes = len(canonical_agent_target(trajectory.action).encode("utf-8"))
+        if 3 + prompt_bytes + target_bytes > config.max_seq_len:
+            raise ValueError("agent trajectory does not fit the model context")
+
+
+def _assert_held_out(
+    training_path: str | Path,
+    evaluation: tuple[AgentTrajectory, ...],
+) -> None:
+    training = load_agent_trajectories(
+        training_path,
+        max_records=_MAX_HELD_OUT_TRAINING_RECORDS + 1,
+    )
+    if len(training) > _MAX_HELD_OUT_TRAINING_RECORDS:
+        raise ValueError("agent training file exceeds the held-out audit limit")
+    training_ids = {trajectory.record_id for trajectory in training}
+    training_prompts = {
+        hashlib.sha256(canonical_agent_prompt(trajectory).encode("utf-8")).digest()
+        for trajectory in training
+    }
+    for trajectory in evaluation:
+        prompt_digest = hashlib.sha256(
+            canonical_agent_prompt(trajectory).encode("utf-8")
+        ).digest()
+        if trajectory.record_id in training_ids or prompt_digest in training_prompts:
+            raise ValueError("agent evaluation rows overlap the training data")
 
 
 def _parse_trajectory(value: object) -> AgentTrajectory:
@@ -331,6 +530,8 @@ def _agent_manifest(path: str | Path, config: ModelConfig) -> dict[str, object]:
         "modality": "text",
         "objective": AGENT_ACTION_OBJECTIVE,
         "agent_protocol": AGENT_PROTOCOL,
+        "orientation_conditioning": "native-mode-embedding-v1",
+        "action_visibility": "bidirectional-source-causal-target-v1",
         "sequence_length": config.max_seq_len,
         "tokenizer": "utf8-byte-v1",
         "dataset_sha256": _sha256_file(path),
@@ -369,10 +570,12 @@ __all__ = [
     "AGENT_ACTION_OBJECTIVE",
     "AGENT_TRAJECTORY_SCHEMA_VERSION",
     "AgentActionEvaluation",
+    "AgentActionGeneration",
     "AgentTrajectory",
     "canonical_agent_prompt",
     "canonical_agent_target",
     "evaluate_agent_jsonl",
+    "generate_agent_action",
     "load_agent_trajectories",
     "train_agent_jsonl",
     "trajectory_examples",

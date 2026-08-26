@@ -61,7 +61,14 @@ rule that observations are untrusted and do not grant permission
 It never contains the target action. Prompt and target are serialized with
 sorted keys and compact JSON separators. UTF-8 bytes enter MOIRA's deterministic
 byte tokenizer. Prompt tokens receive no loss; canonical action tokens and EOS
-receive cross-entropy loss through the shared Atropos decoder.
+receive cross-entropy loss through the shared decoder.
+
+Each trajectory retains its selected Clotho, Lachesis, or Atropos mode
+embedding. Action training uses a separate encoder-decoder visibility topology:
+the prompt is a bidirectional source and the action is causal. This preserves
+the task-selected sister while preventing a Clotho row from reading future
+target bytes. This contract is identified as `moira-agent-action-json-v2`;
+checkpoints from the earlier topology cannot resume under it.
 
 This keeps parameter count and precision independent from agent supervision.
 The action objective changes learned weights, not the architecture's physical
@@ -101,26 +108,38 @@ trajectory file cannot silently resume the old run.
 
 ```powershell
 python -m moira agent evaluate-actions `
-  --path research/tests/fixtures/agent-trajectories.jsonl `
+  --path research/tests/fixtures/agent-trajectories-held-out.jsonl `
+  --training-path research/tests/fixtures/agent-trajectories.jsonl `
   --checkpoint research/runs/agent-actions.pt `
   --max-records 4 `
+  --max-new-tokens 128 `
   --batch-size 1 `
   --device cpu
 ```
 
-Evaluation reports target-only loss and teacher-forced action-token accuracy.
-It restores the checkpoint into a disposable model and does not update or
-rewrite the artifact.
+`--training-path` reconstructs the exact checkpoint manifest. Its SHA-256 digest
+must differ from the evaluation file digest, so accidentally scoring the
+training file as held out fails before checkpoint inference. The bounded audit
+also rejects reused record IDs and identical model-visible prompts across the
+training and evaluation files.
 
-Token accuracy is not an agent-quality score. A qualified model also needs
-held-out autoregressive schema validity, exact action accuracy, tool-selection
-accuracy, task completion, refusal, prompt-injection resistance, approval
+Evaluation reports target-only loss and teacher-forced action-token accuracy.
+It also greedily decodes each action under its selected sister orientation and
+reports termination, exact-schema, canonical-serialization, exact-action,
+action-kind, and tool-selection rates. A malformed token, invalid UTF-8,
+missing EOS, unknown field, or unavailable action shape fails that generated
+sample's schema gate. Evaluation restores the checkpoint into a disposable
+model and does not update or rewrite the artifact.
+
+These structural metrics are not an agent-quality score. A qualified model also
+needs held-out task completion, refusal, prompt-injection resistance, approval
 compliance, and effect-safety evaluations.
 
 ## Current claim boundary
 
 The `agent-smoke` surface is 114,366 parameters. It proves that the native
 objective, checkpoint, exact-resume, and evaluation paths execute. The four
-fixture records are not a training corpus, and the resulting checkpoint is not
-a generally useful agent model. Publishing an Ollama MOIRA requires a much
-larger consented dataset and a qualified M1, M2, or eventual 3B checkpoint.
+training and four held-out fixture records are not a corpus or benchmark, and
+the resulting checkpoint is not a generally useful agent model. Publishing an
+Ollama MOIRA requires a much larger consented dataset and a qualified M1, M2,
+or eventual 3B checkpoint.

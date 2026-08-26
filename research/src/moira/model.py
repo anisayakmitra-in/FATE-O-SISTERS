@@ -453,6 +453,7 @@ class MoiraModel(nn.Module):
         tokens: Tensor,
         *,
         mode: CognitiveMode,
+        visibility_mode: CognitiveMode | None = None,
         valid_tokens: Tensor | None = None,
         source_lengths: Tensor | None = None,
         state: MoiraState | None = None,
@@ -472,6 +473,7 @@ class MoiraModel(nn.Module):
         return self._run_hidden(
             hidden,
             mode=mode,
+            visibility_mode=visibility_mode,
             valid_tokens=valid_tokens,
             source_lengths=source_lengths,
             state=state,
@@ -484,6 +486,7 @@ class MoiraModel(nn.Module):
         prefix_hidden: Tensor,
         *,
         mode: CognitiveMode,
+        visibility_mode: CognitiveMode | None = None,
         valid_tokens: Tensor | None = None,
         source_lengths: Tensor | None = None,
         state: MoiraState | None = None,
@@ -586,6 +589,7 @@ class MoiraModel(nn.Module):
         return self._run_hidden(
             combined_hidden,
             mode=mode,
+            visibility_mode=visibility_mode,
             valid_tokens=combined_valid,
             source_lengths=source_lengths,
             state=state,
@@ -597,6 +601,7 @@ class MoiraModel(nn.Module):
         hidden: Tensor,
         *,
         mode: CognitiveMode,
+        visibility_mode: CognitiveMode | None,
         valid_tokens: Tensor | None,
         source_lengths: Tensor | None,
         state: MoiraState | None,
@@ -607,6 +612,10 @@ class MoiraModel(nn.Module):
             raise ValueError("hidden sequence exceeds max_seq_len")
         if not isinstance(mode, CognitiveMode):
             raise ValueError("mode must be a CognitiveMode")
+        if visibility_mode is None:
+            visibility_mode = mode
+        if not isinstance(visibility_mode, CognitiveMode):
+            raise ValueError("visibility_mode must be a CognitiveMode")
         if ablate is None:
             ablate = frozenset()
         if not isinstance(ablate, frozenset) or not ablate.issubset(
@@ -628,9 +637,14 @@ class MoiraModel(nn.Module):
             )
         if bool(torch.any(~valid_tokens[:, :-1] & valid_tokens[:, 1:])):
             raise ValueError("valid_tokens must be right-padded")
-        if mode is not CognitiveMode.LACHESIS and source_lengths is not None:
+        if (
+            visibility_mode is not CognitiveMode.LACHESIS
+            and source_lengths is not None
+        ):
             raise ValueError("source_lengths is only valid for Lachesis")
-        visibility = build_visibility_mask(mode, valid_tokens, source_lengths)
+        visibility = build_visibility_mask(
+            visibility_mode, valid_tokens, source_lengths
+        )
 
         if state is None:
             spool_states: tuple[SpoolState | None, ...] = (None,) * len(self.blocks)
@@ -658,7 +672,7 @@ class MoiraModel(nn.Module):
                 hidden,
                 visibility,
                 valid_tokens,
-                mode=mode,
+                mode=visibility_mode,
                 source_lengths=source_lengths,
                 state=spool_state,
                 ablate=ablate,

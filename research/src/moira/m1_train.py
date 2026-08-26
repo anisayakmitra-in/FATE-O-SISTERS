@@ -462,6 +462,8 @@ def train_causal_examples(
     checkpoint_path: str | Path | None,
     resume: bool,
     model_config: ModelConfig,
+    modes: tuple[CognitiveMode, ...] | None = None,
+    source_conditioned: bool = False,
 ) -> M1TrainingResult:
     """Train the shared MOIRA decoder on validated target-only text pairs."""
     _validate_m1_limits(steps=steps, batch_size=batch_size, device=device)
@@ -473,6 +475,14 @@ def train_causal_examples(
         raise ValueError("causal examples must be a tuple of DatasetExample values")
     if not isinstance(manifest, dict):
         raise ValueError("causal training manifest must be a dictionary")
+    if modes is None:
+        modes = (CognitiveMode.ATROPOS,) * len(examples)
+    if len(modes) != len(examples) or any(
+        not isinstance(mode, CognitiveMode) for mode in modes
+    ):
+        raise ValueError("causal training modes must match the examples")
+    if type(source_conditioned) is not bool:
+        raise ValueError("source_conditioned must be a boolean")
     config = model_config
     model = MoiraModel(config).to(device=device, dtype=torch.float32)
     if checkpoint_path is not None:
@@ -516,12 +526,16 @@ def train_causal_examples(
         valid_tokens = batch.valid_tokens.to(device)
         loss_mask = batch.loss_mask.to(device)
         optimizer.zero_grad(set_to_none=True)
-        output = model(
+        logits = _forward_causal_logits(
+            model,
             input_ids,
-            mode=CognitiveMode.ATROPOS,
             valid_tokens=valid_tokens,
+            modes=modes[sample_cursor:end],
+            source_lengths=(
+                _causal_source_lengths(loss_mask) if source_conditioned else None
+            ),
         )
-        loss = _masked_loss(output.logits, targets, loss_mask)
+        loss = _masked_loss(logits, targets, loss_mask)
         if not bool(torch.isfinite(loss)):
             raise ValueError("causal training loss became non-finite")
         loss.backward()
@@ -552,6 +566,61 @@ def train_causal_examples(
         losses=tuple(losses),
         checkpoint_path=Path(checkpoint_path) if checkpoint_path is not None else None,
     )
+
+
+def _forward_causal_logits(
+    model: MoiraModel,
+    input_ids: Tensor,
+    *,
+    valid_tokens: Tensor,
+    modes: tuple[CognitiveMode, ...],
+    source_lengths: Tensor | None = None,
+) -> Tensor:
+    """Run a causal batch while preserving each row's selected orientation."""
+    if len(modes) != input_ids.shape[0]:
+        raise ValueError("causal modes must match the batch")
+    if source_lengths is not None and source_lengths.shape != (input_ids.shape[0],):
+        raise ValueError("causal source lengths must match the batch")
+    if len(set(modes)) == 1:
+        return model(
+            input_ids,
+            mode=modes[0],
+            visibility_mode=(
+                CognitiveMode.LACHESIS if source_lengths is not None else None
+            ),
+            valid_tokens=valid_tokens,
+            source_lengths=source_lengths,
+        ).logits
+    return torch.cat(
+        [
+            model(
+                input_ids[index : index + 1],
+                mode=mode,
+                visibility_mode=(
+                    CognitiveMode.LACHESIS if source_lengths is not None else None
+                ),
+                valid_tokens=valid_tokens[index : index + 1],
+                source_lengths=(
+                    source_lengths[index : index + 1]
+                    if source_lengths is not None
+                    else None
+                ),
+            ).logits
+            for index, mode in enumerate(modes)
+        ],
+        dim=0,
+    )
+
+
+def _causal_source_lengths(loss_mask: Tensor) -> Tensor:
+    if (
+        not isinstance(loss_mask, Tensor)
+        or loss_mask.dtype is not torch.bool
+        or loss_mask.ndim != 2
+        or not bool(loss_mask.any(dim=1).all())
+    ):
+        raise ValueError("causal loss mask must select a target in every row")
+    return loss_mask.to(dtype=torch.int64).argmax(dim=1) + 1
 
 
 def _sha256_file(path: str | Path) -> str:

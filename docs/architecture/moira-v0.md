@@ -218,6 +218,12 @@ tool catalog, prior observations, and exactly one next action. The model-visible
 prompt excludes the target action. Only the canonical action bytes and EOS
 receive causal loss.
 
+The selected Clotho, Lachesis, or Atropos embedding remains active for each
+trajectory. Structured action supervision separately uses a Lachesis-style
+source/causal visibility boundary: prompt positions are bidirectional, while
+action positions can see the prompt and earlier action bytes only. This avoids
+future-action leakage when a Clotho-oriented task learns to act.
+
 The objective uses the existing shared token embedding, TSK blocks, Pulse, and
 tied output projection. It does not create a separate policy network, action
 head, or parameter copy, so it preserves the model's parameter ledger and the
@@ -228,9 +234,11 @@ drifting independently.
 The local `agent-smoke` surface has 114,366 trainable parameters and a 768-token
 context. It verifies deterministic batching, target-only masks, optimizer
 updates, bit-exact resume, fail-closed checkpoint manifests, no-update
-evaluation, and all four action kinds. It does not establish autonomous-agent
-quality. Scaling requires a consented trajectory corpus, held-out tasks, schema
-validity and exact-action metrics, safety evaluations, and then M1/M2/3B runs.
+evaluation, and all four action kinds. Evaluation requires a dataset digest
+different from training and measures greedy termination, schema validity,
+canonical encoding, exact action, action kind, and tool selection. It does not
+establish autonomous-agent quality. Scaling requires a consented trajectory
+corpus, task-completion and safety evaluations, and then M1/M2/3B runs.
 
 ## 6. Parameter accounting
 

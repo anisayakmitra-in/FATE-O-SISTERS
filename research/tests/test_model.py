@@ -37,6 +37,22 @@ def _tiny_config(
     )
 
 
+def test_selected_orientation_can_use_causal_source_visibility() -> None:
+    model = MoiraModel(_tiny_config())
+    tokens = torch.tensor([[1, 4, 5, 3, 6, 7]], dtype=torch.int64)
+
+    output = model(
+        tokens,
+        mode=CognitiveMode.CLOTHO,
+        visibility_mode=CognitiveMode.LACHESIS,
+        valid_tokens=torch.ones_like(tokens, dtype=torch.bool),
+        source_lengths=torch.tensor([4], dtype=torch.int64),
+    )
+
+    assert output.logits.shape == (1, 6, 16)
+    assert torch.isfinite(output.logits).all()
+
+
 def test_thread_intersects_visibility_with_locality_and_zeros_blocked_rows() -> None:
     """Catches non-local keys, ignored visible neighbors, and unsafe empty softmax rows."""
     layer = ThreadLocalAttention(d_model=4, n_heads=2, radius=1)

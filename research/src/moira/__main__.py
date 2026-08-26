@@ -172,12 +172,14 @@ def _build_parser() -> argparse.ArgumentParser:
     train_actions.add_argument("--resume", action="store_true")
     evaluate_actions = agent_commands.add_parser(
         "evaluate-actions",
-        help="Evaluate action loss and token accuracy without updating a checkpoint.",
+        help="Evaluate a checkpoint on distinct held-out action trajectories.",
     )
     evaluate_actions.add_argument("--path", type=Path, required=True)
+    evaluate_actions.add_argument("--training-path", type=Path, required=True)
     evaluate_actions.add_argument("--checkpoint", type=Path, required=True)
     evaluate_actions.add_argument("--batch-size", type=int, default=1)
     evaluate_actions.add_argument("--max-records", type=int, default=128)
+    evaluate_actions.add_argument("--max-new-tokens", type=int, default=128)
     evaluate_actions.add_argument(
         "--device", choices=("cpu", "cuda"), default="cpu"
     )
@@ -1268,28 +1270,42 @@ def _train_agent_actions(
 
 def _evaluate_agent_actions(
     path: Path,
+    training_path: Path,
     checkpoint: Path,
     *,
     batch_size: int,
     max_records: int,
+    max_new_tokens: int,
     device: str,
 ) -> dict[str, object]:
     result = evaluate_agent_jsonl(
         path,
+        training_path=training_path,
         checkpoint_path=checkpoint,
         batch_size=batch_size,
         max_records=max_records,
+        max_new_tokens=max_new_tokens,
         device=device,
     )
     return {
+        "action_kind_accuracy": result.action_kind_accuracy,
+        "canonical_validity": result.canonical_validity,
         "checkpoint": str(result.checkpoint_path.resolve()),
         "checkpoint_step": result.checkpoint_step,
+        "evaluation_dataset_sha256": result.evaluation_dataset_sha256,
+        "exact_action_accuracy": result.exact_action_accuracy,
+        "held_out": result.held_out,
         "loss": result.loss,
         "model_surface": "agent-smoke",
         "objective": AGENT_ACTION_OBJECTIVE,
         "samples": result.samples,
+        "schema_validity": result.schema_validity,
+        "termination_rate": result.termination_rate,
         "token_accuracy": result.token_accuracy,
         "tokens": result.tokens,
+        "tool_selection_accuracy": result.tool_selection_accuracy,
+        "tool_selection_samples": result.tool_selection_samples,
+        "training_dataset_sha256": result.training_dataset_sha256,
         "trainable_parameters": result.trainable_parameters,
         "weights_updated": False,
     }
@@ -1326,9 +1342,11 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
         if arguments.agent_command == "evaluate-actions":
             return _evaluate_agent_actions(
                 arguments.path,
+                arguments.training_path,
                 arguments.checkpoint,
                 batch_size=arguments.batch_size,
                 max_records=arguments.max_records,
+                max_new_tokens=arguments.max_new_tokens,
                 device=arguments.device,
             )
         raise ValueError("unknown agent command")

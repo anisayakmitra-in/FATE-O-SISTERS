@@ -17,6 +17,13 @@ CONFIG_PATH = REPOSITORY_ROOT / "research" / "configs" / "m0-smoke.toml"
 AGENT_TRAJECTORY_PATH = (
     REPOSITORY_ROOT / "research" / "tests" / "fixtures" / "agent-trajectories.jsonl"
 )
+AGENT_HELD_OUT_PATH = (
+    REPOSITORY_ROOT
+    / "research"
+    / "tests"
+    / "fixtures"
+    / "agent-trajectories-held-out.jsonl"
+)
 
 
 @pytest.fixture
@@ -414,24 +421,33 @@ def test_agent_action_training_and_evaluation_cli_are_checkpointed(
             "agent",
             "evaluate-actions",
             "--path",
+            AGENT_HELD_OUT_PATH,
+            "--training-path",
             AGENT_TRAJECTORY_PATH,
             "--checkpoint",
             checkpoint,
             "--max-records",
             4,
+            "--max-new-tokens",
+            4,
         )
     )
 
-    assert training["objective"] == "moira-agent-action-json-v1"
+    assert training["objective"] == "moira-agent-action-json-v2"
     assert training["model_surface"] == "agent-smoke"
     assert training["weights_updated"] is True
     assert training["steps"] == 1
     assert training["samples"] == 1
-    assert evaluation["objective"] == "moira-agent-action-json-v1"
+    assert evaluation["objective"] == "moira-agent-action-json-v2"
     assert evaluation["weights_updated"] is False
+    assert evaluation["held_out"] is True
+    assert evaluation["training_dataset_sha256"] != evaluation["evaluation_dataset_sha256"]
     assert evaluation["checkpoint_step"] == 1
     assert evaluation["samples"] == 4
     assert 0.0 <= evaluation["token_accuracy"] <= 1.0
+    assert 0.0 <= evaluation["schema_validity"] <= 1.0
+    assert 0.0 <= evaluation["exact_action_accuracy"] <= 1.0
+    assert evaluation["tool_selection_samples"] == 1
     assert checkpoint.read_bytes() == before_evaluation
 
 
