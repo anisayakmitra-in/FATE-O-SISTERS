@@ -5,8 +5,8 @@ official Kaggle CLI and completing `kaggle auth login`, run:
 
 ```powershell
 research\.venv-cuda\Scripts\kaggle.exe kernels push -p kaggle
-research\.venv-cuda\Scripts\kaggle.exe kernels status anisayakmitra/moira-m1-capacity-probe
-research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m1-capacity-probe -p research\runs\kaggle-m1
+research\.venv-cuda\Scripts\kaggle.exe kernels status anisayakmitra/moira-m1-capacity-and-resume-probe
+research\.venv-cuda\Scripts\kaggle.exe kernels output anisayakmitra/moira-m1-capacity-and-resume-probe -p research\runs\kaggle-m1
 ```
 
 The script clones the current `main`, prints the resolved commit, runs one M3

@@ -1,5 +1,5 @@
 {
-  "id": "anisayakmitra/moira-m1-capacity-probe",
+  "id": "anisayakmitra/moira-m1-capacity-and-resume-probe",
   "title": "MOIRA M1 Capacity and Resume Probe",
   "code_file": "moira_kaggle.py",
   "language": "python",
