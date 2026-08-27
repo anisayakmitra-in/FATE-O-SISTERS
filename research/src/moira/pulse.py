@@ -34,6 +34,7 @@ SLOW_AXES = (
 class PulseState:
     fast: Tensor
     slow: Tensor
+    neutral: bool = False
 
 
 class Pulse(nn.Module):
@@ -72,6 +73,7 @@ class Pulse(nn.Module):
         return PulseState(
             fast=torch.zeros((batch_size, len(FAST_AXES)), device=allocated.device, dtype=dtype),
             slow=torch.zeros((batch_size, len(SLOW_AXES)), device=allocated.device, dtype=dtype),
+            neutral=False,
         )
 
     def appraise(self, summary: Tensor) -> Tensor:
@@ -109,6 +111,7 @@ class Pulse(nn.Module):
         return PulseState(
             fast=torch.where(update, fast, state.fast),
             slow=torch.where(update, slow, state.slow),
+            neutral=state.neutral,
         )
 
     def modulate(self, hidden: Tensor, state: PulseState) -> Tensor:
@@ -117,6 +120,8 @@ class Pulse(nn.Module):
         _require_model_tensor("hidden", hidden, (batch_size, None, self.d_model), self)
         if hidden.device != state.fast.device or hidden.dtype != state.fast.dtype:
             raise ValueError("hidden must match state device and dtype")
+        if state.neutral:
+            return hidden
         affect = torch.cat((state.fast, state.slow), dim=-1)
         scale = torch.tanh(self.modulation_scale(affect)).unsqueeze(1)
         bias = torch.tanh(self.modulation_bias(affect)).unsqueeze(1)
@@ -162,6 +167,7 @@ def _validate_state(state: object, module: nn.Module) -> int:
         or not bool(torch.isfinite(slow).all())
         or bool(torch.any((fast < -1) | (fast > 1)))
         or bool(torch.any((slow < 0) | (slow > 1)))
+        or type(state.neutral) is not bool
     ):
         raise ValueError("state must contain bounded fast [batch, 12] and slow [batch, 6]")
     parameter = next(module.parameters())

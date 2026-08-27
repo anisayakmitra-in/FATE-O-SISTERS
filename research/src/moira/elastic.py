@@ -1,15 +1,15 @@
-"""Precision-elastic parameter growth contracts for the MOIRA field.
+"""Root-relative parameter growth and standard precision contracts for MOIRA.
 
 MOIRA has two independent scaling axes:
 
-* parameter capacity: 3B, 9B, 27B, 81B, and future x3-generated tiers; and
-* logical weight precision: 3-bit, 6-bit, 9-bit, 27-bit, 81-bit, and future
-  generated levels.
+* parameter capacity: exact, root-relative x3 tiers; and
+* integer weight precision: INT2, INT4, or INT8.
 
-The logical bit widths are bitplane budgets, not promises of native hardware
-instructions. A runtime may pack them and dequantize into the arithmetic dtype
-available on the target accelerator. This module produces bounded plans and
-small tensor storage views; it never allocates a multi-billion-parameter model.
+Integer weight storage is separate from BF16/FP16/FP32 whole-model arithmetic.
+FP64 is reserved for a bounded verification-arithmetic path and is never a
+whole-model storage, training, or inference policy. This module produces
+bounded plans and small tensor storage views; it never allocates a
+multi-billion-parameter model.
 """
 
 from __future__ import annotations
@@ -25,15 +25,17 @@ import torch
 from torch import Tensor
 
 
-CANONICAL_PARAMETER_LADDER = (
-    3_000_000_000,
-    9_000_000_000,
-    27_000_000_000,
-    81_000_000_000,
-    243_000_000_000,
-    729_000_000_000,
+DEFAULT_PARAMETER_ROOT = 3_000_000_000
+PARAMETER_GROWTH_MULTIPLIER = 3
+PARAMETER_GROWTH_PREVIEW_STEPS = 5
+MAX_GROWTH_GENERATIONS_PER_PLAN = 32
+CANONICAL_PARAMETER_LADDER = tuple(
+    DEFAULT_PARAMETER_ROOT * PARAMETER_GROWTH_MULTIPLIER**step
+    for step in range(PARAMETER_GROWTH_PREVIEW_STEPS + 1)
 )
-BIT_PRECISION_LADDER = (3, 6, 9, 27, 81)
+BIT_PRECISION_LADDER = (2, 4, 8)
+COMPUTE_DTYPE_LADDER = ("bf16", "fp16", "fp32")
+VERIFICATION_DTYPE_LADDER = ("fp32", "fp64")
 CAPABILITY_AREAS = (
     "mathematics-reasoning",
     "speech-audio",
@@ -44,7 +46,9 @@ CAPABILITY_AREAS = (
     "moe-experts",
     "diffusion-generation",
 )
-_PARAMETER_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kKmMbB]?)\s*$")
+_PARAMETER_RE = re.compile(
+    r"^\s*((?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d+)?)\s*([kKmMbB]?)\s*$"
+)
 _BIT_RE = re.compile(
     r"^\s*(?:int)?(\d+)\s*(?:-?bits?|b)?\s*$", re.IGNORECASE
 )
@@ -52,31 +56,56 @@ _MAX_PACKABLE_VALUES = 1_000_000
 
 
 class ComputeDType(str, Enum):
-    """Arithmetic dtype used after a logical bitplane view is unpacked."""
+    """Allowed whole-model training and inference arithmetic dtype."""
 
-    FP16 = "fp16"
     BF16 = "bf16"
+    FP16 = "fp16"
     FP32 = "fp32"
-    FP64 = "fp64"
 
     @classmethod
     def parse(cls, value: str | "ComputeDType") -> "ComputeDType":
         if isinstance(value, cls):
             return value
         if not isinstance(value, str):
-            raise ValueError("compute dtype must be fp16, bf16, fp32, or fp64")
+            raise ValueError("compute dtype must be bf16, fp16, or fp32")
         try:
             return cls(value.strip().lower())
         except ValueError as error:
-            raise ValueError("compute dtype must be fp16, bf16, fp32, or fp64") from error
+            raise ValueError("compute dtype must be bf16, fp16, or fp32") from error
 
     @property
     def torch_dtype(self) -> torch.dtype:
         return {
-            ComputeDType.FP16: torch.float16,
             ComputeDType.BF16: torch.bfloat16,
+            ComputeDType.FP16: torch.float16,
             ComputeDType.FP32: torch.float32,
-            ComputeDType.FP64: torch.float64,
+        }[self]
+
+
+class VerificationDType(str, Enum):
+    """Arithmetic allowed only for bounded verifier computations."""
+
+    FP32 = "fp32"
+    FP64 = "fp64"
+
+    @classmethod
+    def parse(
+        cls, value: str | "VerificationDType"
+    ) -> "VerificationDType":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("verification dtype must be fp32 or fp64")
+        try:
+            return cls(value.strip().lower())
+        except ValueError as error:
+            raise ValueError("verification dtype must be fp32 or fp64") from error
+
+    @property
+    def torch_dtype(self) -> torch.dtype:
+        return {
+            VerificationDType.FP32: torch.float32,
+            VerificationDType.FP64: torch.float64,
         }[self]
 
 
@@ -90,9 +119,11 @@ def parse_parameter_count(value: int | str) -> int:
         raise ValueError("parameter count must be an integer or a string")
     match = _PARAMETER_RE.fullmatch(value)
     if match is None:
-        raise ValueError("parameter count must look like 3B, 27B, or an integer")
+        raise ValueError(
+            "parameter count must look like 3B, 33,032,562, or an integer"
+        )
     try:
-        number = Decimal(match.group(1))
+        number = Decimal(match.group(1).replace(",", ""))
         multiplier = {
             "": Decimal(1),
             "k": Decimal(1_000),
@@ -117,22 +148,22 @@ def format_parameter_count(value: int | str) -> str:
     ):
         if count % divisor == 0:
             return f"{count // divisor}{suffix}"
-    return str(count)
+    return f"{count:,}"
 
 
 def parse_bit_precision(value: int | str) -> int:
-    """Parse a logical level such as ``int3``, ``3bit``, or ``81-bits``."""
+    """Parse one supported integer weight format: INT2, INT4, or INT8."""
     if type(value) is int:
         bits = value
     elif isinstance(value, str):
         match = _BIT_RE.fullmatch(value)
         if match is None:
-            raise ValueError("bit precision must look like int3, int27, or int81")
+            raise ValueError("integer weight precision must be int2, int4, or int8")
         bits = int(match.group(1))
     else:
-        raise ValueError("bit precision must be an integer or a bit string")
-    if bits <= 0:
-        raise ValueError("bit precision must be positive")
+        raise ValueError("integer weight precision must be int2, int4, or int8")
+    if bits not in BIT_PRECISION_LADDER:
+        raise ValueError("integer weight precision must be int2, int4, or int8")
     return bits
 
 
@@ -141,12 +172,49 @@ def format_bit_precision(value: int | str) -> str:
 
 
 def next_bit_precision(value: int | str) -> int:
-    """Return the next custom level, growing by three beyond the seed ladder."""
+    """Return the next standard integer weight format."""
     bits = parse_bit_precision(value)
     for candidate in BIT_PRECISION_LADDER:
         if candidate > bits:
             return candidate
-    return bits * 3
+    raise ValueError("int8 is the highest supported integer weight precision")
+
+
+def parameter_growth_ladder(
+    root: int | str,
+    *,
+    steps: int = PARAMETER_GROWTH_PREVIEW_STEPS,
+) -> tuple[int, ...]:
+    """Return an exact x3 preview whose first tier is the supplied root."""
+    if (
+        type(steps) is not int
+        or not 0 <= steps <= MAX_GROWTH_GENERATIONS_PER_PLAN
+    ):
+        raise ValueError(
+            "growth preview steps must be between 0 and "
+            f"{MAX_GROWTH_GENERATIONS_PER_PLAN}"
+        )
+    root_count = parse_parameter_count(root)
+    return tuple(
+        root_count * PARAMETER_GROWTH_MULTIPLIER**step
+        for step in range(steps + 1)
+    )
+
+
+def parameter_count_after_generations(
+    current: int | str,
+    generations: int,
+) -> int:
+    """Return ``current * 3**generations`` for one bounded planning command."""
+    if (
+        type(generations) is not int
+        or not 1 <= generations <= MAX_GROWTH_GENERATIONS_PER_PLAN
+    ):
+        raise ValueError(
+            "growth generations must be between 1 and "
+            f"{MAX_GROWTH_GENERATIONS_PER_PLAN}"
+        )
+    return parse_parameter_count(current) * PARAMETER_GROWTH_MULTIPLIER**generations
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +256,8 @@ class GrowthPlan:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "root": format_parameter_count(self.current_parameters),
+            "root_parameters": self.current_parameters,
             "current": format_parameter_count(self.current_parameters),
             "target": format_parameter_count(self.target_parameters),
             "current_parameters": self.current_parameters,
@@ -195,6 +265,11 @@ class GrowthPlan:
             "steps": [step.to_dict() for step in self.steps],
             "requires_training": self.requires_training,
             "parameter_count_is_separate_from_precision": True,
+            "root_relative": True,
+            "growth_multiplier": PARAMETER_GROWTH_MULTIPLIER,
+            "generations": len(self.steps),
+            "per_plan_generation_limit": MAX_GROWTH_GENERATIONS_PER_PLAN,
+            "repeatable_from_qualified_child": True,
             "unbounded_growth": True,
         }
 
@@ -203,7 +278,7 @@ def build_growth_plan(
     current: int | str,
     target: int | str,
 ) -> GrowthPlan:
-    """Build an exact x3, non-allocating expansion plan with no hard upper tier."""
+    """Build an exact x3 plan relative to the supplied root/current model."""
     current_count = parse_parameter_count(current)
     target_count = parse_parameter_count(target)
     if target_count < current_count:
@@ -214,7 +289,13 @@ def build_growth_plan(
     steps: list[GrowthStep] = []
     source = current_count
     while source < target_count:
-        milestone = source * 3
+        if len(steps) >= MAX_GROWTH_GENERATIONS_PER_PLAN:
+            raise ValueError(
+                "one growth plan cannot exceed "
+                f"{MAX_GROWTH_GENERATIONS_PER_PLAN} generations; plan again from "
+                "the qualified child"
+            )
+        milestone = source * PARAMETER_GROWTH_MULTIPLIER
         if milestone > target_count:
             raise ValueError(
                 "growth target must be reachable from the current model by exact x3 steps"
@@ -318,7 +399,7 @@ class QuantizedTensor:
 
 
 def quantize_tensor(tensor: Tensor, bits: int | str) -> QuantizedTensor:
-    """Create a bounded affine 3/6/9/27/81-bit view of a finite tensor."""
+    """Create a bounded affine INT2/INT4/INT8 view of a finite tensor."""
     level = parse_bit_precision(bits)
     if (
         not isinstance(tensor, Tensor)
@@ -367,7 +448,7 @@ def materialize_bit_precision(
 
 @dataclass(frozen=True, slots=True)
 class PrecisionPolicy:
-    """Capability-specific logical bits plus the arithmetic backend."""
+    """Integer weight storage plus explicitly separate arithmetic policy."""
 
     profile: str
     core_bits: int
@@ -376,7 +457,9 @@ class PrecisionPolicy:
     cold_expert_bits: int
     verifier_bits: int
     compute_dtype: ComputeDType
-    verifier_compute_dtype: ComputeDType
+    compute_fallback_dtype: ComputeDType
+    master_weight_dtype: ComputeDType
+    verifier_compute_dtype: VerificationDType
 
     def __post_init__(self) -> None:
         if self.profile not in {"consumer", "enterprise"}:
@@ -398,45 +481,63 @@ class PrecisionPolicy:
         object.__setattr__(self, "compute_dtype", ComputeDType.parse(self.compute_dtype))
         object.__setattr__(
             self,
+            "compute_fallback_dtype",
+            ComputeDType.parse(self.compute_fallback_dtype),
+        )
+        object.__setattr__(
+            self,
+            "master_weight_dtype",
+            ComputeDType.parse(self.master_weight_dtype),
+        )
+        if self.master_weight_dtype is not ComputeDType.FP32:
+            raise ValueError("master weight dtype must be fp32")
+        object.__setattr__(
+            self,
             "verifier_compute_dtype",
-            ComputeDType.parse(self.verifier_compute_dtype),
+            VerificationDType.parse(self.verifier_compute_dtype),
         )
         object.__setattr__(self, "capabilities", normalized)
 
     @classmethod
     def for_profile(cls, profile: str) -> "PrecisionPolicy":
+        if profile == "user":
+            profile = "consumer"
         if profile == "consumer":
             return cls(
                 profile=profile,
-                core_bits=3,
+                core_bits=4,
                 capabilities={
-                    "mathematics-reasoning": 9,
-                    "speech-audio": 6,
-                    "vision": 3,
-                    "cybersecurity": 9,
-                    "graph-molecular": 6,
-                    "time-series": 6,
-                    "moe-experts": 3,
-                    "diffusion-generation": 6,
+                    "mathematics-reasoning": 8,
+                    "speech-audio": 4,
+                    "vision": 4,
+                    "cybersecurity": 8,
+                    "graph-molecular": 4,
+                    "time-series": 4,
+                    "moe-experts": 4,
+                    "diffusion-generation": 4,
                 },
-                active_expert_bits=6,
-                cold_expert_bits=3,
-                verifier_bits=9,
+                active_expert_bits=4,
+                cold_expert_bits=2,
+                verifier_bits=8,
                 compute_dtype=ComputeDType.BF16,
-                verifier_compute_dtype=ComputeDType.FP32,
+                compute_fallback_dtype=ComputeDType.FP16,
+                master_weight_dtype=ComputeDType.FP32,
+                verifier_compute_dtype=VerificationDType.FP32,
             )
         if profile == "enterprise":
             return cls(
                 profile=profile,
-                core_bits=9,
-                capabilities={area: 27 for area in CAPABILITY_AREAS},
-                active_expert_bits=27,
-                cold_expert_bits=9,
-                verifier_bits=81,
+                core_bits=8,
+                capabilities={area: 8 for area in CAPABILITY_AREAS},
+                active_expert_bits=8,
+                cold_expert_bits=4,
+                verifier_bits=8,
                 compute_dtype=ComputeDType.BF16,
-                verifier_compute_dtype=ComputeDType.FP64,
+                compute_fallback_dtype=ComputeDType.FP16,
+                master_weight_dtype=ComputeDType.FP32,
+                verifier_compute_dtype=VerificationDType.FP64,
             )
-        raise ValueError("profile must be consumer or enterprise")
+        raise ValueError("profile must be user, consumer, or enterprise")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -449,10 +550,128 @@ class PrecisionPolicy:
             "active_expert_bits": format_bit_precision(self.active_expert_bits),
             "cold_expert_bits": format_bit_precision(self.cold_expert_bits),
             "verifier_bits": format_bit_precision(self.verifier_bits),
+            "integer_weight_precisions": [
+                format_bit_precision(value) for value in BIT_PRECISION_LADDER
+            ],
             "compute_dtype": self.compute_dtype.value,
+            "compute_fallback_dtype": self.compute_fallback_dtype.value,
+            "master_weight_dtype": self.master_weight_dtype.value,
+            "whole_model_compute_dtypes": list(COMPUTE_DTYPE_LADDER),
             "verifier_compute_dtype": self.verifier_compute_dtype.value,
+            "verification_compute_dtypes": list(VERIFICATION_DTYPE_LADDER),
+            "fp64_scope": "bounded-verification-arithmetic-only",
+            "whole_model_fp64_allowed": False,
+            "parameter_count_is_separate_from_precision": True,
             "teacher_weights": "external-and-explicitly-authorized",
         }
+
+
+def _normalize_precision_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            "precision must be int2, int4, int8, bf16, fp16, fp32, or fp64"
+        )
+    normalized = value.strip().lower()
+    if normalized in COMPUTE_DTYPE_LADDER or normalized == "fp64":
+        return normalized
+    try:
+        return format_bit_precision(normalized)
+    except ValueError as error:
+        raise ValueError(
+            "precision must be int2, int4, int8, bf16, fp16, fp32, or fp64"
+        ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class PrecisionTransitionPlan:
+    """Describe a precision transition without writing or converting an artifact."""
+
+    source_precision: str
+    target_precision: str
+    master_retained: bool = False
+    scope: str = "whole-model"
+
+    def __post_init__(self) -> None:
+        source = _normalize_precision_name(self.source_precision)
+        target = _normalize_precision_name(self.target_precision)
+        if type(self.master_retained) is not bool:
+            raise ValueError("master_retained must be a boolean")
+        if self.scope not in {"whole-model", "verifier"}:
+            raise ValueError("precision scope must be whole-model or verifier")
+        if self.scope == "whole-model" and (source == "fp64" or target == "fp64"):
+            raise ValueError("fp64 is allowed only for bounded verifier arithmetic")
+        if self.scope == "verifier" and target not in VERIFICATION_DTYPE_LADDER:
+            raise ValueError("verifier precision target must be fp32 or fp64")
+        object.__setattr__(self, "source_precision", source)
+        object.__setattr__(self, "target_precision", target)
+
+    @staticmethod
+    def _axis(precision: str) -> str:
+        if precision.startswith("int"):
+            return "integer-weight-storage"
+        if precision == "fp64":
+            return "bounded-verification-arithmetic"
+        return "whole-model-compute-or-export"
+
+    @staticmethod
+    def _width(precision: str) -> int:
+        if precision.startswith("int"):
+            return int(precision[3:])
+        return {"bf16": 16, "fp16": 16, "fp32": 32, "fp64": 64}[precision]
+
+    def to_dict(self) -> dict[str, object]:
+        source_width = self._width(self.source_precision)
+        target_width = self._width(self.target_precision)
+        representation_widening = target_width > source_width
+        uses_retained_master = self.master_retained and representation_widening
+        lossy_container_widening = representation_widening and not uses_retained_master
+        downconversion = target_width < source_width
+        same_width_format_change = (
+            source_width == target_width
+            and self.source_precision != self.target_precision
+        )
+        return {
+            "contract": "MOIRA-precision-transition-plan-v1",
+            "source_precision": self.source_precision,
+            "source_axis": self._axis(self.source_precision),
+            "target_precision": self.target_precision,
+            "target_axis": self._axis(self.target_precision),
+            "scope": self.scope,
+            "master_retained": self.master_retained,
+            "uses_retained_master": uses_retained_master,
+            "representation_widening_only": lossy_container_widening,
+            "requires_higher_precision_source_for_information_recovery": (
+                lossy_container_widening
+            ),
+            "requires_new_training_for_quality_recovery": (
+                lossy_container_widening and self.scope == "whole-model"
+            ),
+            "discards_information": downconversion,
+            "same_width_format_change": same_width_format_change,
+            "requires_evaluation": self.source_precision != self.target_precision,
+            "reconstructs_discarded_information": False,
+            "restores_lost_quantization_information": False,
+            "whole_model_fp64_allowed": False,
+            "plan_only": True,
+            "artifact_exported": False,
+            "status": "plan-only-no-artifact-written",
+        }
+
+
+def plan_precision_transition(
+    source: str,
+    target: str,
+    *,
+    master_retained: bool = False,
+    scope: str = "whole-model",
+) -> PrecisionTransitionPlan:
+    """Build an honest, non-mutating precision transition plan."""
+    return PrecisionTransitionPlan(
+        source_precision=source,
+        target_precision=target,
+        master_retained=master_retained,
+        scope=scope,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,16 +687,26 @@ class ElasticPlan:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "architecture": "MOIRA-precision-lattice-v1",
+            "architecture": "MOIRA-root-relative-standard-precision-v2",
             "current_parameters": format_parameter_count(self.growth.current_parameters),
             "target_parameters": format_parameter_count(self.growth.target_parameters),
             "growth": self.growth.to_dict(),
             "precision": self.policy.to_dict(),
             "runtime_bits": format_bit_precision(self.runtime_bits),
-            "target_weight_storage_bytes": estimate_weight_storage_bytes(
+            "target_weight_storage_lower_bound_bytes": estimate_weight_storage_bytes(
                 self.growth.target_parameters, self.runtime_bits
             ),
-            "master_weights_required_for_high_precision_promotion": True,
+            "weight_storage_estimate_excludes": [
+                "quantization-scales",
+                "tensor-metadata",
+                "optimizer-state",
+                "gradients",
+                "activations",
+                "checkpoint-overhead",
+            ],
+            "qat_master_weight_policy": "retain-fp32-if-qat-is-materialized",
+            "fp32_master_weights_verified": False,
+            "parameter_count_is_separate_from_precision": True,
             "status": "plan-only-no-target-allocation",
         }
 
@@ -494,7 +723,7 @@ def build_elastic_plan(
     return ElasticPlan(
         growth=build_growth_plan(current, target),
         policy=policy,
-        runtime_bits=runtime_bits or policy.core_bits,
+        runtime_bits=policy.core_bits if runtime_bits is None else runtime_bits,
     )
 
 
@@ -502,12 +731,20 @@ __all__ = [
     "BIT_PRECISION_LADDER",
     "CANONICAL_PARAMETER_LADDER",
     "CAPABILITY_AREAS",
+    "COMPUTE_DTYPE_LADDER",
     "ComputeDType",
+    "DEFAULT_PARAMETER_ROOT",
     "ElasticPlan",
     "GrowthPlan",
     "GrowthStep",
+    "MAX_GROWTH_GENERATIONS_PER_PLAN",
+    "PARAMETER_GROWTH_MULTIPLIER",
+    "PARAMETER_GROWTH_PREVIEW_STEPS",
     "PrecisionPolicy",
+    "PrecisionTransitionPlan",
     "QuantizedTensor",
+    "VERIFICATION_DTYPE_LADDER",
+    "VerificationDType",
     "build_elastic_plan",
     "build_growth_plan",
     "estimate_weight_storage_bytes",
@@ -515,7 +752,10 @@ __all__ = [
     "format_parameter_count",
     "materialize_bit_precision",
     "next_bit_precision",
+    "parameter_growth_ladder",
+    "parameter_count_after_generations",
     "parse_bit_precision",
     "parse_parameter_count",
+    "plan_precision_transition",
     "quantize_tensor",
 ]

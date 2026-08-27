@@ -1,4 +1,4 @@
-"""Executable arbitrary-bit weight QAT for proof-scale MOIRA models.
+"""Executable INT2/INT4/INT8 weight QAT for proof-scale MOIRA models.
 
 The optimizer owns floating-point master parameters. Linear and embedding
 forwards see a signed symmetric fake-quantized view, so gradients can train the
@@ -9,7 +9,9 @@ from a low-bit-only artifact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -29,23 +31,84 @@ from .model import MoiraModel
 from .synthetic import SYNTHETIC_CURSOR_KIND, DataCursor, SyntheticStream
 
 
-QAT_CHECKPOINT_SCHEMA_VERSION = 1
-_MAX_QAT_BITS = 52
+QAT_CHECKPOINT_SCHEMA_VERSION = 3
 _MAX_QAT_SMOKE_STEPS_PER_STAGE = 32
 
 
-def _validate_qat_bits(value: int | str) -> int:
-    bits = parse_bit_precision(value)
-    if bits > _MAX_QAT_BITS:
-        raise ValueError(
-            "executable QAT is limited to 52 logical bits by FP64 significand precision"
+def qat_config_digest(config: TrainingConfig) -> str:
+    """Bind a continuation checkpoint to one exact validated training config."""
+    if not isinstance(config, TrainingConfig):
+        raise ValueError("QAT config digest requires a TrainingConfig")
+    encoded = json.dumps(
+        asdict(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(b"moira.qat.training-config.v1\x00")
+    digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _validate_config_digest(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("QAT config digest must be a lowercase SHA-256 digest")
+    return value
+
+
+def _cursor_mapping(cursor: DataCursor) -> dict[str, object]:
+    if not isinstance(cursor, DataCursor):
+        raise ValueError("QAT checkpoint data cursor is invalid")
+    return {
+        "kind": cursor.kind,
+        "next_sample_index": cursor.next_sample_index,
+        "samples_seen": cursor.samples_seen,
+        "tokens_seen": cursor.tokens_seen,
+    }
+
+
+def _cursor_from_mapping(value: object) -> DataCursor:
+    if not isinstance(value, Mapping) or set(value) != {
+        "kind",
+        "next_sample_index",
+        "samples_seen",
+        "tokens_seen",
+    }:
+        raise ValueError("QAT checkpoint data cursor fields are invalid")
+    try:
+        return DataCursor(
+            kind=value["kind"],
+            next_sample_index=value["next_sample_index"],
+            samples_seen=value["samples_seen"],
+            tokens_seen=value["tokens_seen"],
         )
-    candidate = 3
-    while candidate < bits:
-        candidate = next_bit_precision(candidate)
-    if candidate != bits:
-        raise ValueError("QAT bits must be a MOIRA precision-lattice level")
-    return bits
+    except (TypeError, ValueError) as error:
+        raise ValueError("QAT checkpoint data cursor is invalid") from error
+
+
+def _validate_cursor_for_config(
+    cursor: DataCursor,
+    *,
+    global_step: int,
+    config: TrainingConfig,
+) -> None:
+    expected_samples = global_step * config.data.batch_size
+    expected_tokens = expected_samples * config.model.max_seq_len
+    if (
+        cursor.next_sample_index != expected_samples
+        or cursor.samples_seen != expected_samples
+        or cursor.tokens_seen != expected_tokens
+    ):
+        raise ValueError("QAT checkpoint cursor does not match its step and config")
+
+
+def _validate_qat_bits(value: int | str) -> int:
+    return parse_bit_precision(value)
 
 
 def fake_quantize_weight_ste(
@@ -62,7 +125,7 @@ def fake_quantize_weight_ste(
         or weight.numel() <= 0
     ):
         raise ValueError("QAT weight must be a non-empty floating tensor")
-    working_dtype = torch.float64 if level > 24 else torch.float32
+    working_dtype = torch.float32
     working = weight.to(dtype=working_dtype)
     qmax = (1 << (level - 1)) - 1
     if not isinstance(per_row, bool):
@@ -82,7 +145,7 @@ def fake_quantize_weight_ste(
 
 
 class IntXWeightParametrization(nn.Module):
-    """Parametrization retaining the master while changing its forward view."""
+    """Parametrization retaining an FP32 master behind an INT2/4/8 view."""
 
     def __init__(self, bits: int | str) -> None:
         super().__init__()
@@ -142,9 +205,9 @@ def _qat_parametrizations(model: nn.Module) -> tuple[IntXWeightParametrization, 
 
 def prepare_model_for_qat(
     model: nn.Module,
-    bits: int | str = 3,
+    bits: int | str = 2,
 ) -> QATPreparation:
-    """Attach an INTx forward view to every Linear and Embedding weight."""
+    """Attach a standard integer view to every Linear and Embedding weight."""
     if not isinstance(model, nn.Module):
         raise ValueError("QAT model must be a torch module")
     level = _validate_qat_bits(bits)
@@ -158,8 +221,8 @@ def prepare_model_for_qat(
     for module in targets:
         if parametrize.is_parametrized(module, "weight"):
             raise ValueError("QAT model is already parametrized")
-        if module.weight.dtype not in {torch.float32, torch.float64}:
-            raise ValueError("QAT master weights must use FP32 or FP64")
+        if module.weight.dtype is not torch.float32:
+            raise ValueError("QAT master weights must use FP32")
     for module in targets:
         parametrize.register_parametrization(
             module,
@@ -214,7 +277,7 @@ def promote_model_qat(model: nn.Module, target_bits: int | str) -> dict[str, obj
     if target <= current:
         raise ValueError("QAT promotion target must exceed the current precision")
     if target != next_bit_precision(current):
-        raise ValueError("QAT promotion must advance by exactly one precision-lattice level")
+        raise ValueError("QAT promotion must advance by exactly one INT2/INT4/INT8 level")
     for item in parametrizations:
         item.set_bits(target)
     return {
@@ -234,12 +297,16 @@ def save_qat_checkpoint(
     optimizer: Optimizer,
     global_step: int,
     precision_history: Sequence[int | str],
+    config_digest: str,
+    data_cursor: DataCursor,
 ) -> Path:
     """Atomically save an experimental trusted-local QAT continuation checkpoint."""
     if type(global_step) is not int or global_step <= 0:
         raise ValueError("QAT checkpoint step must be a positive integer")
     if not isinstance(optimizer, Optimizer):
         raise ValueError("QAT checkpoint optimizer is invalid")
+    validated_config_digest = _validate_config_digest(config_digest)
+    cursor_mapping = _cursor_mapping(data_cursor)
     history = _validate_precision_history(precision_history)
     state = qat_model_state(model)
     if state["logical_bits"] != format_bit_precision(history[-1]):
@@ -256,6 +323,8 @@ def save_qat_checkpoint(
         "schema_version": QAT_CHECKPOINT_SCHEMA_VERSION,
         "global_step": global_step,
         "precision_history": list(history),
+        "config_digest": validated_config_digest,
+        "data_cursor": cursor_mapping,
         "qat_state": state,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
@@ -300,6 +369,8 @@ def verify_qat_checkpoint(path: str | Path) -> dict[str, object]:
         "schema_version",
         "global_step",
         "precision_history",
+        "config_digest",
+        "data_cursor",
         "qat_state",
         "model_state",
         "optimizer_state",
@@ -310,6 +381,8 @@ def verify_qat_checkpoint(path: str | Path) -> dict[str, object]:
         raise ValueError("QAT checkpoint schema version is unsupported")
     if type(payload["global_step"]) is not int or payload["global_step"] <= 0:
         raise ValueError("QAT checkpoint step is invalid")
+    config_digest = _validate_config_digest(payload["config_digest"])
+    data_cursor = _cursor_from_mapping(payload["data_cursor"])
     history = payload["precision_history"]
     if not isinstance(history, list) or not history:
         raise ValueError("QAT checkpoint precision history is invalid")
@@ -325,10 +398,10 @@ def verify_qat_checkpoint(path: str | Path) -> dict[str, object]:
     )
     if not master_keys or any(
         not isinstance(model_state[key], Tensor)
-        or model_state[key].dtype not in {torch.float32, torch.float64}
+        or model_state[key].dtype is not torch.float32
         for key in master_keys
     ):
-        raise ValueError("QAT checkpoint does not retain floating master weights")
+        raise ValueError("QAT checkpoint does not retain FP32 master weights")
     if qat_state.get("logical_bits") != format_bit_precision(levels[-1]):
         raise ValueError("QAT checkpoint precision state and history disagree")
     if qat_state.get("master_weights_retained") is not True:
@@ -341,6 +414,8 @@ def verify_qat_checkpoint(path: str | Path) -> dict[str, object]:
         "checkpoint": str(checkpoint_path.resolve()),
         "global_step": payload["global_step"],
         "precision_history": [format_bit_precision(value) for value in levels],
+        "config_digest": config_digest,
+        "data_cursor": _cursor_mapping(data_cursor),
         "logical_bits": qat_state["logical_bits"],
         "master_tensor_entries": len(master_keys),
         "master_weights_retained": True,
@@ -353,9 +428,13 @@ def load_qat_checkpoint(
     *,
     model: nn.Module,
     optimizer: Optimizer | None = None,
+    expected_config_digest: str,
 ) -> dict[str, object]:
     """Restore a verified trusted-local continuation checkpoint."""
     verified = verify_qat_checkpoint(path)
+    expected_digest = _validate_config_digest(expected_config_digest)
+    if verified["config_digest"] != expected_digest:
+        raise ValueError("QAT checkpoint config digest does not match")
     if not isinstance(model, nn.Module):
         raise ValueError("QAT checkpoint model must be a torch module")
     if optimizer is not None and not isinstance(optimizer, Optimizer):
@@ -410,13 +489,14 @@ def _validate_precision_history(
 def run_moira_qat_smoke(
     config: TrainingConfig,
     *,
-    initial_bits: int | str = 3,
-    promote_to: int | str = 6,
+    initial_bits: int | str = 2,
+    promote_to: int | str = 4,
     steps_per_stage: int = 1,
     device: str = "cpu",
     checkpoint: str | Path | None = None,
+    resume: bool = False,
 ) -> dict[str, object]:
-    """Train a bounded MOIRA model before and after one precision promotion."""
+    """Train a bounded MOIRA model at INT8 or across one precision promotion."""
     if not isinstance(config, TrainingConfig):
         raise ValueError("QAT smoke config must be a TrainingConfig")
     if (
@@ -426,10 +506,29 @@ def run_moira_qat_smoke(
         raise ValueError("QAT steps per stage must be between 1 and 32")
     if device not in {"cpu", "cuda"}:
         raise ValueError("QAT device must be cpu or cuda")
+    if type(resume) is not bool:
+        raise ValueError("QAT resume flag must be boolean")
     if device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA is not available for the QAT smoke run")
     initial = _validate_qat_bits(initial_bits)
     target = _validate_qat_bits(promote_to)
+    single_stage = initial == target
+    if single_stage and initial != 8:
+        raise ValueError("equal QAT precisions are supported only for single-stage int8")
+    if not single_stage and target != next_bit_precision(initial):
+        raise ValueError("QAT promotion must advance exactly one precision level")
+    if resume and (not single_stage or initial != 8):
+        raise ValueError("QAT resume currently supports only single-stage int8")
+    if resume and config.model.dropout != 0.0:
+        raise ValueError("QAT resume requires dropout 0 until RNG state is checkpointed")
+    if resume and checkpoint is None:
+        raise ValueError("QAT resume requires an existing checkpoint")
+    if resume and checkpoint is not None and not os.path.lexists(checkpoint):
+        raise ValueError("QAT resume checkpoint does not exist")
+    if not resume and checkpoint is not None and os.path.lexists(checkpoint):
+        raise ValueError("QAT checkpoint already exists; use resume to continue it")
+    precision_history = (initial,) if single_stage else (initial, target)
+    config_digest = qat_config_digest(config)
 
     torch.manual_seed(config.reproducibility.seed)
     if device == "cuda":
@@ -450,6 +549,23 @@ def run_moira_qat_smoke(
         config.model.max_seq_len,
     )
     cursor = DataCursor(SYNTHETIC_CURSOR_KIND, 0, 0, 0)
+    starting_global_step = 0
+    if resume:
+        restored = load_qat_checkpoint(
+            checkpoint,
+            model=model,
+            optimizer=optimizer,
+            expected_config_digest=config_digest,
+        )
+        if restored["precision_history"] != ["int8"]:
+            raise ValueError("QAT resume checkpoint is not a single-stage int8 lineage")
+        starting_global_step = int(restored["global_step"])
+        cursor = _cursor_from_mapping(restored["data_cursor"])
+        _validate_cursor_for_config(
+            cursor,
+            global_step=starting_global_step,
+            config=config,
+        )
     losses: list[float] = []
     bf16_available = device == "cuda" and torch.cuda.is_bf16_supported()
     autocast_bf16 = False
@@ -492,21 +608,27 @@ def run_moira_qat_smoke(
             losses.append(float(loss.detach().item()))
 
     train_stage()
-    promotion = promote_model_qat(model, target)
-    train_stage()
+    promotion = None
+    if not single_stage:
+        promotion = promote_model_qat(model, target)
+        train_stage()
     if device == "cuda":
         torch.cuda.synchronize()
+    global_step = starting_global_step + steps_per_stage * len(precision_history)
+    _validate_cursor_for_config(cursor, global_step=global_step, config=config)
     checkpoint_path = None
     if checkpoint is not None:
         checkpoint_path = save_qat_checkpoint(
             checkpoint,
             model=model,
             optimizer=optimizer,
-            global_step=steps_per_stage * 2,
-            precision_history=(initial, target),
+            global_step=global_step,
+            precision_history=precision_history,
+            config_digest=config_digest,
+            data_cursor=cursor,
         )
     return {
-        "architecture": "MOIRA-master-retained-INTx-QAT-v1",
+        "architecture": "MOIRA-master-retained-standard-INT-QAT-v2",
         "model": "MOIRA",
         "device": device,
         "compute_dtype": "fp32",
@@ -516,16 +638,28 @@ def run_moira_qat_smoke(
         "preparation": preparation.to_dict(),
         "promotion": promotion,
         "final_qat_state": qat_model_state(model),
-        "precision_history": [format_bit_precision(initial), format_bit_precision(target)],
+        "precision_history": [
+            format_bit_precision(level) for level in precision_history
+        ],
         "steps_per_stage": steps_per_stage,
-        "global_step": steps_per_stage * 2,
+        "resumed": resume,
+        "starting_global_step": starting_global_step,
+        "global_step": global_step,
+        "config_digest": config_digest,
+        "data_cursor": _cursor_mapping(cursor),
+        "resume_scope": "weights-optimizer-and-synthetic-cursor",
+        "exact_resume_guaranteed": False,
         "losses": losses,
         "all_losses_finite": all(torch.isfinite(torch.tensor(losses)).tolist()),
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
+        "trainable_parameters": model.parameter_ledger().total_trainable,
         "peak_cuda_memory_bytes": (
             torch.cuda.max_memory_allocated() if device == "cuda" else 0
         ),
-        "scope": "proof-scale-weight-only-QAT-not-a-trained-3B-checkpoint",
+        "peak_cuda_reserved_bytes": (
+            torch.cuda.max_memory_reserved() if device == "cuda" else 0
+        ),
+        "scope": "proof-scale-weight-only-QAT-no-parameter-growth",
     }
 
 
@@ -537,6 +671,7 @@ __all__ = [
     "load_qat_checkpoint",
     "prepare_model_for_qat",
     "promote_model_qat",
+    "qat_config_digest",
     "qat_model_state",
     "run_moira_qat_smoke",
     "save_qat_checkpoint",

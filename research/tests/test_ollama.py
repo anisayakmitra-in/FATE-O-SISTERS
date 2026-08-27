@@ -17,14 +17,20 @@ from moira.context import (
 from moira.masks import CognitiveMode
 from moira.ollama import (
     ACTION_SCHEMA,
+    DEFAULT_OLLAMA_CONTEXT_TOKENS,
+    MAX_OLLAMA_CONTEXT_TOKENS,
     OllamaCognition,
     OllamaConfig,
     ollama_action_request,
+    ollama_request_token_cost,
     parse_ollama_action,
+    serialize_ollama_request,
 )
 
 
-def _context() -> AgentContext:
+def _context(
+    task_content: str = "Inspect README.md and explain the result",
+) -> AgentContext:
     assembly = ContextAssembler().assemble(
         task_id="task-1",
         scope_id="workspace-1",
@@ -35,7 +41,7 @@ def _context() -> AgentContext:
                 trust=ContextTrust.USER_SUPPLIED,
                 classification=ContextClassification.PRIVATE,
                 scope_id="workspace-1",
-                content="Inspect README.md and explain the result",
+                content=task_content,
                 provenance="test-task",
                 required=True,
             ),
@@ -83,7 +89,10 @@ def test_ollama_request_uses_local_model_structured_action_schema() -> None:
     assert request["model"] == "moira:3b"
     assert request["stream"] is False
     assert request["format"] == ACTION_SCHEMA
-    assert request["options"] == {"temperature": 0}
+    assert request["options"] == {
+        "num_ctx": DEFAULT_OLLAMA_CONTEXT_TOKENS,
+        "temperature": 0,
+    }
     assert context["context"][0]["content"] == (
         "Inspect README.md and explain the result"
     )
@@ -131,6 +140,9 @@ def test_ollama_cognition_calls_local_chat_endpoint_and_returns_tool_action() ->
     assert captured["url"] == "http://127.0.0.1:11434/api/chat"
     assert captured["timeout"] == 15.0
     assert captured["request"]["model"] == "moira:3b"
+    assert captured["request"]["options"]["num_ctx"] == (
+        DEFAULT_OLLAMA_CONTEXT_TOKENS
+    )
     assert action.kind is AgentActionKind.USE_TOOL
     assert action.tool_id == "workspace.read"
     assert action.target == "README.md"
@@ -197,6 +209,75 @@ def test_ollama_defaults_to_loopback_and_requires_opt_in_for_remote() -> None:
         allow_remote=True,
     )
     assert remote.allow_remote is True
+
+
+def test_ollama_preflight_accounts_for_the_canonical_full_request() -> None:
+    context = _context()
+    request = ollama_action_request(
+        "moira:3b",
+        context,
+        context_window_tokens=4_096,
+    )
+    encoded = serialize_ollama_request(request)
+
+    assert ollama_request_token_cost(request) == len(encoded)
+    assert len(encoded) > context.context.receipt.tokens_used
+    assert b'"num_ctx":4096' in encoded
+    assert b'"format":{"additionalProperties":false' in encoded
+    assert b"workspace.read" in encoded
+    assert b"context_receipt" in encoded
+    assert b"Inspect README.md and explain the result" in encoded
+
+
+def test_ollama_preflight_accounts_for_nested_json_escaping() -> None:
+    content = 'Inspect "caf\u00e9\\notes"'
+    context = _context(content)
+    request = ollama_action_request("moira:3b", context)
+    encoded = serialize_ollama_request(request)
+
+    assert b"caf\\\\u00e9" in encoded
+    assert b"\\\\\\\"" in encoded
+    assert len(encoded) > len(content.encode("utf-8"))
+
+
+def test_ollama_preflight_fails_before_transport_when_envelope_overflows() -> None:
+    calls = 0
+
+    def transport(
+        url: str, payload: bytes, timeout: float, maximum: int
+    ) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("transport must not run after preflight failure")
+
+    context = _context()
+    assert context.context.receipt.tokens_used < 256
+    cognition = OllamaCognition(
+        OllamaConfig("moira:3b", context_window_tokens=256),
+        transport=transport,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"exceeds configured context window \([0-9]+ > 256\)",
+    ):
+        cognition.next_action(context)
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "context_window_tokens",
+    (False, 0, MAX_OLLAMA_CONTEXT_TOKENS + 1),
+)
+def test_ollama_rejects_invalid_context_windows(
+    context_window_tokens: object,
+) -> None:
+    with pytest.raises(ValueError, match="context window"):
+        OllamaConfig(
+            "moira:3b",
+            context_window_tokens=context_window_tokens,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(

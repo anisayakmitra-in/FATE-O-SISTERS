@@ -1,4 +1,6 @@
 from dataclasses import replace
+from pathlib import Path
+import tomllib
 
 import pytest
 import moira
@@ -15,6 +17,9 @@ from moira.config import (
 from moira.model import MoiraModel
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
 def test_m0_config_is_valid_and_head_aligned() -> None:
     config = ModelConfig.m0_cpu()
     assert config.d_model % config.n_heads == 0
@@ -28,6 +33,28 @@ def test_m2_config_parameter_contract() -> None:
 
     assert model.parameter_ledger().total_trainable == 153_349_122
     assert config.expected_trainable_parameters == 153_349_122
+
+
+def test_m1_local_int8_config_preserves_exact_m1_parameter_contract() -> None:
+    path = REPOSITORY_ROOT / "research" / "configs" / "m1-local-int8.toml"
+    with path.open("rb") as handle:
+        raw = tomllib.load(handle)
+    config = TrainingConfig(
+        schema_version=raw["schema_version"],
+        model=ModelConfig(**raw["model"]),
+        data=DataConfig(**raw["data"]),
+        optimization=OptimizationConfig(**raw["optimization"]),
+        reproducibility=ReproducibilityConfig(**raw["reproducibility"]),
+        run=RunConfig(**raw["run"]),
+    )
+    with torch.device("meta"):
+        model = MoiraModel(config.model)
+
+    assert model.parameter_ledger().total_trainable == 33_032_562
+    assert config.model.expected_trainable_parameters == 33_032_562
+    assert config.model.max_seq_len == 64
+    assert config.data.batch_size == 1
+    assert config.optimization.precision == "fp32"
 
 
 def test_package_exposes_the_task_one_configuration_interfaces() -> None:

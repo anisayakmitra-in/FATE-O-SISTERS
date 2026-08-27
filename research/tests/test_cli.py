@@ -14,6 +14,9 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "research" / "configs" / "m0-smoke.toml"
+M1_QAT_CONFIG_PATH = (
+    REPOSITORY_ROOT / "research" / "configs" / "m1-local-int8.toml"
+)
 AGENT_TRAIN_MANIFEST = (
     REPOSITORY_ROOT
     / "research"
@@ -183,6 +186,8 @@ def test_agent_run_ollama_uses_local_structured_api_and_finishes(
             f"http://127.0.0.1:{server.server_port}",
             "--max-steps",
             2,
+            "--context-window-tokens",
+            4096,
         )
     finally:
         server.shutdown()
@@ -197,12 +202,14 @@ def test_agent_run_ollama_uses_local_structured_api_and_finishes(
     assert output["profile"] == "read-only"
     assert output["enabled_tools"] == ["workspace.read", "workspace.search"]
     assert output["model"] == "moira-test:latest"
+    assert output["context_window_tokens"] == 4096
     assert output["steps"] == 2
     assert output["effects"] == 1
     assert len(output["receipts"]) == 1
     assert len(requests) == 2
     assert requests[0]["model"] == "moira-test:latest"
     assert requests[0]["stream"] is False
+    assert requests[0]["options"]["num_ctx"] == 4096
     assert requests[0]["format"]["additionalProperties"] is False
     tool_context = _tool_context_entry(requests[1])
     assert tool_context["content"] == "evidence.txt:1:needle"
@@ -498,7 +505,15 @@ def test_deployment_switch_persists_policy_without_changing_weights(
     state_path = cli_root / "deployment.json"
 
     consumer = _output_json(
-        _run_cli("deployment", "switch", "consumer", "--state", state_path)
+        _run_cli(
+            "deployment",
+            "switch",
+            "consumer",
+            "--state",
+            state_path,
+            "--root-parameters",
+            "33,032,562",
+        )
     )
     enterprise = _output_json(
         _run_cli("deployment", "switch", "enterprise", "--state", state_path)
@@ -511,9 +526,45 @@ def test_deployment_switch_persists_policy_without_changing_weights(
     assert enterprise["profile"] == "enterprise"
     assert enterprise["switch_applied"] is True
     assert enterprise["weights_converted"] is False
+    assert enterprise["schema_version"] == 2
+    assert enterprise["parameter_root"] == "33,032,562"
+    assert enterprise["parameter_root_parameters"] == 33_032_562
     assert persisted["profile"] == "enterprise"
     assert persisted["precision_policy"]["verifier_compute_dtype"] == "fp64"
+    assert persisted["precision_policy"]["whole_model_fp64_allowed"] is False
+    assert persisted["fp64_scope"] == "bounded-verification-arithmetic-only"
+    assert persisted["parameter_count_is_separate_from_precision"] is True
     assert persisted["state_only_no_weight_conversion"] is True
+
+
+def test_user_profile_alias_switches_from_enterprise_and_persists_consumer(
+    cli_root: Path,
+) -> None:
+    state_path = cli_root / "deployment-user-alias.json"
+
+    enterprise = _output_json(
+        _run_cli(
+            "deployment",
+            "switch",
+            "enterprise",
+            "--state",
+            state_path,
+            "--root-parameters",
+            "33,032,562",
+        )
+    )
+    user = _output_json(
+        _run_cli("deployment", "switch", "user", "--state", state_path)
+    )
+    described = _output_json(_run_cli("deployment", "describe", "user"))
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert enterprise["profile"] == "enterprise"
+    assert user["previous_profile"] == "enterprise"
+    assert user["profile"] == "consumer"
+    assert described["profile"] == "consumer"
+    assert persisted["profile"] == "consumer"
+    assert persisted["precision_policy"]["profile"] == "consumer"
 
 
 def test_doctor_reports_the_exact_m0_cpu_surface(cli_root: Path) -> None:
@@ -569,53 +620,127 @@ def test_m1_capability_evaluation_command_is_registered() -> None:
 
 
 def test_elastic_policy_and_unbounded_growth_plan_cli() -> None:
-    policy = _output_json(_run_cli("elastic", "policy", "--profile", "enterprise"))
+    policy = _output_json(
+        _run_cli(
+            "elastic",
+            "policy",
+            "--profile",
+            "enterprise",
+            "--root",
+            "33,032,562",
+        )
+    )
     assert policy["bit_precision_ladder"] == [
-        "int3",
-        "int6",
-        "int9",
-        "int27",
-        "int81",
+        "int2",
+        "int4",
+        "int8",
     ]
     assert policy["parameter_growth_ladder"] == [
-        "3B",
-        "9B",
-        "27B",
-        "81B",
-        "243B",
-        "729B",
+        "33,032,562",
+        "99,097,686",
+        "297,293,058",
+        "891,879,174",
+        "2,675,637,522",
+        "8,026,912,566",
     ]
     assert policy["unbounded_parameter_growth"] is True
-    assert policy["precision_policy"]["verifier_bits"] == "int81"
+    assert policy["parameter_root_parameters"] == 33_032_562
+    assert policy["parameter_growth_policy"]["root_relative"] is True
+    assert policy["precision_policy"]["verifier_bits"] == "int8"
+    assert policy["whole_model_compute_dtypes"] == ["bf16", "fp16", "fp32"]
+    assert policy["verification_compute_dtypes"] == ["fp32", "fp64"]
 
     plan = _output_json(
         _run_cli(
             "elastic",
             "plan",
-            "--current",
-            "3B",
+            "--root",
+            "33,032,562",
             "--target",
-            "243B",
+            "891,879,174",
             "--profile",
             "consumer",
-            "--runtime-bits",
-            "int6",
+            "--runtime-precision",
+            "int4",
         )
     )
-    assert plan["runtime_bits"] == "int6"
-    assert plan["growth"]["target"] == "243B"
+    assert plan["runtime_bits"] == "int4"
+    assert plan["growth"]["root"] == "33,032,562"
+    assert plan["growth"]["target"] == "891,879,174"
     assert [step["target"] for step in plan["growth"]["steps"]] == [
-        "9B",
-        "27B",
-        "81B",
-        "243B",
+        "99,097,686",
+        "297,293,058",
+        "891,879,174",
     ]
     assert plan["growth"]["unbounded_growth"] is True
     assert plan["status"] == "plan-only-no-target-allocation"
 
+    generated = _output_json(
+        _run_cli(
+            "elastic",
+            "plan",
+            "--root",
+            "9B",
+            "--generations",
+            5,
+            "--profile",
+            "user",
+            "--runtime-precision",
+            "int4",
+        )
+    )
+    assert generated["growth"]["target"] == "2187B"
+    assert generated["growth"]["generations"] == 5
+    assert generated["growth"]["per_plan_generation_limit"] == 32
+    assert generated["growth"]["repeatable_from_qualified_child"] is True
+    assert generated["precision"]["profile"] == "consumer"
 
-def test_qat_smoke_cli_trains_int3_then_promotes_to_int6(cli_root: Path) -> None:
-    checkpoint = cli_root / "int3-to-int6.pt"
+
+def test_precision_plan_cli_is_non_mutating_and_fp64_is_verifier_only() -> None:
+    master_backed = _output_json(
+        _run_cli(
+            "precision",
+            "plan",
+            "--from",
+            "int8",
+            "--to",
+            "fp16",
+            "--master-retained",
+        )
+    )
+    verifier = _output_json(
+        _run_cli(
+            "precision",
+            "plan",
+            "--from",
+            "fp32",
+            "--to",
+            "fp64",
+            "--scope",
+            "verifier",
+        )
+    )
+    rejected = _run_cli(
+        "precision",
+        "plan",
+        "--from",
+        "fp32",
+        "--to",
+        "fp64",
+    )
+
+    assert master_backed["uses_retained_master"] is True
+    assert master_backed["reconstructs_discarded_information"] is False
+    assert master_backed["plan_only"] is True
+    assert master_backed["artifact_exported"] is False
+    assert verifier["scope"] == "verifier"
+    assert verifier["whole_model_fp64_allowed"] is False
+    assert rejected.returncode == 2
+    assert "fp64 is allowed only for bounded verifier arithmetic" in rejected.stderr
+
+
+def test_qat_smoke_cli_trains_int2_then_promotes_to_int4(cli_root: Path) -> None:
+    checkpoint = cli_root / "int2-to-int4.pt"
     output = _output_json(
         _run_cli(
             "elastic",
@@ -623,9 +748,9 @@ def test_qat_smoke_cli_trains_int3_then_promotes_to_int6(cli_root: Path) -> None
             "--config",
             CONFIG_PATH,
             "--initial-bits",
-            "int3",
+            "int2",
             "--promote-to",
-            "int6",
+            "int4",
             "--steps-per-stage",
             1,
             "--device",
@@ -635,15 +760,38 @@ def test_qat_smoke_cli_trains_int3_then_promotes_to_int6(cli_root: Path) -> None
         )
     )
 
-    assert output["architecture"] == "MOIRA-master-retained-INTx-QAT-v1"
-    assert output["precision_history"] == ["int3", "int6"]
+    assert output["architecture"] == "MOIRA-master-retained-standard-INT-QAT-v2"
+    assert output["precision_history"] == ["int2", "int4"]
     assert output["preparation"]["master_weights_retained"] is True
     assert output["promotion"]["reconstructed_from_low_bit_artifact"] is False
-    assert output["final_qat_state"]["logical_bits"] == "int6"
+    assert output["final_qat_state"]["logical_bits"] == "int4"
     assert output["global_step"] == 2
     assert output["all_losses_finite"] is True
-    assert output["scope"] == "proof-scale-weight-only-QAT-not-a-trained-3B-checkpoint"
+    assert output["scope"] == "proof-scale-weight-only-QAT-no-parameter-growth"
     assert Path(str(output["checkpoint"])).is_file()
+    assert "--resume" in _run_cli("elastic", "qat-smoke", "--help").stdout
+
+
+def test_qat_smoke_cli_admits_exact_m1_config_without_raising_global_m0_cap() -> None:
+    result = _run_cli(
+        "elastic",
+        "qat-smoke",
+        "--config",
+        M1_QAT_CONFIG_PATH,
+        "--initial-bits",
+        "int8",
+        "--promote-to",
+        "int8",
+        "--steps-per-stage",
+        0,
+        "--device",
+        "cpu",
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "QAT steps per stage must be between 1 and 32" in result.stderr
+    assert "10M-parameter Phase 0 M0 budget" not in result.stderr
 
 
 def test_train_verify_evaluate_and_auto_resume_cli(cli_root: Path) -> None:

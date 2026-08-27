@@ -21,6 +21,8 @@ from .agent_loop import (
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_CONTEXT_TOKENS = 128 * 1024
+MAX_OLLAMA_CONTEXT_TOKENS = 1_000_000
 _MAX_OLLAMA_RESPONSE_BYTES = 4 * 1024 * 1024
 
 ACTION_SCHEMA: dict[str, object] = {
@@ -46,6 +48,7 @@ class OllamaConfig:
     base_url: str = DEFAULT_OLLAMA_URL
     timeout_seconds: float = 60.0
     allow_remote: bool = False
+    context_window_tokens: int = DEFAULT_OLLAMA_CONTEXT_TOKENS
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_remote, bool):
@@ -64,6 +67,11 @@ class OllamaConfig:
             or not 0 < float(self.timeout_seconds) <= 600
         ):
             raise ValueError("Ollama timeout must be between 0 and 600 seconds")
+        if (
+            type(self.context_window_tokens) is not int
+            or not 1 <= self.context_window_tokens <= MAX_OLLAMA_CONTEXT_TOKENS
+        ):
+            raise ValueError("Ollama context window is outside its bounded range")
 
 
 OllamaTransport = Callable[[str, bytes, float, int], dict[str, Any]]
@@ -86,11 +94,17 @@ class OllamaCognition:
     def next_action(self, context: AgentContext) -> AgentAction:
         if not isinstance(context, AgentContext):
             raise ValueError("context must be an AgentContext")
-        request = ollama_action_request(self.config.model, context)
+        request = ollama_action_request(
+            self.config.model,
+            context,
+            context_window_tokens=self.config.context_window_tokens,
+        )
         endpoint = self.config.base_url.rstrip("/") + "/api/chat"
-        encoded = json.dumps(
-            request, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        encoded = serialize_ollama_request(request)
+        _preflight_ollama_request(
+            encoded,
+            context_window_tokens=self.config.context_window_tokens,
+        )
         response = self._transport(
             endpoint,
             encoded,
@@ -100,13 +114,26 @@ class OllamaCognition:
         return parse_ollama_action(response)
 
 
-def ollama_action_request(model: str, context: AgentContext) -> dict[str, object]:
+def ollama_action_request(
+    model: str,
+    context: AgentContext,
+    *,
+    context_window_tokens: int = DEFAULT_OLLAMA_CONTEXT_TOKENS,
+) -> dict[str, object]:
+    if (
+        type(context_window_tokens) is not int
+        or not 1 <= context_window_tokens <= MAX_OLLAMA_CONTEXT_TOKENS
+    ):
+        raise ValueError("Ollama context window is outside its bounded range")
     context_value = agent_context_mapping(context)
     return {
         "model": model,
         "stream": False,
         "format": ACTION_SCHEMA,
-        "options": {"temperature": 0},
+        "options": {
+            "num_ctx": context_window_tokens,
+            "temperature": 0,
+        },
         "messages": [
             {
                 "role": "system",
@@ -130,6 +157,37 @@ def ollama_action_request(model: str, context: AgentContext) -> dict[str, object
             },
         ],
     }
+
+
+def serialize_ollama_request(request: object) -> bytes:
+    """Serialize one request exactly as the transport will send it."""
+    try:
+        return json.dumps(
+            request,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError("Ollama request is not JSON serializable") from error
+
+
+def ollama_request_token_cost(request: object) -> int:
+    """Return the exact cost under MOIRA's conservative UTF-8-byte tokenizer."""
+    return len(serialize_ollama_request(request))
+
+
+def _preflight_ollama_request(
+    encoded: bytes,
+    *,
+    context_window_tokens: int,
+) -> None:
+    token_cost = len(encoded)
+    if token_cost > context_window_tokens:
+        raise ValueError(
+            "Ollama request exceeds configured context window "
+            f"({token_cost} > {context_window_tokens})"
+        )
 
 
 def parse_ollama_action(response: object) -> AgentAction:
@@ -202,9 +260,14 @@ def _validate_base_url(value: object, allow_remote: bool) -> None:
 
 __all__ = [
     "ACTION_SCHEMA",
+    "DEFAULT_OLLAMA_CONTEXT_TOKENS",
     "DEFAULT_OLLAMA_URL",
+    "MAX_OLLAMA_CONTEXT_TOKENS",
     "OllamaConfig",
     "OllamaCognition",
+    "OllamaTransport",
     "ollama_action_request",
+    "ollama_request_token_cost",
     "parse_ollama_action",
+    "serialize_ollama_request",
 ]

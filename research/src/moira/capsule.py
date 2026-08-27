@@ -1,6 +1,7 @@
 """Typed capability capsules and their in-memory integrity evidence."""
 
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha256
 import json
 from typing import Collection
@@ -10,6 +11,142 @@ from torch import Tensor
 
 
 CAPSULE_ABI_VERSION = 1
+CAPABILITY_OBSERVATION_ABI_VERSION = 2
+
+
+class CapabilityEvidenceClass(str, Enum):
+    UNTRUSTED_RETRIEVAL = "untrusted-retrieval"
+    WEAK_BEHAVIOR = "weak-behavior"
+    EXPLICIT_CORRECTION = "explicit-correction"
+    DURABLE_ACCEPTED_EDIT = "durable-accepted-edit"
+    INDEPENDENT_VERIFICATION = "independent-verification"
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityResourceCostV1:
+    cpu_time_ms: int
+    gpu_time_ms: int
+    peak_memory_bytes: int
+
+    def validate(self) -> None:
+        if any(
+            type(value) is not int or value < 0
+            for value in (self.cpu_time_ms, self.gpu_time_ms, self.peak_memory_bytes)
+        ):
+            raise ValueError("resource cost values must be non-negative integers")
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityObservationV2:
+    """A source-bound capability observation; receipt references grant no authority."""
+
+    abi_version: int
+    capability_id: str
+    capability_version: str
+    task_id: str
+    scope_id: str
+    owner_or_tenant: str
+    modality: str
+    evidence_class: CapabilityEvidenceClass
+    raw_artifact_digest: str
+    feature_digest: str
+    preprocessing_digest: str
+    encoder_digest: str
+    latent: Tensor
+    uncertainty: Tensor | None
+    coordinates: Tensor | None
+    resource_cost: CapabilityResourceCostV1
+    permission_receipt_ref: str
+
+    def validate(
+        self,
+        *,
+        expected_width: int,
+        feature_tensor: Tensor,
+        expected_raw_artifact_digest: str,
+    ) -> None:
+        if self.abi_version != CAPABILITY_OBSERVATION_ABI_VERSION:
+            raise ValueError("unsupported capability observation ABI version")
+        for name, value in (
+            ("capability_id", self.capability_id),
+            ("capability_version", self.capability_version),
+            ("task_id", self.task_id),
+            ("scope_id", self.scope_id),
+            ("owner_or_tenant", self.owner_or_tenant),
+            ("modality", self.modality),
+            ("permission_receipt_ref", self.permission_receipt_ref),
+        ):
+            _require_nonempty(name, value)
+        if not isinstance(self.evidence_class, CapabilityEvidenceClass):
+            raise ValueError("evidence_class must be a CapabilityEvidenceClass")
+        for name, value in (
+            ("raw_artifact_digest", self.raw_artifact_digest),
+            ("feature_digest", self.feature_digest),
+            ("preprocessing_digest", self.preprocessing_digest),
+            ("encoder_digest", self.encoder_digest),
+        ):
+            _require_sha256(name, value)
+        if type(expected_width) is not int or expected_width <= 0:
+            raise ValueError("expected_width must be positive")
+        _require_floating_matrix("latent", self.latent)
+        slots, width = self.latent.shape
+        if slots <= 0 or width != expected_width:
+            raise ValueError("latent shape does not match expected_width")
+        if self.uncertainty is not None:
+            _require_floating_vector("uncertainty", self.uncertainty, slots)
+            if torch.any((self.uncertainty < 0) | (self.uncertainty > 1)):
+                raise ValueError("uncertainty must be in [0, 1] or explicitly unknown")
+            _require_same_device(self.latent, self.uncertainty)
+        if self.coordinates is not None:
+            _require_floating_matrix("coordinates", self.coordinates)
+            if self.coordinates.shape[0] != slots or self.coordinates.shape[1] <= 0:
+                raise ValueError("coordinates slots must match latent slots")
+            _require_same_device(self.latent, self.coordinates)
+        if not isinstance(self.resource_cost, CapabilityResourceCostV1):
+            raise ValueError("resource_cost must be CapabilityResourceCostV1")
+        self.resource_cost.validate()
+        if tensor_content_digest(feature_tensor) != self.feature_digest:
+            raise ValueError("feature tensor digest does not match the observation")
+        _require_sha256("expected_raw_artifact_digest", expected_raw_artifact_digest)
+        if expected_raw_artifact_digest != self.raw_artifact_digest:
+            raise ValueError("raw artifact digest does not match the observation")
+
+    @property
+    def observation_digest(self) -> str:
+        digest = sha256()
+        header = {
+            "abi_version": self.abi_version,
+            "capability_id": self.capability_id,
+            "capability_version": self.capability_version,
+            "encoder_digest": self.encoder_digest,
+            "evidence_class": (
+                self.evidence_class.value
+                if isinstance(self.evidence_class, CapabilityEvidenceClass)
+                else self.evidence_class
+            ),
+            "feature_digest": self.feature_digest,
+            "modality": self.modality,
+            "owner_or_tenant": self.owner_or_tenant,
+            "permission_receipt_ref": self.permission_receipt_ref,
+            "preprocessing_digest": self.preprocessing_digest,
+            "raw_artifact_digest": self.raw_artifact_digest,
+            "resource_cost": {
+                "cpu_time_ms": self.resource_cost.cpu_time_ms,
+                "gpu_time_ms": self.resource_cost.gpu_time_ms,
+                "peak_memory_bytes": self.resource_cost.peak_memory_bytes,
+            },
+            "scope_id": self.scope_id,
+            "task_id": self.task_id,
+            "uncertainty": "unknown" if self.uncertainty is None else "calibrated",
+        }
+        digest.update(
+            json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        for name in ("latent", "uncertainty", "coordinates"):
+            tensor = getattr(self, name)
+            if tensor is not None:
+                _update_tensor(digest, name, tensor)
+        return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,9 +248,31 @@ def capsule_digest(capsule: CapabilityCapsule) -> str:
     return digest.hexdigest()
 
 
+def tensor_content_digest(tensor: Tensor) -> str:
+    """Hash one concrete tensor with its dtype and shape as source evidence."""
+    if (
+        not isinstance(tensor, Tensor)
+        or tensor.device.type == "meta"
+        or (tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()))
+    ):
+        raise ValueError("tensor must be concrete and finite")
+    digest = sha256()
+    _update_tensor(digest, "feature", tensor)
+    return digest.hexdigest()
+
+
 def _require_nonempty(name: str, value: object) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a nonempty string")
+
+
+def _require_sha256(name: str, value: object) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
 
 
 def _validate_allowed_scope_ids(allowed_scope_ids: Collection[str]) -> None:

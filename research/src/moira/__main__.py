@@ -48,12 +48,12 @@ from .config import (
     TrainingConfig,
 )
 from .dataset import SourceCatalog, iter_jsonl_examples
-from .deployment import switch_deployment_profile
+from .deployment import deployment_state, switch_deployment_profile
 from .elastic import (
-    BIT_PRECISION_LADDER,
-    CANONICAL_PARAMETER_LADDER,
-    PrecisionPolicy,
+    MAX_GROWTH_GENERATIONS_PER_PLAN,
     build_elastic_plan,
+    parameter_count_after_generations,
+    plan_precision_transition,
 )
 from .host import StandaloneConsolePort
 from .local_tools import DeveloperWorkspace, ReadOnlyWorkspace
@@ -66,7 +66,12 @@ from .m1_train import (
 )
 from .scale_probe import run_scale_probe
 from .qat import run_moira_qat_smoke
-from .ollama import DEFAULT_OLLAMA_URL, OllamaConfig, OllamaCognition
+from .ollama import (
+    DEFAULT_OLLAMA_CONTEXT_TOKENS,
+    DEFAULT_OLLAMA_URL,
+    OllamaConfig,
+    OllamaCognition,
+)
 from .process_tools import AllowlistedProcessRunner
 from .synthetic import SyntheticStream
 from .train import (
@@ -89,6 +94,7 @@ _CONFIG_SECTIONS = {
 }
 _MAX_CONFIG_BYTES = 1024 * 1024
 _MAX_M0_TRAINABLE_PARAMETERS = 10_000_000
+_M1_QAT_TRAINABLE_PARAMETERS = 33_032_562
 _MAX_M0_LAYERS = 32
 _MAX_M0_BATCH_SIZE = 4_096
 _MAX_M0_SEQUENCE_LENGTH = 8_192
@@ -158,6 +164,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_ollama.add_argument("--base-url", default=DEFAULT_OLLAMA_URL)
     run_ollama.add_argument("--timeout", type=float, default=60.0)
     run_ollama.add_argument(
+        "--context-window-tokens",
+        type=int,
+        default=DEFAULT_OLLAMA_CONTEXT_TOKENS,
+        help="Bound the complete serialized Ollama request and set num_ctx.",
+    )
+    run_ollama.add_argument(
         "--allow-write",
         action="store_true",
         help="Register atomic workspace.write; every request requires approval.",
@@ -206,21 +218,64 @@ def _build_parser() -> argparse.ArgumentParser:
     describe = deployment_commands.add_parser(
         "describe", help="Describe a deployment profile without changing state."
     )
-    describe.add_argument("profile", choices=("consumer", "enterprise"))
+    describe.add_argument("profile", choices=("user", "consumer", "enterprise"))
+    describe.add_argument(
+        "--root-parameters",
+        default="3B",
+        help="Exact lineage root used to preview root-relative x3 growth.",
+    )
     switch = deployment_commands.add_parser(
         "switch", help="Persist a local Consumer or Enterprise policy selection."
     )
-    switch.add_argument("profile", choices=("consumer", "enterprise"))
+    switch.add_argument("profile", choices=("user", "consumer", "enterprise"))
     switch.add_argument(
         "--state",
         type=Path,
         required=True,
         help="JSON state path; this command does not convert or allocate weights.",
     )
+    switch.add_argument(
+        "--root-parameters",
+        help="Exact lineage root; an existing deployment state keeps its root.",
+    )
+
+    precision = commands.add_parser(
+        "precision",
+        help="Plan model precision transitions without exporting an artifact.",
+    )
+    precision_commands = precision.add_subparsers(
+        dest="precision_command", required=True
+    )
+    precision_plan = precision_commands.add_parser(
+        "plan", help="Describe one storage, compute, or verifier precision change."
+    )
+    precision_plan.add_argument(
+        "--from",
+        dest="source_precision",
+        required=True,
+        help="Source precision: int2, int4, int8, bf16, fp16, fp32, or fp64.",
+    )
+    precision_plan.add_argument(
+        "--to",
+        dest="target_precision",
+        required=True,
+        help="Target precision: int2, int4, int8, bf16, fp16, fp32, or fp64.",
+    )
+    precision_plan.add_argument(
+        "--master-retained",
+        action="store_true",
+        help="Declare that a higher-precision master exists for a later export.",
+    )
+    precision_plan.add_argument(
+        "--scope",
+        choices=("whole-model", "verifier"),
+        default="whole-model",
+        help="FP64 is valid only for the bounded verifier scope.",
+    )
 
     elastic = commands.add_parser(
         "elastic",
-        help="Plan unbounded parameter growth and custom bitplane precision.",
+        help="Plan root-relative x3 growth and standard model precision.",
     )
     elastic_commands = elastic.add_subparsers(
         dest="elastic_command", required=True
@@ -229,33 +284,60 @@ def _build_parser() -> argparse.ArgumentParser:
         "policy", help="Show the Consumer or Enterprise precision policy."
     )
     elastic_policy.add_argument(
-        "--profile", required=True, choices=("consumer", "enterprise")
+        "--profile", required=True, choices=("user", "consumer", "enterprise")
+    )
+    elastic_policy.add_argument(
+        "--root",
+        default="3B",
+        help="Exact lineage root for the growth preview.",
     )
     elastic_plan = elastic_commands.add_parser(
         "plan", help="Plan a growth tier without allocating the target weights."
     )
-    elastic_plan.add_argument("--current", default="3B")
-    elastic_plan.add_argument("--target", required=True)
     elastic_plan.add_argument(
-        "--profile", required=True, choices=("consumer", "enterprise")
+        "--root",
+        "--current",
+        dest="current",
+        default="3B",
+        help="Exact current lineage root; --current remains a compatibility alias.",
+    )
+    elastic_target = elastic_plan.add_mutually_exclusive_group(required=True)
+    elastic_target.add_argument("--target")
+    elastic_target.add_argument(
+        "--generations",
+        type=int,
+        help=(
+            "Plan current * 3^N for this command; N is bounded to "
+            f"{MAX_GROWTH_GENERATIONS_PER_PLAN} and qualified children may be replanned."
+        ),
     )
     elastic_plan.add_argument(
+        "--profile", required=True, choices=("user", "consumer", "enterprise")
+    )
+    elastic_plan.add_argument(
+        "--runtime-precision",
         "--runtime-bits",
-        help="Override the profile core level, for example int3, int9, or int81.",
+        dest="runtime_bits",
+        help="Override integer weight storage with int2, int4, or int8.",
     )
     qat_smoke = elastic_commands.add_parser(
         "qat-smoke",
         help="Train a proof-scale MOIRA model at one bit level, then promote it.",
     )
     qat_smoke.add_argument("--config", required=True, type=Path)
-    qat_smoke.add_argument("--initial-bits", default="int3")
-    qat_smoke.add_argument("--promote-to", default="int6")
+    qat_smoke.add_argument("--initial-bits", default="int2")
+    qat_smoke.add_argument("--promote-to", default="int4")
     qat_smoke.add_argument("--steps-per-stage", default=1, type=int)
     qat_smoke.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     qat_smoke.add_argument(
         "--checkpoint",
         type=Path,
-        help="Optional trusted-local continuation checkpoint path.",
+        help="Output checkpoint; use --resume to continue an existing INT8 file.",
+    )
+    qat_smoke.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue a dropout-free single-stage INT8 checkpoint in place.",
     )
 
     m1 = commands.add_parser(
@@ -429,6 +511,29 @@ def _add_checkpoint_source_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _load_config(path: Path) -> TrainingConfig:
+    config = _parse_config(path)
+    _validate_config_resource_budget(config)
+    return config
+
+
+def _load_qat_config(path: Path) -> TrainingConfig:
+    """Load the exact M1 QAT surface without relaxing generic M0 commands."""
+    config = _parse_config(path)
+    if config.model.expected_trainable_parameters != _M1_QAT_TRAINABLE_PARAMETERS:
+        _validate_config_resource_budget(config)
+        return config
+    _validate_config_resource_budget(
+        config,
+        max_trainable_parameters=_M1_QAT_TRAINABLE_PARAMETERS,
+    )
+    if _meta_trainable_parameters(config.model) != _M1_QAT_TRAINABLE_PARAMETERS:
+        raise ValueError(
+            "QAT config does not materialize exactly 33,032,562 trainable parameters"
+        )
+    return config
+
+
+def _parse_config(path: Path) -> TrainingConfig:
     raw = tomllib.loads(_read_config_bytes(path).decode("utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("config must be a TOML table")
@@ -454,7 +559,6 @@ def _load_config(path: Path) -> TrainingConfig:
         ),
         run=_build_config_section("run", RunConfig, raw["run"]),
     )
-    _validate_config_resource_budget(config)
     return config
 
 
@@ -502,7 +606,11 @@ def _file_status_signature(status: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _validate_config_resource_budget(config: TrainingConfig) -> None:
+def _validate_config_resource_budget(
+    config: TrainingConfig,
+    *,
+    max_trainable_parameters: int = _MAX_M0_TRAINABLE_PARAMETERS,
+) -> None:
     if any(
         value > (1 << 64) - 1
         for value in (
@@ -555,8 +663,10 @@ def _validate_config_resource_budget(config: TrainingConfig) -> None:
         raise ValueError("run counts exceed the Phase 0 M0 resource budget")
 
     total_trainable = _meta_trainable_parameters(config.model)
-    if total_trainable > _MAX_M0_TRAINABLE_PARAMETERS:
-        raise ValueError("model exceeds the 10M-parameter Phase 0 M0 budget")
+    if total_trainable > max_trainable_parameters:
+        if max_trainable_parameters == _MAX_M0_TRAINABLE_PARAMETERS:
+            raise ValueError("model exceeds the 10M-parameter Phase 0 M0 budget")
+        raise ValueError("model exceeds the exact M1 QAT parameter budget")
 
 
 def _resource_products(
@@ -910,61 +1020,92 @@ def _matches_annotation(value: object, annotation: object) -> bool:
     return isinstance(annotation, type) and type(value) is annotation
 
 
-def _elastic_policy(profile: str) -> dict[str, object]:
-    policy = PrecisionPolicy.for_profile(profile)
+def _elastic_policy(
+    profile: str,
+    root_parameters: str = "3B",
+) -> dict[str, object]:
+    state = deployment_state(profile, root_parameters)
     return {
-        "architecture": "MOIRA-precision-lattice-v1",
-        "profile": profile,
-        "precision_policy": policy.to_dict(),
-        "parameter_growth_ladder": [
-            f"{value // 1_000_000_000}B" for value in CANONICAL_PARAMETER_LADDER
-        ],
-        "bit_precision_ladder": [f"int{value}" for value in BIT_PRECISION_LADDER],
-        "unbounded_parameter_growth": True,
+        "architecture": "MOIRA-root-relative-standard-precision-v2",
+        **state,
         "weights_allocated": False,
     }
 
 
 def _elastic_plan(
     current: str,
-    target: str,
+    target: str | None,
+    generations: int | None,
     profile: str,
     runtime_bits: str | None,
 ) -> dict[str, object]:
+    if (target is None) == (generations is None):
+        raise ValueError("exactly one of target or generations is required")
+    resolved_target: int | str = (
+        target
+        if target is not None
+        else parameter_count_after_generations(current, generations)
+    )
     return build_elastic_plan(
         current,
-        target,
+        resolved_target,
         profile=profile,
         runtime_bits=runtime_bits,
     ).to_dict()
 
 
-def _describe_deployment(profile: str) -> dict[str, object]:
+def _precision_plan(
+    source_precision: str,
+    target_precision: str,
+    *,
+    master_retained: bool,
+    scope: str,
+) -> dict[str, object]:
+    return plan_precision_transition(
+        source_precision,
+        target_precision,
+        master_retained=master_retained,
+        scope=scope,
+    ).to_dict()
+
+
+def _describe_deployment(
+    profile: str,
+    root_parameters: str = "3B",
+) -> dict[str, object]:
     descriptions = {
         "consumer": (
-            "One resident field, sequential support fields, local encrypted "
-            "memory, lazy organs, and zero paid compute by default."
+            "One resident field, sequential support fields, planned encrypted "
+            "local memory, lazy organs, and zero paid compute by default."
         ),
         "enterprise": (
             "A future profile with distributed placement, parallel fields, "
             "tenant isolation, audit sinks, training queues, and explicit cost budgets."
         ),
     }
-    policy = _elastic_policy(profile)
+    policy = _elastic_policy(profile, root_parameters)
+    canonical_profile = str(policy["profile"])
     return {
         "implemented_in_phase_0": False,
         "model": "MOIRA",
-        "profile": profile,
+        "profile": canonical_profile,
         "profile_changes_model_identity": False,
         "status": "local profile state available; runtime orchestration pending",
-        "description": descriptions[profile],
+        "description": descriptions[canonical_profile],
         "switch_command_available": True,
         "switch_changes_weights": False,
         "profile_state_implemented": True,
         "runtime_profile_application_implemented": False,
         "precision_policy": policy["precision_policy"],
         "parameter_growth_ladder": policy["parameter_growth_ladder"],
+        "parameter_root": policy["parameter_root"],
+        "parameter_root_parameters": policy["parameter_root_parameters"],
+        "parameter_growth_policy": policy["parameter_growth_policy"],
         "bit_precision_ladder": policy["bit_precision_ladder"],
+        "whole_model_compute_dtypes": policy["whole_model_compute_dtypes"],
+        "verification_compute_dtypes": policy["verification_compute_dtypes"],
+        "fp64_scope": policy["fp64_scope"],
+        "parameter_count_is_separate_from_precision": True,
         "unbounded_parameter_growth": True,
     }
 
@@ -1155,6 +1296,7 @@ def _run_ollama_agent(
     max_effects: int | None,
     base_url: str,
     timeout: float,
+    context_window_tokens: int,
     allow_write: bool,
     allowed_commands: tuple[str, ...],
     command_timeout: float,
@@ -1230,6 +1372,7 @@ def _run_ollama_agent(
                 model=model,
                 base_url=base_url,
                 timeout_seconds=timeout,
+                context_window_tokens=context_window_tokens,
             )
         ),
         port=StandaloneConsolePort(output=sys.stderr),
@@ -1241,6 +1384,7 @@ def _run_ollama_agent(
         "effects": len(result.receipts),
         "enabled_tools": [tool.tool_id for tool in tools],
         "model": model,
+        "context_window_tokens": context_window_tokens,
         "mode": selected_mode.value,
         "profile": "developer" if approval_actions else "read-only",
         "read_only": not approval_actions,
@@ -1383,6 +1527,7 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
                 max_effects=arguments.max_effects,
                 base_url=arguments.base_url,
                 timeout=arguments.timeout,
+                context_window_tokens=arguments.context_window_tokens,
                 allow_write=arguments.allow_write,
                 allowed_commands=tuple(arguments.allow_command),
                 command_timeout=arguments.command_timeout,
@@ -1409,28 +1554,43 @@ def _dispatch(arguments: argparse.Namespace) -> Mapping[str, object]:
         raise ValueError("unknown agent command")
     if arguments.command == "deployment":
         if arguments.deployment_command == "describe":
-            return _describe_deployment(arguments.profile)
+            return _describe_deployment(arguments.profile, arguments.root_parameters)
         if arguments.deployment_command == "switch":
-            return switch_deployment_profile(arguments.profile, arguments.state)
+            return switch_deployment_profile(
+                arguments.profile,
+                arguments.state,
+                root_parameters=arguments.root_parameters,
+            )
         raise ValueError("unknown deployment command")
+    if arguments.command == "precision":
+        if arguments.precision_command == "plan":
+            return _precision_plan(
+                arguments.source_precision,
+                arguments.target_precision,
+                master_retained=arguments.master_retained,
+                scope=arguments.scope,
+            )
+        raise ValueError("unknown precision command")
     if arguments.command == "elastic":
         if arguments.elastic_command == "policy":
-            return _elastic_policy(arguments.profile)
+            return _elastic_policy(arguments.profile, arguments.root)
         if arguments.elastic_command == "plan":
             return _elastic_plan(
                 arguments.current,
                 arguments.target,
+                arguments.generations,
                 arguments.profile,
                 arguments.runtime_bits,
             )
         if arguments.elastic_command == "qat-smoke":
             return run_moira_qat_smoke(
-                _load_config(arguments.config),
+                _load_qat_config(arguments.config),
                 initial_bits=arguments.initial_bits,
                 promote_to=arguments.promote_to,
                 steps_per_stage=arguments.steps_per_stage,
                 device=arguments.device,
                 checkpoint=arguments.checkpoint,
+                resume=arguments.resume,
             )
         raise ValueError("unknown elastic command")
     if arguments.command == "m1":

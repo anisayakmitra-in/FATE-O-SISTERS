@@ -1,8 +1,13 @@
 # MOIRA
 
-MOIRA is an experimental sequence-model research project. The executable Phase 0 reference lives in `research/` and supports deterministic FP32 training and evaluation on CPU. The repository also contains the M1 data and capability foundation: a manifest-first source catalog, bounded record adapters, a capability loom, and a 33,032,562-parameter inspection surface.
+MOIRA is an experimental sequence-model research project. The executable reference lives in `research/` and supports deterministic FP32 training and evaluation on CPU, bounded CUDA capacity probes, and master-retained INT2/INT4/INT8 quantization-aware training. The repository also contains the M1 data and capability foundation: a manifest-first source catalog, bounded record adapters, a capability loom, and an exact 33,032,562-parameter training surface.
 
-The repository does not contain a trained checkpoint or a 3B model. It does not establish AGI, recursive self-improvement, benchmark gains, speedups, quantization, GPU execution, or production deployment. Each of those claims requires a later implementation and measured evidence.
+The repository does not contain a released trained checkpoint or a 3B model. It does not establish AGI, recursive self-improvement, benchmark gains, production packed-integer kernels, general GPU speedups, or production deployment. Each of those claims requires a later implementation and measured evidence.
+
+The current normative design is
+[`MOIRA Offline Lifelong-Cognition Architecture v1`](docs/architecture/moira-lifelong-v1.md).
+It separates executable proof foundations from the pending daemon, continual
+training, distributed execution, and optimized-kernel milestones.
 
 ## What works now
 
@@ -34,7 +39,7 @@ The Python reference contains:
 - a bounded PEFT LoRA candidate backend with content-addressed train and
   selection data, adapter-only safetensors output, and immutable base checks;
 - checkpoint manifests, sidecars, compatibility checks, retention, and recovery; and
-- a CPU command-line interface for preflight checks, training, checkpoint verification, evaluation, and deployment-profile descriptions.
+- a command-line interface for preflight checks, bounded CPU/CUDA research runs, checkpoint verification, evaluation, and deployment-profile selection.
 
 Clotho, Lachesis, and Atropos are internal execution orientations. They do not have separate identities, conversations, permissions, memories, or parameter copies.
 
@@ -282,7 +287,7 @@ For an Ollama download, the weights provide cognition and structured action
 selection. A model file cannot directly call the operating system. Real file,
 terminal, browser, or API effects therefore use the small MOIRA companion
 runtime, which connects the Ollama model to the same policy, approval, tool, and
-receipt layer. A third-party harness may host that interface, but none is
+receipt layer. A third-party agent host may implement that interface, but none is
 required by MOIRA's architecture.
 
 The first standalone command is executable now. It exposes only bounded file
@@ -295,6 +300,7 @@ python -m moira agent run-ollama `
   --model $moiraModel `
   --task "Inspect this repository and summarize its architecture." `
   --workspace (Resolve-Path ".") `
+  --context-window-tokens 32768 `
   --max-steps 8
 ```
 
@@ -321,59 +327,118 @@ there is no shell interpolation. See
 [`docs/guides/ollama-agent.md`](docs/guides/ollama-agent.md) for the exact
 runtime contract.
 
-## Elastic capacity and custom bitplane precision
+## Root-relative capacity and standard precision
 
-MOIRA now has a planning contract for one identity that can grow with
-hardware-supported resources:
+MOIRA plans threefold growth from an artifact's exact lineage root. The M1
+research lineage is:
 
 ```text
-parameters: 3B -> 9B -> 27B -> 81B -> 243B -> 729B -> ...
-logical bits: int3 -> int6 -> int9 -> int27 -> int81 -> int243 -> ...
+33,032,562
+-> 99,097,686
+-> 297,293,058
+-> 891,879,174
+-> 2,675,637,522
+-> 8,026,912,566
+-> 24,080,737,698
+-> 72,242,213,094
+-> ...
 ```
 
-These are separate axes. A `3B` model is not a `3-bit` model, and `int81` is a
-logical packed-bit budget rather than a claim that a GPU has native 81-bit
-matrix multiplication. Consumer and Enterprise policies select different
-logical precision per capability while keeping one MOIRA model identity:
+An optional exact 3,000,000,000-parameter root forms a separate checkpoint
+family. Parameter growth has no fixed architecture tier, but every concrete
+child needs hardware, training, evaluation, qualification, and rollback. A
+newly copied child is `MATERIALIZED_UNTRAINED`.
+
+Numeric precision is a separate axis:
+
+```text
+integer weight storage: INT2 -> INT4 -> INT8
+whole-model arithmetic: BF16 or FP16, with FP32 where required
+verification: FP32, with FP64 restricted to bounded verifier paths
+```
+
+Inspect the policies and create a non-allocating M1 growth plan:
 
 ```powershell
-python -m moira elastic policy --profile consumer
-python -m moira elastic policy --profile enterprise
+python -m moira elastic policy --profile consumer --root 33032562
+python -m moira elastic policy --profile enterprise --root 33032562
 python -m moira elastic plan `
-  --current 3B `
-  --target 243B `
-  --profile enterprise `
-  --runtime-bits int27
-python -m moira deployment switch consumer `
+  --root 33032562 `
+  --generations 2 `
+  --profile consumer `
+  --runtime-precision int4
+python -m moira precision plan `
+  --from int8 `
+  --to fp16 `
+  --master-retained
+python -m moira precision plan `
+  --from fp32 `
+  --to fp64 `
+  --scope verifier
+python -m moira deployment switch enterprise `
+  --state research/runs/deployment.json `
+  --root-parameters 33032562
+python -m moira deployment switch user `
   --state research/runs/deployment.json
 ```
 
-The plan is non-allocating and records every growth step, target storage
-estimate, capability precision policy, arithmetic dtype, and the requirement
-for training and promotion. The deployment command atomically selects a local
-policy; it does not convert weights, allocate a different model, or grant new
-capabilities.
-
-The executable proof path trains Linear and Embedding weights through an
-`int3` fake-quantized forward view while AdamW updates retained FP32 masters,
-then advances exactly one rung to `int6`:
+The proof-scale QAT path keeps floating-point master weights while its forward
+view uses INT2, INT4, or INT8:
 
 ```powershell
 python -m moira elastic qat-smoke `
   --config research/configs/m0-smoke.toml `
-  --initial-bits int3 `
-  --promote-to int6 `
+  --initial-bits int2 `
+  --promote-to int4 `
   --steps-per-stage 1 `
   --device cuda `
-  --checkpoint research/runs/int3-to-int6.pt
+  --checkpoint research/runs/int2-to-int4.pt
 ```
 
-This is weight-only quantization-aware training, not native packed INT3 matrix
-multiplication. The executable QAT levels stop at `int27`: FP64 has 52 explicit
-significand bits, so pretending to simulate `int81` numerics would be false.
-`int81` and higher remain logical storage/policy levels. Turning an `int3`-only
-artifact into a larger container cannot recover discarded information.
-Large-field packed kernels and distributed training remain future work.
+For the exact M1 local profile, start with one measured INT8 stage before
+raising the bounded step count:
+
+```powershell
+python -m moira elastic qat-smoke `
+  --config research/configs/m1-local-int8.toml `
+  --initial-bits int8 `
+  --promote-to int8 `
+  --steps-per-stage 1 `
+  --device cuda `
+  --checkpoint research/runs/m1-int8/qat.pt
+```
+
+This is an INT8 fake-quantized weight view with FP32 masters and gradients. It
+is not a packed INT8 training kernel. The runner permits at most 32 steps per
+stage; capacity must be measured on the target machine before increasing it.
+Continue that dropout-free INT8 checkpoint without replacing its learned state:
+
+```powershell
+python -m moira elastic qat-smoke `
+  --config research/configs/m1-local-int8.toml `
+  --initial-bits int8 `
+  --promote-to int8 `
+  --steps-per-stage 32 `
+  --device cuda `
+  --checkpoint research/runs/m1-int8/qat.pt `
+  --resume
+```
+
+Resume restores weights, optimizer state, and the persisted deterministic
+synthetic-data cursor after verifying the exact training-configuration digest.
+It is not advertised as exact replay because the proof checkpoint does not yet
+persist every RNG and runtime state.
+
+`user` is a command alias for the canonical `consumer` profile. Profile
+switching changes persisted resource policy, not weights or model identity.
+Each growth command plans at most 32 generations; a qualified child can become
+the root of another command, so the lineage has no fixed final tier.
+
+The planning commands do not allocate target weights or write an exported
+artifact. The QAT command trains only the configured proof model. Converting a
+lossy low-bit artifact to a wider container cannot reconstruct information
+that was discarded; retained masters or new training are required for quality
+recovery. FP64 remains a bounded verifier option, not a whole-model mode.
 
 Successful commands write one compact JSON object to standard output. Expected argument, configuration, filesystem, and checkpoint failures write an error to standard error and exit with status 2. Keep the complete run directory for automatic recovery and resume; a checkpoint tensor file by itself is not the whole run state.
 
@@ -387,23 +452,28 @@ python -m pytest research/tests -p no:cacheprovider
 
 | Path | Purpose |
 | --- | --- |
-| `research/src/moira/` | Executable PyTorch CPU reference and CLI |
-| `research/src/moira/elastic.py` | Unbounded capacity plans, custom bitplane views, and profile policies |
-| `research/src/moira/qat.py` | Master-retained INT3/INT6/INT9/INT27 weight-QAT and continuation checkpoint |
+| `research/src/moira/` | Executable PyTorch CPU/CUDA research reference and CLI |
+| `research/src/moira/elastic.py` | Exact root-relative growth plans, standard low-bit views, and profile policies |
+| `research/src/moira/qat.py` | Master-retained INT2/INT4/INT8 weight QAT and continuation checkpoints |
 | `research/src/moira/deployment.py` | Atomic local Consumer/Enterprise profile selection |
 | `research/src/moira/context.py` | Deterministic scoped context admission, budgeting, and receipts |
+| `research/src/moira/lifelong.py` | Typed consent, interaction, memory, perspective, wake, and cognition contracts |
+| `research/src/moira/kernel.py` | Persistent five-module control-kernel state and receipt chain |
+| `research/src/moira/core_extensions.py` | Affect, drive, truth-tone, triadic-growth, and architecture-candidate primitives |
+| `research/src/moira/capabilities.py` | Capability-port ABI and evidence-backed qualification labels |
 | `research/src/moira/candidate_search.py` | Bounded candidate archive and deterministic research selection |
 | `research/src/moira/candidate_worker.py` | One-shot native-agent boundary for staged candidate work |
 | `research/src/moira/lora_backend.py` | Bounded PEFT LoRA candidate trainer and selection evaluator |
 | `research/src/moira/agent_data.py` | Agent trajectory provenance, consent, license, split, and content-manifest gate |
 | `research/tests/` | Model, mask, state, checkpoint, resume, and CLI tests |
 | `research/configs/m0-smoke.toml` | Checked-in 24,478-parameter smoke configuration |
+| `research/configs/m1-local-int8.toml` | Exact 33,032,562-parameter local INT8-QAT profile |
 | `research/configs/m1-sources.toml` | M1 dataset, model, and evaluation source catalog |
-| `docs/architecture/moira-v0.md` | Architecture, scope boundaries, and milestone gates |
+| `docs/architecture/moira-lifelong-v1.md` | Current normative lifelong-cognition architecture and milestone gates |
+| `docs/architecture/moira-v0.md` | Superseded v0 design marker |
 | `docs/guides/kaggle-m0.md` | Cell-by-cell Kaggle workflow and artifact rules |
 | `docs/guides/free-compute.md` | Current free compute routes and their limits |
 | `docs/guides/m1-data.md` | M1 source, normalization, capability, and training workflow |
-| `docs/guides/local-int3-qat.md` | RTX/Kaggle setup, INT3-to-INT6 run, and memory limits |
 | `docs/guides/candidate-search.md` | Candidate-search contract, selection algorithm, and promotion boundary |
 | `docs/guides/candidate-worker.md` | Permit, staging, budget, artifact, and isolation contract for candidate work |
 | `docs/guides/lora-candidates.md` | LoRA dataset, training, artifact, and evaluation contract |
@@ -412,9 +482,17 @@ python -m pytest research/tests -p no:cacheprovider
 
 ## Research boundary
 
-The architecture document records proposals for an exact 3B root model, governed threefold growth, consumer and enterprise placement, specialist capability fields, adapters, retrieval, quantization, and later GPU work. The current M1 work covers source contracts, capability boundaries, a fixed 33M parameter surface, equal-parameter ablations, bounded text training, and checkpointed capability-prefix training. It does not establish a long stable M1 curve, a 3B lineage, or any AGI claim.
+The current architecture uses exact root-relative threefold growth. Its shipped
+research root is 33,032,562 parameters; a future exact
+3,000,000,000-parameter root would be a separate lineage. The current M1 work
+covers source contracts, capability boundaries, a fixed 33M inspection
+surface, equal-parameter ablations, bounded text training, and checkpointed
+capability-prefix training. It does not establish a long stable M1 curve, a
+trained larger lineage, lifelong autonomy, or any AGI claim.
 
-For a hosted notebook run, follow the [Kaggle M0 guide](docs/guides/kaggle-m0.md). For the model contract and milestone criteria, read the [MOIRA v0 architecture](docs/architecture/moira-v0.md).
+For a hosted notebook run, follow the [Kaggle M0 guide](docs/guides/kaggle-m0.md).
+For model, control, learning, growth, and deployment contracts, read the
+[MOIRA Offline Lifelong-Cognition Architecture v1](docs/architecture/moira-lifelong-v1.md).
 
 ## License
 

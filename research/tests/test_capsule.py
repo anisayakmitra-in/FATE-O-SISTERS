@@ -3,7 +3,15 @@ from dataclasses import replace
 import pytest
 import torch
 
-from moira.capsule import CapabilityCapsule, capsule_digest, validate_capsule
+from moira.capsule import (
+    CapabilityCapsule,
+    CapabilityEvidenceClass,
+    CapabilityObservationV2,
+    CapabilityResourceCostV1,
+    capsule_digest,
+    tensor_content_digest,
+    validate_capsule,
+)
 
 
 def make_capsule(**changes: object) -> CapabilityCapsule:
@@ -288,3 +296,101 @@ def test_capsule_digest_does_not_mutate_or_bump_input_tensor_versions() -> None:
 
     assert tuple(tensor._version for tensor in tensors) == versions
     assert all(torch.equal(tensor, original) for tensor, original in zip(tensors, originals))
+
+
+def make_observation_v2(
+    feature: torch.Tensor, **changes: object
+) -> CapabilityObservationV2:
+    values: dict[str, object] = {
+        "abi_version": 2,
+        "capability_id": "vision.ocr",
+        "capability_version": "1.0.0",
+        "task_id": "task-1",
+        "scope_id": "owner:anis",
+        "owner_or_tenant": "owner:anis",
+        "modality": "image",
+        "evidence_class": CapabilityEvidenceClass.INDEPENDENT_VERIFICATION,
+        "raw_artifact_digest": "a" * 64,
+        "feature_digest": tensor_content_digest(feature),
+        "preprocessing_digest": "b" * 64,
+        "encoder_digest": "c" * 64,
+        "latent": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        "uncertainty": None,
+        "coordinates": torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
+        "resource_cost": CapabilityResourceCostV1(2, 0, 1_024),
+        "permission_receipt_ref": "review:receipt-1",
+    }
+    values.update(changes)
+    return CapabilityObservationV2(**values)  # type: ignore[arg-type]
+
+
+def test_capability_observation_v2_binds_raw_artifact_and_feature_tensor() -> None:
+    feature = torch.arange(12.0).reshape(3, 4)
+    observation = make_observation_v2(feature)
+
+    observation.validate(
+        expected_width=2,
+        feature_tensor=feature,
+        expected_raw_artifact_digest="a" * 64,
+    )
+
+    with pytest.raises(ValueError, match="feature tensor digest"):
+        observation.validate(
+            expected_width=2,
+            feature_tensor=feature + 1,
+            expected_raw_artifact_digest="a" * 64,
+        )
+    with pytest.raises(ValueError, match="raw artifact digest"):
+        observation.validate(
+            expected_width=2,
+            feature_tensor=feature,
+            expected_raw_artifact_digest="d" * 64,
+        )
+
+
+def test_capability_observation_v2_allows_unknown_or_calibrated_uncertainty_only() -> None:
+    feature = torch.ones((2, 3))
+    unknown = make_observation_v2(feature)
+    calibrated = make_observation_v2(
+        feature, uncertainty=torch.tensor([0.1, 0.9])
+    )
+
+    unknown.validate(
+        expected_width=2,
+        feature_tensor=feature,
+        expected_raw_artifact_digest="a" * 64,
+    )
+    calibrated.validate(
+        expected_width=2,
+        feature_tensor=feature,
+        expected_raw_artifact_digest="a" * 64,
+    )
+    assert unknown.observation_digest != calibrated.observation_digest
+
+    with pytest.raises(ValueError, match="uncertainty"):
+        make_observation_v2(
+            feature, uncertainty=torch.tensor([0.1, 1.1])
+        ).validate(
+            expected_width=2,
+            feature_tensor=feature,
+            expected_raw_artifact_digest="a" * 64,
+        )
+
+
+def test_capability_observation_v2_rejects_untyped_evidence_and_bad_resource_cost() -> None:
+    feature = torch.ones((2, 3))
+    with pytest.raises(ValueError, match="evidence_class"):
+        make_observation_v2(feature, evidence_class="verified").validate(  # type: ignore[arg-type]
+            expected_width=2,
+            feature_tensor=feature,
+            expected_raw_artifact_digest="a" * 64,
+        )
+    with pytest.raises(ValueError, match="resource cost"):
+        make_observation_v2(
+            feature,
+            resource_cost=CapabilityResourceCostV1(-1, 0, 0),
+        ).validate(
+            expected_width=2,
+            feature_tensor=feature,
+            expected_raw_artifact_digest="a" * 64,
+        )

@@ -175,6 +175,25 @@ def test_modulate_preserves_hidden_shape_device_and_dtype() -> None:
     assert actual.device == hidden.device
 
 
+def test_neutral_mode_is_an_exact_affect_bypass() -> None:
+    """Catches any affect coordinate changing semantic hidden state in neutral mode."""
+    pulse = Pulse(d_model=4)
+    hidden = torch.randn((2, 3, 4))
+    low = PulseState(
+        torch.full((2, 12), -1.0),
+        torch.zeros((2, 6)),
+        neutral=True,
+    )
+    high = PulseState(
+        torch.full((2, 12), 1.0),
+        torch.ones((2, 6)),
+        neutral=True,
+    )
+
+    assert torch.equal(pulse.modulate(hidden, low), hidden)
+    assert torch.equal(pulse.modulate(hidden, high), hidden)
+
+
 @pytest.mark.parametrize(
     "hidden",
     [

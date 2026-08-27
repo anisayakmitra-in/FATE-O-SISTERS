@@ -748,7 +748,7 @@ def agent_contract() -> dict[str, object]:
         "context_scope_bound_to_lease": True,
         "context_receipt_binds_labels_and_content": True,
         "context_content_token_budget_maximum": MAX_CONTEXT_TOKENS,
-        "context_full_request_preflight_implemented": False,
+        "context_full_request_preflight_implemented": True,
         "context_external_priority_ceiling": MAX_EXTERNAL_CONTEXT_PRIORITY,
         "context_latest_observation_required": True,
         "context_persistence_implemented": False,
