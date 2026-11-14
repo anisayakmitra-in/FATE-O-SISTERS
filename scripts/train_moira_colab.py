@@ -451,8 +451,7 @@ def run_moira_3b_decision_text_training(
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-    from moira.dataset import iter_cataloged_text_examples
-    from moira.m1_train import _causal_source_lengths, _masked_loss, build_causal_batch
+    from moira.m1_train import _causal_source_lengths, _masked_loss, build_causal_batch, iter_cataloged_text_examples
     from moira.masks import CognitiveMode
     from moira.model import MoiraModel
 
