@@ -537,7 +537,6 @@ def run_moira_3b_decision_text_training(
                 input_ids,
                 mode=CognitiveMode.ATROPOS,
                 valid_tokens=valid_tokens,
-                source_lengths=src_lens,
             )
             text_loss = _masked_loss(out_text.logits.float(), targets, loss_mask)
 
