@@ -779,35 +779,56 @@ pub fn train_and_export_all(teacher_epochs: usize, student_epochs: usize) -> std
 license: gpl-3.0\n\
 language:\n\
   - en\n\
+pipeline_tag: text-generation\n\
 tags:\n\
-  - fate-o-sisters\n\
   - moira\n\
+  - fate-o-sisters\n\
   - rust\n\
   - decision-engine\n\
   - agent-safety\n\
   - tropical-geometry\n\
   - delta-rule\n\
+  - tsk-backbone\n\
 ---\n\n\
-# FATE-O-SISTERS (MOIRA) — 100% Rust Engine & Tropical `.pnn` Suite\n\n\
-Canonical Hugging Face repository for **[FATE-O-SISTERS (MOIRA)](https://github.com/anisayakmitra-in/FATE-O-SISTERS)** \
-and **[AGENT-PANDORA](https://github.com/anisayakmitra-in/AGENT-PANDORA)**, licensed under **GNU GPLv3 (`GPL-3.0-or-later`)**.\n\n\
-## Pure-Rust Artifacts Included (`moira v0.2.0`)\n\n\
+# MOIRA (FATE-O-SISTERS)\n\n\
+**MOIRA** is an independent, sovereign neural sequence and decision architecture designed for on-device latent reasoning, tri-timescale context retention, and zero-multiplication edge safety policies. Licensed under **GNU GPLv3 (`GPL-3.0-or-later`)**.\n\n\
+Official repository: **[https://github.com/anisayakmitra-in/FATE-O-SISTERS](https://github.com/anisayakmitra-in/FATE-O-SISTERS)**\n\n\
+## Architectural Pillars\n\n\
+1. **Tri-Timescale `TSKBlock` Sequence Backbone:**\n\
+   - **Thread (`ThreadLocalAttention`):** Multi-head local-window RoPE attention for fine-grained local syntax and token order.\n\
+   - **Spool (`SpoolRecurrent`):** Gated Widrow-Hoff / Delta-Rule associative matrix memory with $O(1)$ state footprint, executing rank-1 key-value overwrite across unbounded streams.\n\
+   - **Knot (`KnotLandmarkAttention`):** Prefix-stable complete-chunk landmarks with hybrid $\\frac{{1}}{{2}}\\text{{Mean}} + \\frac{{1}}{{2}}\\text{{Max}}$ pooling preserving high-frequency token activations.\n\
+   - **SwiGLU Channel Mixing (`SwiGluFfn`):** Pre-norm $\\text{{SiLU}}(h W_g) \\odot (h W_u)$ nonlinear channel transformation.\n\
+   - **Pulse Homeostatic State Engine (`PulseAffectEngine`):** Two-timescale 30D affect coordinate tracker (`12` fast axes + `6` slow axes + `12` appraisal axes).\n\n\
+2. **Standalone 3-6-9 Perspective Decision Engine (`MoiraDecisionModel`):**\n\
+   - **Clotho Head (weight 3):** Fast intent & lexical alignment.\n\
+   - **Lachesis Core (weight 6):** 9-step Krasnoselskii-Mann damped recurrent state refinement ($z^{{(k+1)}} = \\frac{{1}}{{2}}z^{{(k)}} + \\frac{{1}}{{2}}\\tanh(W_L z^{{(k)}} + b_L)$).\n\
+   - **Atropos Gate (weight 9):** Causal safety, integrity verification, and veto.\n\
+   - **3:6:9 Mixing Law:** $V_{{\\text{{mixed}}}} = \\frac{{3 V_{{\\text{{clotho}}}} + 6 V_{{\\text{{lachesis}}}} + 9 V_{{\\text{{atropos}}}}}}{{18}}$.\n\n\
+3. **Tropical Semiring Policy Compiler (`TropicalPolicyStudent`):**\n\
+   - Distilled into the Max-Plus semiring $(\\mathbb{{R}} \\cup \\{{-\\infty\\}}, \\max, +)$ where linear operations require **zero multiplications** ($y_j = b_j + \\max_i(x_i + W_{{ji}})$).\n\n\
+## Released Artifacts (`moira v0.2.0`)\n\n\
 | Artifact | Format | Parameters | Description |\n\
 | --- | --- | --- | --- |\n\
-| `model.safetensors` | SafeTensors (`F32`) | `13,633` | 3-6-9 `MoiraDecisionModel` Teacher (Clotho / 9-step Lachesis / Atropos) |\n\
-| `moira_tsk_backbone.safetensors` | SafeTensors (`F32`) | `{}` | Tri-Timescale `TSKBlock` (`Thread` RoPE + `Spool` Delta-Rule + `Knot` Mean+Max + `SwiGLUFFN` + `Pulse` 30D) |\n\
-| `model_decision.pnn` | JSON `.pnn` (`AGENT-PANDORA`) | `3,201` | Zero-Multiplication Tropical Max-Plus $(\\max, +)$ Student (`SHA-256: {}`) |\n\
-| `model_decision.bin.pnn` | Binary `PNN\\x01` | `3,201` | Compact binary Tropical Max-Plus policy (`12,840` bytes) |\n\
-| `training_metrics.json` | JSON | — | Verified training & held-out adversarial evaluation metrics |\n\n\
-## Benchmark Results (72 Train Scenarios / 12 Held-Out Adversarial Pairs)\n\n\
-- **MOIRA 3-6-9 Teacher (`13,633` params):** **`{:.1}%`** Held-Out Accuracy (avg margin: `{:.3}`)\n\
+| `model.safetensors` | SafeTensors (`F32`) | `13,633` | Standalone MOIRA 3-6-9 Perspective Decision Model |\n\
+| `moira_tsk_backbone.safetensors` | SafeTensors (`F32`) | `{}` | Tri-Timescale `TSKBlock` + `SwiGLUFFN` + `Pulse` 30D Core |\n\
+| `model_decision.pnn` | JSON `.pnn` | `3,201` | Zero-Multiplication Tropical Policy (`SHA-256: {}`) |\n\
+| `model_decision.bin.pnn` | Binary `PNN\\x01` | `3,201` | Compact binary Tropical Max-Plus policy artifact |\n\
+| `training_metrics.json` | JSON | — | Verified training and held-out adversarial evaluation metrics |\n\
+| `config.json` | JSON | — | Standalone architecture and parameter configuration |\n\n\
+## Benchmark Performance (72 Train Scenarios / 12 Held-Out Adversarial Pairs)\n\n\
+- **MOIRA 3-6-9 Decision Model (`13,633` params):** **`{:.1}%`** Held-Out Accuracy (avg margin: `{:.3}`)\n\
 - **Zero-Multiplication Tropical `.pnn` Student (`3,201` params):** **`{:.1}%`** Held-Out Accuracy (avg margin: `{:.3}`, exact MSE: `{:.5}`)\n\
 - **Naive Single-Head Baseline (`577` params):** `{:.1}%` Held-Out Accuracy (avg margin: `{:.3}`)\n\n\
-## Quickstart (100% Pure Rust)\n\n\
+## Pure-Rust Execution\n\n\
 ```bash\n\
-cargo test\n\
-cargo run --release -- train --push-hf\n\
+# Run 3-6-9 Latent Inference + Zero-Multiplication Tropical Check\n\
 cargo run --release -- infer\n\
+\n\
+# Train Teacher + Tropical Student & Push to Hugging Face\n\
+cargo run --release -- train --push-hf\n\
+\n\
+# Monitor Remote GPU Runner / Colab\n\
 cargo run --release -- colab-ctl status\n\
 ```\n\n\
 ## License\n\
