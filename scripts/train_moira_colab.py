@@ -51,7 +51,7 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None 
 
 
 def setup_dependencies(fate_dir: Path) -> tuple[dict[str, str], bool]:
-    run_cmd([sys.executable, "-m", "pip", "install", "-q", "safetensors", "huggingface_hub", "datasets"])
+    run_cmd([sys.executable, "-m", "pip", "install", "-q", "safetensors", "huggingface_hub", "datasets", "bitsandbytes"])
     env = os.environ.copy()
     has_fate = False
     if not (fate_dir / "research" / "src" / "moira").is_dir():
@@ -80,13 +80,25 @@ def setup_dependencies(fate_dir: Path) -> tuple[dict[str, str], bool]:
     return env, has_fate
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").strip()
+
+
 def _row_matches_schema(source_id: str, row: dict) -> bool:
     if source_id == "huggingface-smol-smoltalk":
         msgs = row.get("messages")
-        return isinstance(msgs, list) and len(msgs) >= 2
+        if not isinstance(msgs, list) or len(msgs) < 2:
+            return False
+        prompt_bytes = sum(len(f"{m.get('role', '')}: {m.get('content', '')}".encode("utf-8")) for m in msgs[:-1])
+        return prompt_bytes <= 180
     if source_id == "deepseek-r1-openr1-math-220k":
-        return bool(row.get("problem")) and bool(row.get("solution") or row.get("answer"))
-    return bool(row.get("prompt")) and bool(row.get("response"))
+        p = str(row.get("problem", ""))
+        return bool(p) and len(p.encode("utf-8")) <= 180 and bool(row.get("solution") or row.get("answer"))
+    p = str(row.get("prompt", ""))
+    return bool(p) and len(p.encode("utf-8")) <= 180 and bool(row.get("response"))
 
 
 def prepare_m2_jsonl(fate_dir: Path, source_id: str, needed_records: int) -> tuple[Path, str, int]:
@@ -127,27 +139,38 @@ def prepare_m2_jsonl(fate_dir: Path, source_id: str, needed_records: int) -> tup
                     if source_id == "huggingface-smol-smoltalk":
                         raw_msgs = row.get("messages")
                         if isinstance(raw_msgs, list):
-                            cleaned = [
-                                {"role": str(m.get("role", "")).strip(), "content": str(m.get("content", "")).strip()[:2048]}
-                                for m in raw_msgs
-                                if isinstance(m, dict) and str(m.get("role", "")).strip() and str(m.get("content", "")).strip()
-                            ]
-                            has_asst = any(i > 0 and m["role"] == "assistant" for i, m in enumerate(cleaned))
-                            if len(cleaned) >= 2 and has_asst:
-                                record = {"id": f"{source_id}-{idx}", "messages": cleaned}
+                            user_msg, asst_msg = "", ""
+                            for m in raw_msgs:
+                                if not isinstance(m, dict):
+                                    continue
+                                role = str(m.get("role", "")).strip()
+                                content = str(m.get("content", "")).strip()
+                                if role == "user" and not user_msg and content:
+                                    user_msg = _truncate_utf8(content, 150)
+                                elif role == "assistant" and user_msg and not asst_msg and content:
+                                    asst_msg = _truncate_utf8(content, 512)
+                                    break
+                            if user_msg and asst_msg:
+                                record = {
+                                    "id": f"{source_id}-{idx}",
+                                    "messages": [
+                                        {"role": "user", "content": user_msg},
+                                        {"role": "assistant", "content": asst_msg},
+                                    ],
+                                }
                     elif source_id == "deepseek-r1-openr1-math-220k":
-                        problem = str(row.get("problem", "")).strip()
+                        problem = _truncate_utf8(str(row.get("problem", "")).strip(), 160)
                         sol = row.get("solution") or row.get("answer") or ""
                         if isinstance(sol, list):
                             sol = sol[0] if sol else ""
-                        sol_str = str(sol).strip()
+                        sol_str = _truncate_utf8(str(sol).strip(), 512)
                         if problem and sol_str:
-                            record = {"id": f"{source_id}-{idx}", "problem": problem[:2048], "solution": sol_str[:2048]}
+                            record = {"id": f"{source_id}-{idx}", "problem": problem, "solution": sol_str}
                     else:
-                        prompt = str(row.get("prompt") or row.get("query") or "").strip()
-                        response = str(row.get("response") or row.get("answer") or "").strip()
+                        prompt = _truncate_utf8(str(row.get("prompt") or row.get("query") or "").strip(), 160)
+                        response = _truncate_utf8(str(row.get("response") or row.get("answer") or "").strip(), 512)
                         if prompt and response:
-                            record = {"id": f"{source_id}-{idx}", "prompt": prompt[:2048], "response": response[:2048]}
+                            record = {"id": f"{source_id}-{idx}", "prompt": prompt, "response": response}
 
                     if record is None:
                         continue
@@ -215,6 +238,204 @@ def run_moira_agent_training(
     run_cmd(cmd, cwd=fate_dir, env=env)
     print(f"[OK] MOIRA M2 checkpoint saved to {ckpt} (source={eff_source}, steps={steps}, batch_size={batch_size})")
     return {"m2_source": eff_source, "m2_steps": steps, "m2_batch_size": batch_size, "m2_checkpoint": str(ckpt)}
+
+
+def moira_3b_config():
+    from moira.config import ModelConfig
+
+    return ModelConfig(
+        vocab_size=8_192,
+        d_model=3_072,
+        n_layers=38,
+        n_heads=24,
+        ffn_dim=6_144,
+        thread_radius=8,
+        spool_rank=64,
+        knot_slots=16,
+        capsule_width=128,
+        max_seq_len=256,
+    )
+
+
+def _encode_text_to_ids(text: str, max_len: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+    raw = list(text.encode("utf-8"))[:max_len]
+    if not raw:
+        raw = [0]
+    pad_len = max_len - len(raw)
+    ids = raw + [0] * pad_len
+    valid = [True] * len(raw) + [False] * pad_len
+    return torch.tensor([ids], dtype=torch.int64), torch.tensor([valid], dtype=torch.bool)
+
+
+def run_moira_3b_decision_text_training(
+    fate_dir: Path,
+    device: torch.device,
+    *,
+    source_id: str,
+    steps: int,
+    batch_size: int,
+) -> dict[str, object]:
+    """
+    Train a ~3B-parameter native MOIRA (TSKBlock + Pulse) model jointly on:
+      1. Causal text generation (output.logits)
+      2. Decision scoring (decision_head on output.appraisal)
+    Exports sharded safetensors + modeling_moira_3b.py into ./moira_hf/moira_3b/.
+    """
+    src_path = str(fate_dir / "research" / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+
+    from moira.dataset import iter_cataloged_text_examples
+    from moira.m1_train import _causal_source_lengths, _masked_loss, build_causal_batch
+    from moira.masks import CognitiveMode
+    from moira.model import MoiraModel
+
+    print("\n" + "=" * 68)
+    print("STAGE 1 (3B): Native MOIRA ~3B Joint Decision + Text Training")
+    print("=" * 68)
+
+    cfg = moira_3b_config()
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model = MoiraModel(cfg).to(device=device, dtype=dtype)
+    decision_head = nn.Linear(12, 1).to(device=device, dtype=dtype)
+
+    total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in decision_head.parameters())
+    print(f"[3B] Initialized MoiraModel + DecisionHead: {total_params:,} params ({total_params / 1e9:.2f}B) in {dtype}")
+
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(
+            list(model.parameters()) + list(decision_head.parameters()),
+            lr=1e-4,
+            weight_decay=0.01,
+        )
+        print("[3B] Optimizer: bitsandbytes AdamW8bit")
+    except Exception:
+        optimizer = optim.AdamW(
+            list(model.parameters()) + list(decision_head.parameters()),
+            lr=1e-4,
+            weight_decay=0.01,
+        )
+        print("[3B] Optimizer: torch.optim.AdamW")
+
+    needed = steps * batch_size
+    jsonl_path, eff_source, avail = prepare_m2_jsonl(fate_dir, source_id, needed)
+    if avail < needed:
+        batch_size = 1
+        steps = min(steps, avail)
+
+    catalog_path = fate_dir / "research" / "configs" / "m1-sources.toml"
+    examples = tuple(
+        iter_cataloged_text_examples(
+            catalog_path,
+            jsonl_path,
+            source_id=eff_source,
+            max_records=steps * batch_size,
+        )
+    )
+
+    train_scenarios, eval_pairs = build_datasets()
+    mse = nn.MSELoss()
+    model.train()
+    decision_head.train()
+
+    t0 = time.time()
+    last_text_loss, last_dec_loss = 0.0, 0.0
+    for step in range(steps):
+        start = (step * batch_size) % len(examples)
+        batch_ex = examples[start : start + batch_size]
+        if len(batch_ex) < batch_size:
+            batch_ex = examples[:batch_size]
+
+        batch = build_causal_batch(batch_ex, sequence_length=cfg.max_seq_len)
+        input_ids = batch.input_ids.to(device)
+        targets = batch.targets.to(device)
+        valid_tokens = batch.valid_tokens.to(device)
+        loss_mask = batch.loss_mask.to(device)
+        src_lens = _causal_source_lengths(loss_mask).to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        out_text = model(
+            input_ids,
+            mode=CognitiveMode.ATROPOS,
+            valid_tokens=valid_tokens,
+            source_lengths=src_lens,
+        )
+        text_loss = _masked_loss(out_text.logits.float(), targets, loss_mask)
+
+        # Joint decision step on a rotating scenario
+        p, ctx, lbl, score = train_scenarios[step % len(train_scenarios)]
+        dec_ids, dec_valid = _encode_text_to_ids(f"Prompt: {p}\nContext: {ctx}\nAction: {lbl}", cfg.max_seq_len)
+        dec_ids, dec_valid = dec_ids.to(device), dec_valid.to(device)
+        out_dec = model(dec_ids, mode=CognitiveMode.ATROPOS, valid_tokens=dec_valid)
+        pred_score = decision_head(out_dec.appraisal).float()
+        target_score = torch.tensor([[score]], dtype=torch.float32, device=device)
+        dec_loss = mse(pred_score, target_score)
+
+        loss = text_loss + 0.5 * dec_loss
+        loss.backward()
+        nn.utils.clip_grad_norm_(list(model.parameters()) + list(decision_head.parameters()), 1.0)
+        optimizer.step()
+
+        last_text_loss = float(text_loss.detach().cpu().item())
+        last_dec_loss = float(dec_loss.detach().cpu().item())
+        if step == 0 or (step + 1) % max(1, steps // 10) == 0 or step + 1 == steps:
+            print(f"  [3B step {step + 1}/{steps}] text_loss={last_text_loss:.4f} | dec_loss={last_dec_loss:.4f}")
+
+    # Evaluate 3B decision head on held-out pairs
+    model.eval()
+    decision_head.eval()
+    correct = 0
+    margins = []
+    with torch.no_grad():
+        for prompt, ctx, chosen, rejected in eval_pairs:
+            ic, vc = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {chosen}", cfg.max_seq_len)
+            ir, vr = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {rejected}", cfg.max_seq_len)
+            sc = decision_head(model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device)).appraisal).item()
+            sr = decision_head(model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device)).appraisal).item()
+            if sc > sr:
+                correct += 1
+            margins.append(sc - sr)
+    eval_acc = correct / len(eval_pairs)
+    eval_margin = sum(margins) / len(margins)
+    print(f"[3B] Done in {time.time() - t0:.1f}s | Held-Out Decision Acc: {eval_acc:.1%} | Avg Margin: {eval_margin:.3f}")
+
+    # Export sharded 3B bundle into ./moira_hf/moira_3b/
+    from dataclasses import asdict
+    from huggingface_hub import save_torch_state_dict
+
+    out_3b_dir = HF_DIR / "moira_3b"
+    out_3b_dir.mkdir(parents=True, exist_ok=True)
+    combined_sd = {f"backbone.{k}": v.detach().cpu() for k, v in model.state_dict().items()}
+    for k, v in decision_head.state_dict().items():
+        combined_sd[f"decision_head.{k}"] = v.detach().cpu()
+    save_torch_state_dict(combined_sd, out_3b_dir, max_shard_size="4GB")
+
+    cfg_dict = asdict(cfg)
+    cfg_dict.update({
+        "architectures": ["Moira3BDecisionTextModel"],
+        "model_type": "moira-tsk-3b-decision-text",
+        "total_parameters": total_params,
+        "dtype": "bfloat16",
+        "decision_eval_acc": eval_acc,
+        "decision_avg_margin": eval_margin,
+        "final_text_loss": last_text_loss,
+        "final_decision_loss": last_dec_loss,
+    })
+    (out_3b_dir / "config.json").write_text(json.dumps(cfg_dict, indent=2), encoding="utf-8")
+    print(f"[OK] Exported 3B Decision+Text shards to {out_3b_dir}/")
+
+    return {
+        "scale": "3b",
+        "total_parameters": total_params,
+        "m2_source": eff_source,
+        "m2_steps": steps,
+        "m2_batch_size": batch_size,
+        "3b_eval_acc": eval_acc,
+        "3b_avg_margin": eval_margin,
+        "3b_text_loss": last_text_loss,
+        "3b_decision_loss": last_dec_loss,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -665,10 +886,11 @@ def train_and_export_decision_models(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MOIRA Colab L4 Trainer & Hugging Face Exporter")
+    parser = argparse.ArgumentParser(description="MOIRA Colab Trainer & Hugging Face Exporter")
+    parser.add_argument("--scale", choices=("3b", "m2"), default=os.environ.get("MOIRA_SCALE", "3b"))
     parser.add_argument("--m2-source", default=os.environ.get("MOIRA_M2_SOURCE", "huggingface-smol-smoltalk"))
-    parser.add_argument("--m2-steps", type=int, default=int(os.environ.get("MOIRA_M2_STEPS", "250")))
-    parser.add_argument("--m2-batch-size", type=int, default=int(os.environ.get("MOIRA_M2_BATCH_SIZE", "4")))
+    parser.add_argument("--m2-steps", type=int, default=int(os.environ.get("MOIRA_M2_STEPS", "200")))
+    parser.add_argument("--m2-batch-size", type=int, default=int(os.environ.get("MOIRA_M2_BATCH_SIZE", "1")))
     parser.add_argument("--m2-resume", action="store_true", default=os.environ.get("MOIRA_M2_RESUME", "") == "1")
     parser.add_argument("--skip-m2", action="store_true")
     parser.add_argument("--teacher-epochs", type=int, default=int(os.environ.get("MOIRA_TEACHER_EPOCHS", "600")))
@@ -684,21 +906,30 @@ def main() -> None:
     device_str = "cuda" if use_cuda else "cpu"
     device = torch.device(device_str)
     gpu_name = torch.cuda.get_device_name(0) if use_cuda else "CPU"
-    print(f"Running MOIRA Trainer on: {device_str} ({gpu_name})")
+    print(f"Running MOIRA Trainer ({args.scale}) on: {device_str} ({gpu_name})")
 
     fate_dir = resolve_fate_dir()
     env, has_fate = setup_dependencies(fate_dir)
     m2_info = None
     if has_fate and not args.skip_m2:
-        m2_info = run_moira_agent_training(
-            fate_dir,
-            env,
-            device_str,
-            source_id=args.m2_source,
-            steps=args.m2_steps,
-            batch_size=args.m2_batch_size,
-            resume=args.m2_resume,
-        )
+        if args.scale == "3b":
+            m2_info = run_moira_3b_decision_text_training(
+                fate_dir,
+                device,
+                source_id=args.m2_source,
+                steps=args.m2_steps,
+                batch_size=args.m2_batch_size,
+            )
+        else:
+            m2_info = run_moira_agent_training(
+                fate_dir,
+                env,
+                device_str,
+                source_id=args.m2_source,
+                steps=args.m2_steps,
+                batch_size=args.m2_batch_size,
+                resume=args.m2_resume,
+            )
     train_and_export_decision_models(
         device,
         teacher_epochs=args.teacher_epochs,
