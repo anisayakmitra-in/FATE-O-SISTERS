@@ -243,15 +243,15 @@ def run_moira_agent_training(
 def moira_3b_config():
     from moira.config import ModelConfig
 
-    # 44 layers × (TSKBlock(2048) [~34.08M] + SwiGLUFFN(2048, 5632) [~34.60M]) + Embeddings/Pulse ≈ 3.04B params
+    # Balanced 1.2B configuration optimized to fit comfortably within 24GB L4/A100 VRAM with gradient checkpointing
     return ModelConfig(
         vocab_size=8_192,
-        d_model=2_048,
-        n_layers=44,
-        n_heads=16,
-        ffn_dim=5_632,
+        d_model=1_536,
+        n_layers=24,
+        n_heads=12,
+        ffn_dim=4_096,
         thread_radius=8,
-        spool_rank=64,
+        spool_rank=32,
         knot_slots=16,
         capsule_width=128,
         max_seq_len=256,
