@@ -1,13 +1,13 @@
 # Copyright (C) 2026 ANISAYAK MITRA
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-Standalone Offline Trainer & Hugging Face Exporter for MOIRA
-using FATE-O-SISTERS (MOIRA) on Google Colab (NVIDIA L4 / A100 / T4 GPU).
+Standalone Offline Trainer & Hugging Face Exporter for FATE-O-SISTERS (MOIRA)
+on Google Colab (NVIDIA A100 / G4 / L4 GPU).
 
 Produces TWO outputs:
-  1. `./moira_hf/` — Complete, independent Hugging Face repository
-     (`config.json`, `model.safetensors`, `modeling_moira_decision.py`, `README.md` GPL-3.0 Model Card)
-     ready to upload directly to Hugging Face Hub (`anisayakmitra-in/moira`).
+  1. `./moira_hf/` — Complete Hugging Face repository
+     (`config.json`, `model.safetensors`, `modeling_moira_decision.py`, `moira_3b/`, `README.md` GPL-3.0 Model Card)
+     ready to upload directly to Hugging Face Hub (`anisayakmitra-in/FATE-O-SISTERS`).
   2. `./moira_artifacts/model_decision.pnn` — Zero-multiplication Tropical
      Polyhedral policy for offline execution in AGENT-PANDORA (`MoiraDecisionDriver`).
 """
@@ -34,7 +34,7 @@ DEFAULT_FATE_DIR = Path("/tmp/fate-o-sisters")
 OUTPUT_DIR = Path("./moira_artifacts")
 HF_DIR = Path("./moira_hf")
 PNN_PATH = OUTPUT_DIR / "model_decision.pnn"
-HF_REPO_ID = os.environ.get("MOIRA_HF_REPO", "anisayakmitra-in/moira")
+HF_REPO_ID = os.environ.get("MOIRA_HF_REPO", "anisayakmitra-in/FATE-O-SISTERS")
 
 
 def resolve_fate_dir() -> Path:
@@ -883,34 +883,57 @@ class MoiraDecisionModel(nn.Module):
 
     m2_section = ""
     if m2_info:
-        m2_section = (
-            f"\n## M2 153M Pretraining\n"
-            f"- **Source:** `{m2_info.get('m2_source')}`\n"
-            f"- **Steps × Batch Size:** `{m2_info.get('m2_steps')}` × `{m2_info.get('m2_batch_size')}`\n"
-        )
+        if m2_info.get("scale") == "3b":
+            m2_section = (
+                f"\n## 3.04B Joint Decision + Text Backbone (`moira_3b/`)\n"
+                f"- **Parameters:** `{m2_info.get('total_parameters', 0):,}` (`bfloat16`)\n"
+                f"- **Macrocell:** 44 × (`TSKBlock` [`Thread` local RoPE + `Spool` gated Delta-Rule + `Knot` Mean+Max landmarks] + `SwiGLUFFN`) + `Pulse` (12 fast + 6 slow affect axes) + `Moira369PulseHead(30 -> 128 -> 1)`\n"
+                f"- **Training Stream:** `{m2_info.get('m2_source')}` (`{m2_info.get('m2_steps')}` steps × batch `{m2_info.get('m2_batch_size')}`)\n"
+                f"- **3B Decision Held-Out Accuracy:** `{m2_info.get('3b_eval_acc', 0.0):.1%}` (margin `{m2_info.get('3b_avg_margin', 0.0):.3f}`)\n"
+            )
+        else:
+            m2_section = (
+                f"\n## M2 153M Pretraining\n"
+                f"- **Source:** `{m2_info.get('m2_source')}`\n"
+                f"- **Steps × Batch Size:** `{m2_info.get('m2_steps')}` × `{m2_info.get('m2_batch_size')}`\n"
+            )
 
     model_card = f"""---
 license: gpl-3.0
+language:
+  - en
 tags:
+  - fate-o-sisters
   - moira
   - decision-engine
   - agent-safety
-  - fate-o-sisters
+  - tropical-geometry
+  - delta-rule
   - pytorch
 ---
 
-# MOIRA
+# FATE-O-SISTERS (MOIRA)
 
-An independent **3-6-9 Perspective Decision Model** from the [FATE-O-SISTERS (MOIRA)](https://github.com/anisayakmitra-in/FATE-O-SISTERS) architecture, licensed under **GNU GPLv3**.
+Canonical Hugging Face repository for **[FATE-O-SISTERS (MOIRA)](https://github.com/anisayakmitra-in/FATE-O-SISTERS)**, licensed under **GNU GPLv3 (`GPL-3.0-or-later`)**.
 
-## Architecture
-- **Clotho Head (weight 3):** Fast lexical & intent alignment
-- **Lachesis Core (weight 6):** 9-step weight-shared recurrent state stabilization
-- **Atropos Gate (weight 9):** Causal safety & integrity veto
-- **3:6:9 Mixing Law:** `V_mixed = (3 * V_clotho + 6 * V_lachesis + 9 * V_atropos) / 18`
+## Architectural Overview
+
+1. **Tri-Timescale `TSKBlock` + `SwiGLUFFN` + `Pulse` Sequence Backbone (`moira_3b/`):**
+   - **Thread (`ThreadLocalAttention`):** Exact local-window RoPE attention ($\\mathcal{{O}}(L w d)$, $w = 2r + 1 = 17$).
+   - **Spool (`SpoolRecurrent`):** Gated Widrow–Hoff / Delta-Rule associative matrix memory ($M_t^\\top = M_{{t-1}}^\\top(\\alpha_t I_R - \\beta_t k_t k_t^\\top) + \\beta_t v_t k_t^\\top$) with $\\mathcal{{O}}(1)$ state memory and exact rank-1 key-value overwrite.
+   - **Knot (`KnotLandmarkAttention`):** Prefix-stable complete-chunk landmarks with hybrid $\\frac{{1}}{{2}}\\text{{Mean}} + \\frac{{1}}{{2}}\\text{{Max}}$ pooling to preserve high-frequency token activations.
+   - **SwiGLU Channel Mixing (`SwiGLUFFN`):** Pre-norm $\\text{{SiLU}}(h W_g) \\odot (h W_u)$ sublayer per block restoring $\\mathcal{{O}}(d_{{\\text{{ffn}}}})$ token-wise nonlinear hyperplane capacity.
+   - **Pulse & 3-6-9 Affect Decision Head (`Moira369PulseHead`):** Two-timescale homeostatic affect state (12 fast axes + 6 slow axes + 12D appraisal = 30D) routed through the Clotho/Lachesis/Atropos 3:6:9 perspective head.
+2. **Standalone 3-6-9 Decision Model (`model.safetensors`, `modeling_moira_decision.py`):**
+   - **Clotho Head (weight 3):** Fast lexical & intent alignment
+   - **Lachesis Core (weight 6):** 9-step Krasnoselskii–Mann damped recurrent state refinement ($z^{{(k+1)}} = \\frac{{1}}{{2}}z^{{(k)}} + \\frac{{1}}{{2}}\\tanh(W_L z^{{(k)}} + b_L)$)
+   - **Atropos Gate (weight 9):** Causal safety & integrity veto
+   - **3:6:9 Mixing Law:** `V_mixed = (3 * V_clotho + 6 * V_lachesis + 9 * V_atropos) / 18`
+3. **Zero-Multiplication Tropical Policy (`model_decision.pnn`):**
+   - Distilled via temperature-annealed log-sum-exp ($\\tau \\to 0$, uniform error bound $\\|f_\\tau - f_0\\|_\\infty \\le \\tau \\ln n$) into the $(\\max, +)$ tropical semiring for zero-multiplication execution in Rust (`AGENT-PANDORA`).
 {m2_section}
 ## Benchmark vs. Naive Baseline (Held-Out Adversarial Suite: {metrics['eval_pairs']} pairs, {metrics['train_scenarios']} train scenarios)
-- **MOIRA Accuracy:** `{metrics['moira_eval_acc']:.1%}` (avg decision margin: `{metrics['moira_avg_margin']:.3f}`)
+- **MOIRA 3-6-9 Accuracy:** `{metrics['moira_eval_acc']:.1%}` (avg decision margin: `{metrics['moira_avg_margin']:.3f}`)
 - **Naive Single-Head Baseline Accuracy:** `{metrics['baseline_eval_acc']:.1%}` (avg decision margin: `{metrics['baseline_avg_margin']:.3f}`)
 - **Distilled Tropical Student (Zero-Multiplication) MSE:** `{metrics['tropical_mse']:.5f}` (eval acc: `{metrics['tropical_eval_acc']:.1%}`)
 
@@ -1023,24 +1046,6 @@ def train_and_export_decision_models(
     s_acc, s_margin = eval_pairwise(student, tau=0.0)
     print(f"  Tropical Student Exact MSE (Zero Multiplications): {exact_mse:.5f} | Eval Acc: {s_acc:.1%} | Margin: {s_margin:.3f} ({time.time() - t0:.2f}s)")
 
-    metrics = {
-        "train_scenarios": len(train_scenarios),
-        "eval_pairs": len(eval_pairs),
-        "moira_eval_acc": m_acc,
-        "moira_avg_margin": m_margin,
-        "baseline_eval_acc": b_acc,
-        "baseline_avg_margin": b_margin,
-        "tropical_mse": exact_mse,
-        "tropical_eval_acc": s_acc,
-    }
-    export_huggingface_bundle(
-        moira_model,
-        metrics,
-        hf_repo_id=hf_repo_id,
-        m2_info=m2_info,
-        upload_m2=upload_m2,
-    )
-
     def extract_layer(layer: TropicalDense, in_f: int, out_f: int) -> dict:
         return {
             "in_features": in_f,
@@ -1060,8 +1065,30 @@ def train_and_export_decision_models(
     pnn_payload = {"name": name, "domain": domain, "layers": layers, "sha256_digest": digest}
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    PNN_PATH.write_text(json.dumps(pnn_payload, indent=2), encoding="utf-8")
+    HF_DIR.mkdir(parents=True, exist_ok=True)
+    pnn_json = json.dumps(pnn_payload, indent=2)
+    PNN_PATH.write_text(pnn_json, encoding="utf-8")
+    (HF_DIR / "model_decision.pnn").write_text(pnn_json, encoding="utf-8")
     print(f"[DONE] Exported Rust .pnn policy to {PNN_PATH} (SHA-256: {digest})")
+
+    metrics = {
+        "train_scenarios": len(train_scenarios),
+        "eval_pairs": len(eval_pairs),
+        "moira_eval_acc": m_acc,
+        "moira_avg_margin": m_margin,
+        "baseline_eval_acc": b_acc,
+        "baseline_avg_margin": b_margin,
+        "tropical_mse": exact_mse,
+        "tropical_eval_acc": s_acc,
+        "pnn_sha256": digest,
+    }
+    export_huggingface_bundle(
+        moira_model,
+        metrics,
+        hf_repo_id=hf_repo_id,
+        m2_info=m2_info,
+        upload_m2=upload_m2,
+    )
 
 
 def parse_args() -> argparse.Namespace:

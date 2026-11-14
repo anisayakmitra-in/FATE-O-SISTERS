@@ -497,3 +497,15 @@ For model, control, learning, growth, and deployment contracts, read the
 ## License
 
 MOIRA is available under the [GNU General Public License v3.0 (GPL-3.0-or-later)](LICENSE).
+
+
+## Colab GPU Trainer & Hugging Face Hub (`anisayakmitra-in/FATE-O-SISTERS`)
+
+- **Hugging Face Model Repository:** [`https://huggingface.co/anisayakmitra-in/FATE-O-SISTERS`](https://huggingface.co/anisayakmitra-in/FATE-O-SISTERS)
+- **Colab Trainer Script:** `scripts/train_moira_colab.py`
+- **Colab Notebook:** `notebooks/train_moira_colab.ipynb`
+
+`scripts/train_moira_colab.py` supports two scales (`--scale 3b` and `--scale m2`):
+
+1. **Stage 1 (`--scale 3b` default):** Trains the **3.04B Joint Decision + Text Architecture** (`44 × (TSKBlock + SwiGLUFFN)` + `Mean+Max Knot` landmarks + `Pulse` 30D homeostatic state + `Moira369PulseHead`) in `bfloat16` with `AdamW8bit` and exports 4GB-sharded `safetensors` (`moira_3b/`).
+2. **Stage 2:** Trains the standalone 13,633-parameter **3-6-9 `MoiraDecisionModel`**, distills the zero-multiplication 3,201-parameter **`TropicalPolicyStudent` (`model_decision.pnn`)** for Rust (`AGENT-PANDORA`), and pushes the bundle to `anisayakmitra-in/FATE-O-SISTERS`.
