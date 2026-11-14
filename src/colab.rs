@@ -8,6 +8,7 @@
 //   - `colab-ctl`: Runs locally in Antigravity (`status`, `logs`, `exec`, `kill`, `ping`, `pull`, `pair`).
 //   - `push-hf`: Uploads compiled `.pnn`, `.safetensors`, and metrics to Hugging Face Hub via NDJSON API.
 
+use crate::pnn::Sha256;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
@@ -99,7 +100,81 @@ pub fn hf_download_bytes(repo_id: &str, path_in_repo: &str, token: Option<&str>)
     }
 }
 
+/// Uploads a binary blob via the Git LFS Batch API so Hugging Face Hub accepts `lfsFile` commits.
+fn hf_upload_lfs_blob(repo_id: &str, token: &str, content: &[u8]) -> Result<(String, usize), String> {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let oid = hasher.finalize_hex();
+    let size = content.len();
+
+    let batch_req = serde_json::json!({
+        "operation": "upload",
+        "transfers": ["basic"],
+        "objects": [{ "oid": oid, "size": size }],
+        "hash_algo": "sha256"
+    });
+    let batch_url = format!("https://huggingface.co/{repo_id}.git/info/lfs/objects/batch");
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            "--max-time",
+            "30",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            "-H",
+            "Accept: application/vnd.git-lfs+json",
+            "-H",
+            "Content-Type: application/vnd.git-lfs+json",
+            "-d",
+            &batch_req.to_string(),
+            &batch_url,
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+        if let Some(upload_obj) = resp_json
+            .get("objects")
+            .and_then(|o| o.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("actions"))
+            .and_then(|act| act.get("upload"))
+        {
+            if let Some(href) = upload_obj.get("href").and_then(|h| h.as_str()) {
+                let tmp_bin =
+                    std::env::temp_dir().join(format!("moira_lfs_{}_{size}.bin", std::process::id()));
+                std::fs::write(&tmp_bin, content).map_err(|e| e.to_string())?;
+
+                let mut put_cmd = Command::new("curl");
+                put_cmd.args(["-sS", "-X", "PUT", "--max-time", "60"]);
+                if let Some(headers) = upload_obj.get("header").and_then(|h| h.as_object()) {
+                    for (hk, hv) in headers {
+                        if let Some(hv_str) = hv.as_str() {
+                            put_cmd.args(["-H", &format!("{hk}: {hv_str}")]);
+                        }
+                    }
+                }
+                put_cmd.args(["--data-binary", &format!("@{}", tmp_bin.display()), href]);
+                let put_out = put_cmd.output();
+                let _ = std::fs::remove_file(&tmp_bin);
+                let put_out = put_out.map_err(|e| e.to_string())?;
+                if !put_out.status.success() {
+                    return Err(format!(
+                        "LFS PUT failed: {}",
+                        String::from_utf8_lossy(&put_out.stderr)
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((oid, size))
+}
+
 /// Commits one or more files atomically to Hugging Face Hub `main` using the NDJSON Commit API.
+/// Automatically routes binary files (`.safetensors`, `.bin.pnn`) through Git LFS (`lfsFile`).
 pub fn hf_commit_files(
     repo_id: &str,
     token: &str,
@@ -118,17 +193,37 @@ pub fn hf_commit_files(
     ndjson.push('\n');
 
     for &(path_in_repo, content) in files {
-        let b64_content = B64.encode(content);
-        let file_line = serde_json::json!({
-            "key": "file",
-            "value": {
-                "content": b64_content,
-                "path": path_in_repo,
-                "encoding": "base64"
-            }
-        });
-        ndjson.push_str(&file_line.to_string());
-        ndjson.push('\n');
+        let is_binary = path_in_repo.ends_with(".safetensors")
+            || path_in_repo.ends_with(".bin.pnn")
+            || path_in_repo.ends_with(".pt")
+            || content.contains(&0u8);
+
+        if is_binary {
+            let (oid, size) = hf_upload_lfs_blob(repo_id, token, content)?;
+            let lfs_line = serde_json::json!({
+                "key": "lfsFile",
+                "value": {
+                    "path": path_in_repo,
+                    "algo": "sha256",
+                    "oid": oid,
+                    "size": size
+                }
+            });
+            ndjson.push_str(&lfs_line.to_string());
+            ndjson.push('\n');
+        } else {
+            let b64_content = B64.encode(content);
+            let file_line = serde_json::json!({
+                "key": "file",
+                "value": {
+                    "content": b64_content,
+                    "path": path_in_repo,
+                    "encoding": "base64"
+                }
+            });
+            ndjson.push_str(&file_line.to_string());
+            ndjson.push('\n');
+        }
     }
 
     let tmp_ndjson = std::env::temp_dir().join(format!("moira_hf_commit_{}.ndjson", std::process::id()));
@@ -138,7 +233,6 @@ pub fn hf_commit_files(
     let out = Command::new("curl")
         .args([
             "-sS",
-            "-f",
             "-X",
             "POST",
             "--max-time",
@@ -156,9 +250,10 @@ pub fn hf_commit_files(
 
     let _ = std::fs::remove_file(&tmp_ndjson);
     let out = out?;
-    if !out.status.success() {
+    let body = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || body.contains("\"error\"") {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("HF commit failed: {stderr}"));
+        return Err(format!("HF commit failed: {body} {stderr}"));
     }
     Ok(())
 }
@@ -739,6 +834,7 @@ pub fn push_hf_bundle(repo_id: &str) -> Result<(), String> {
     let hf_dir = PathBuf::from("moira_hf");
     let candidate_files = [
         "model.safetensors",
+        "moira_tsk_backbone.safetensors",
         "model_decision.pnn",
         "model_decision.bin.pnn",
         "training_metrics.json",

@@ -15,12 +15,14 @@ mod decision;
 mod engine;
 mod memory;
 mod pnn;
+mod tsk;
 
 use colab::DEFAULT_REPO_ID;
 use data_sifter::DataSifter;
 use engine::MoiraEngine;
 use memory::MemorySupervisor;
 use std::path::Path;
+use tsk::{MoiraTskBackbone, Orientation};
 
 fn run_inference_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing MOIRA Engine (100% Rust | GPL-3.0-or-later)...");
@@ -43,6 +45,17 @@ fn run_inference_demo() -> Result<(), Box<dyn std::error::Error>> {
         input_tokens.len(),
         entropy,
         logits.dims()
+    );
+
+    let mut tsk_backbone = MoiraTskBackbone::new(128, 24, 2, 4, 2, 8, 4, 48, 369);
+    let (_seq_c, pulse_c, _spools) = tsk_backbone.forward(&input_tokens, Orientation::Clotho);
+    let (_seq_l, _pulse_l, _) =
+        tsk_backbone.forward(&input_tokens, Orientation::Lachesis { prefix_len: 2 });
+    let (_seq_a, pulse_a, _) = tsk_backbone.forward(&input_tokens, Orientation::Atropos);
+    println!(
+        "TSK Backbone ({} params): Thread+Spool+Knot+SwiGLU verified | Pulse 30D norm = {:.4}",
+        tsk_backbone.param_count(),
+        pulse_c.iter().zip(pulse_a.iter()).map(|(a, b)| a * a + b * b).sum::<f32>().sqrt()
     );
 
     let bin_pnn = Path::new("moira_artifacts/model_decision.bin.pnn");

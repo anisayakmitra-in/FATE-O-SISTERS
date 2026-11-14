@@ -719,6 +719,14 @@ pub fn train_and_export_all(teacher_epochs: usize, student_epochs: usize) -> std
     let st_bytes = teacher.save_safetensors(&hf_dir.join("model.safetensors"))?;
     let _ = teacher.save_safetensors(&artifacts_dir.join("model.safetensors"))?;
 
+    let tsk = crate::tsk::MoiraTskBackbone::new(128, 24, 2, 4, 2, 8, 4, 48, 369);
+    let tsk_bytes = tsk.save_safetensors(&hf_dir.join("moira_tsk_backbone.safetensors"))?;
+    let _ = tsk.save_safetensors(&artifacts_dir.join("moira_tsk_backbone.safetensors"))?;
+    println!(
+        "  [TSK Core] {:6} params | Exported moira_tsk_backbone.safetensors ({tsk_bytes} B)",
+        tsk.param_count()
+    );
+
     let metrics = TrainingMetrics {
         train_scenarios: train_scenarios.len(),
         eval_pairs: eval_pairs.len(),
