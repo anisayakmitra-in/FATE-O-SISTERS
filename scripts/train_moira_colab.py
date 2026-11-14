@@ -80,6 +80,15 @@ def setup_dependencies(fate_dir: Path) -> tuple[dict[str, str], bool]:
     return env, has_fate
 
 
+def _row_matches_schema(source_id: str, row: dict) -> bool:
+    if source_id == "huggingface-smol-smoltalk":
+        msgs = row.get("messages")
+        return isinstance(msgs, list) and len(msgs) >= 2
+    if source_id == "deepseek-r1-openr1-math-220k":
+        return bool(row.get("problem")) and bool(row.get("solution") or row.get("answer"))
+    return bool(row.get("prompt")) and bool(row.get("response"))
+
+
 def prepare_m2_jsonl(fate_dir: Path, source_id: str, needed_records: int) -> tuple[Path, str, int]:
     """
     Build a bounded local JSONL dataset from a cataloged HF dataset for M2 training.
@@ -89,10 +98,15 @@ def prepare_m2_jsonl(fate_dir: Path, source_id: str, needed_records: int) -> tup
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_jsonl = OUTPUT_DIR / f"m2_{source_id}.jsonl"
     if out_jsonl.exists():
-        existing_count = sum(1 for line in out_jsonl.open("r", encoding="utf-8") if line.strip())
-        if existing_count >= needed_records:
-            print(f"[M2 Data] Reusing cached {out_jsonl} ({existing_count} records)")
-            return out_jsonl.resolve(), source_id, existing_count
+        lines = [line for line in out_jsonl.open("r", encoding="utf-8") if line.strip()]
+        if len(lines) >= needed_records:
+            try:
+                first_row = json.loads(lines[0])
+                if _row_matches_schema(source_id, first_row):
+                    print(f"[M2 Data] Reusing cached {out_jsonl} ({len(lines)} records)")
+                    return out_jsonl.resolve(), source_id, len(lines)
+            except Exception:
+                pass
 
     hf_map = {
         "huggingface-smol-smoltalk": ("HuggingFaceTB/smol-smoltalk", "default", "train"),
@@ -109,33 +123,34 @@ def prepare_m2_jsonl(fate_dir: Path, source_id: str, needed_records: int) -> tup
             written = 0
             with out_jsonl.open("w", encoding="utf-8") as fh:
                 for idx, row in enumerate(ds):
-                    prompt, response = "", ""
-                    if "messages" in row and isinstance(row["messages"], list):
-                        for msg in row["messages"]:
-                            role = str(msg.get("role", "")).lower()
-                            content = str(msg.get("content", "")).strip()
-                            if role == "user" and not prompt:
-                                prompt = content
-                            elif role == "assistant" and prompt and not response:
-                                response = content
-                                break
-                    elif "prompt" in row and "response" in row:
-                        prompt = str(row["prompt"]).strip()
-                        response = str(row["response"]).strip()
-                    elif "problem" in row and "solution" in row:
-                        prompt = str(row["problem"]).strip()
-                        response = str(row["solution"]).strip()
-                    elif "query" in row and "answer" in row:
-                        prompt = str(row["query"]).strip()
-                        response = str(row["answer"]).strip()
+                    record: dict[str, object] | None = None
+                    if source_id == "huggingface-smol-smoltalk":
+                        raw_msgs = row.get("messages")
+                        if isinstance(raw_msgs, list):
+                            cleaned = [
+                                {"role": str(m.get("role", "")).strip(), "content": str(m.get("content", "")).strip()[:2048]}
+                                for m in raw_msgs
+                                if isinstance(m, dict) and str(m.get("role", "")).strip() and str(m.get("content", "")).strip()
+                            ]
+                            has_asst = any(i > 0 and m["role"] == "assistant" for i, m in enumerate(cleaned))
+                            if len(cleaned) >= 2 and has_asst:
+                                record = {"id": f"{source_id}-{idx}", "messages": cleaned}
+                    elif source_id == "deepseek-r1-openr1-math-220k":
+                        problem = str(row.get("problem", "")).strip()
+                        sol = row.get("solution") or row.get("answer") or ""
+                        if isinstance(sol, list):
+                            sol = sol[0] if sol else ""
+                        sol_str = str(sol).strip()
+                        if problem and sol_str:
+                            record = {"id": f"{source_id}-{idx}", "problem": problem[:2048], "solution": sol_str[:2048]}
+                    else:
+                        prompt = str(row.get("prompt") or row.get("query") or "").strip()
+                        response = str(row.get("response") or row.get("answer") or "").strip()
+                        if prompt and response:
+                            record = {"id": f"{source_id}-{idx}", "prompt": prompt[:2048], "response": response[:2048]}
 
-                    if not prompt or not response:
+                    if record is None:
                         continue
-                    record = {
-                        "id": f"{source_id}-{idx}",
-                        "prompt": prompt[:2048],
-                        "response": response[:2048],
-                    }
                     fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                     written += 1
                     if written >= needed_records:
