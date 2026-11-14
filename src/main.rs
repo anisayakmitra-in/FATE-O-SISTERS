@@ -13,6 +13,7 @@ mod colab;
 mod data_sifter;
 mod decision;
 mod engine;
+mod generator;
 mod memory;
 mod pnn;
 mod tsk;
@@ -20,6 +21,7 @@ mod tsk;
 use colab::DEFAULT_REPO_ID;
 use data_sifter::DataSifter;
 use engine::MoiraEngine;
+use generator::{GenerationConfig, Generator};
 use memory::MemorySupervisor;
 use std::path::Path;
 use tsk::{MoiraTskBackbone, Orientation};
@@ -108,8 +110,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "colab-ctl" => {
             colab::run_colab_ctl(DEFAULT_REPO_ID, &args[1..])?;
         }
+        "generate" => {
+            let prompt = args.get(1).map(String::as_str).unwrap_or("fn reason(state) ->");
+            println!("Generating with MOIRA Tri-Timescale Sequence Engine...");
+            println!("Prompt: \"{prompt}\"");
+
+            let backbone = MoiraTskBackbone::new(256, 32, 2, 4, 2, 8, 4, 64, 369);
+            let mut generator = Generator::new(backbone);
+            let config = GenerationConfig::default();
+
+            let (output, pulse) = generator.generate(prompt, &config);
+            println!("\nGenerated Output:\n{output}");
+            println!("\nPulse (30D Homeostatic Affect):");
+            println!("  Appraisal (12D): {:?}", &pulse[0..12]);
+            println!("  Fast (12D)     : {:?}", &pulse[12..24]);
+            println!("  Slow (6D)      : {:?}", &pulse[24..30]);
+        }
         other => {
-            eprintln!("Unknown subcommand '{other}'. Supported: infer | train [--push-hf] | colab-agent | colab-ctl | push-hf");
+            eprintln!("Unknown subcommand '{other}'. Supported: infer | generate [prompt] | train [--push-hf] | colab-agent | colab-ctl | push-hf");
             std::process::exit(2);
         }
     }
