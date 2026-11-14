@@ -747,6 +747,83 @@ pub fn train_and_export_all(teacher_epochs: usize, student_epochs: usize) -> std
     std::fs::write(hf_dir.join("training_metrics.json"), &metrics_json)?;
     std::fs::write(artifacts_dir.join("training_metrics.json"), &metrics_json)?;
 
+    let hf_config = serde_json::json!({
+        "architectures": ["MoiraDecisionModel", "MoiraTskBackbone", "TropicalPolicyStudent"],
+        "model_type": "moira-369-rust",
+        "runtime": "100% Pure Rust (moira v0.2.0)",
+        "in_dim": 16,
+        "hidden_dim": 64,
+        "lachesis_steps": 9,
+        "mixing_law": { "clotho": 3, "lachesis": 6, "atropos": 9, "divisor": 18 },
+        "tsk_backbone": {
+            "vocab_size": 128,
+            "d_model": 24,
+            "n_layers": 2,
+            "n_heads": 4,
+            "thread_radius": 2,
+            "spool_rank": 8,
+            "knot_chunk_size": 4,
+            "ffn_dim": 48,
+            "pulse_affect_dim": 30,
+            "parameters": tsk.param_count()
+        },
+        "license": "gpl-3.0",
+        "metrics": metrics
+    });
+    let config_str = serde_json::to_string_pretty(&hf_config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(hf_dir.join("config.json"), &config_str)?;
+
+    let model_card = format!(
+        "---\n\
+license: gpl-3.0\n\
+language:\n\
+  - en\n\
+tags:\n\
+  - fate-o-sisters\n\
+  - moira\n\
+  - rust\n\
+  - decision-engine\n\
+  - agent-safety\n\
+  - tropical-geometry\n\
+  - delta-rule\n\
+---\n\n\
+# FATE-O-SISTERS (MOIRA) — 100% Rust Engine & Tropical `.pnn` Suite\n\n\
+Canonical Hugging Face repository for **[FATE-O-SISTERS (MOIRA)](https://github.com/anisayakmitra-in/FATE-O-SISTERS)** \
+and **[AGENT-PANDORA](https://github.com/anisayakmitra-in/AGENT-PANDORA)**, licensed under **GNU GPLv3 (`GPL-3.0-or-later`)**.\n\n\
+## Pure-Rust Artifacts Included (`moira v0.2.0`)\n\n\
+| Artifact | Format | Parameters | Description |\n\
+| --- | --- | --- | --- |\n\
+| `model.safetensors` | SafeTensors (`F32`) | `13,633` | 3-6-9 `MoiraDecisionModel` Teacher (Clotho / 9-step Lachesis / Atropos) |\n\
+| `moira_tsk_backbone.safetensors` | SafeTensors (`F32`) | `{}` | Tri-Timescale `TSKBlock` (`Thread` RoPE + `Spool` Delta-Rule + `Knot` Mean+Max + `SwiGLUFFN` + `Pulse` 30D) |\n\
+| `model_decision.pnn` | JSON `.pnn` (`AGENT-PANDORA`) | `3,201` | Zero-Multiplication Tropical Max-Plus $(\\max, +)$ Student (`SHA-256: {}`) |\n\
+| `model_decision.bin.pnn` | Binary `PNN\\x01` | `3,201` | Compact binary Tropical Max-Plus policy (`12,840` bytes) |\n\
+| `training_metrics.json` | JSON | — | Verified training & held-out adversarial evaluation metrics |\n\n\
+## Benchmark Results (72 Train Scenarios / 12 Held-Out Adversarial Pairs)\n\n\
+- **MOIRA 3-6-9 Teacher (`13,633` params):** **`{:.1}%`** Held-Out Accuracy (avg margin: `{:.3}`)\n\
+- **Zero-Multiplication Tropical `.pnn` Student (`3,201` params):** **`{:.1}%`** Held-Out Accuracy (avg margin: `{:.3}`, exact MSE: `{:.5}`)\n\
+- **Naive Single-Head Baseline (`577` params):** `{:.1}%` Held-Out Accuracy (avg margin: `{:.3}`)\n\n\
+## Quickstart (100% Pure Rust)\n\n\
+```bash\n\
+cargo test\n\
+cargo run --release -- train --push-hf\n\
+cargo run --release -- infer\n\
+cargo run --release -- colab-ctl status\n\
+```\n\n\
+## License\n\
+GNU General Public License v3.0 (`GPL-3.0-or-later`). Copyright (C) 2026 ANISAYAK MITRA.\n",
+        tsk.param_count(),
+        digest,
+        moira_eval_acc * 100.0,
+        moira_avg_margin,
+        tropical_eval_acc * 100.0,
+        tropical_avg_margin,
+        exact_mse,
+        baseline_eval_acc * 100.0,
+        baseline_avg_margin,
+    );
+    std::fs::write(hf_dir.join("README.md"), &model_card)?;
+
     println!(
         "[OK] Exported model.safetensors ({st_bytes} B) and model_decision.pnn (SHA-256: {digest})"
     );

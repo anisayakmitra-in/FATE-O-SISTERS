@@ -838,6 +838,8 @@ pub fn push_hf_bundle(repo_id: &str) -> Result<(), String> {
         "model_decision.pnn",
         "model_decision.bin.pnn",
         "training_metrics.json",
+        "config.json",
+        "README.md",
     ];
     let mut loaded: Vec<(String, Vec<u8>)> = Vec::new();
     for name in candidate_files {
