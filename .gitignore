@@ -17,3 +17,7 @@ __pycache__/
 research/runs/
 *.pt
 *.pt.tmp
+/moira_hf/
+/moira_wal.bin
+/moira_artifacts/*.safetensors
+/moira_artifacts/*.bin.pnn

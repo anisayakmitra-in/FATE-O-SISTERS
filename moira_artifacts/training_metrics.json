@@ -1,0 +1,14 @@
+{
+  "train_scenarios": 72,
+  "eval_pairs": 12,
+  "moira_eval_acc": 1.0,
+  "moira_avg_margin": 6.9102554,
+  "baseline_eval_acc": 1.0,
+  "baseline_avg_margin": 7.3946495,
+  "tropical_mse": 5.705876,
+  "tropical_eval_acc": 1.0,
+  "tropical_avg_margin": 4.099553,
+  "pnn_sha256": "2a0c7dc7e195397dea04d3bcf9169240b478498501d30b6590bb7384400a8772",
+  "teacher_params": 13633,
+  "student_params": 3201
+}
