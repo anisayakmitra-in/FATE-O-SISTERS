@@ -1,28 +1,40 @@
+// Copyright (C) 2026 ANISAYAK MITRA
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+mod data_sifter;
 mod engine;
 mod memory;
-mod data_sifter;
 
+use data_sifter::DataSifter;
 use engine::MoiraEngine;
+use memory::MemorySupervisor;
 
-fn main() -> candle_core::Result<()> {
-    println!("Initializing MOIRA Engine...");
-    println!("Loading FATE'O'SISTERS Model Architecture...");
-    
-    // Initialize the engine with a 4,096 vocabulary limit and 128 hidden dimensions
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Initializing MOIRA Engine (GPL-3.0-or-later)...");
+    println!("Loading FATE'O'SISTERS 3-6-9 Model Architecture...");
+
     let mut engine = MoiraEngine::new(4096, 128)?;
-    
-    // Simulated input tokens from the text stream
-    let input_tokens = vec![102, 45, 899, 12];
-    
-    // Run the 3-6-9 forward evaluation pass
-    let (probabilities, agent_gate_triggered) = engine.forward(input_tokens)?;
-    
-    println!("Forward pass sequence executed successfully.");
-    
+    let sifter = DataSifter::new();
+    let mut memory = MemorySupervisor::new()?;
+
+    let input_tokens = sifter.sift_stream_trajectory("fn reason(state) -> verify_integrity(state)");
+    let (logits, agent_gate_triggered, entropy) = engine.forward(&input_tokens)?;
+
+    let summary_vec = logits.squeeze(0)?.to_vec1::<f32>()?;
+    let trace_slice: Vec<f32> = summary_vec.into_iter().take(16).collect();
+    memory.secure_trajectory(trace_slice)?;
+    memory.flush_queue_to_wal()?;
+
+    println!(
+        "Forward pass executed: {} tokens, normalized entropy = {:.4}",
+        input_tokens.len(),
+        entropy
+    );
+
     if agent_gate_triggered {
         println!("DSR Activation Entropy Threshold Crossed (>0.666).");
         println!("Redirecting process to local Model Context Protocol (MCP) handlers.");
     }
-    
+
     Ok(())
 }

@@ -478,7 +478,7 @@ python -m pytest research/tests -p no:cacheprovider
 | `docs/guides/candidate-worker.md` | Permit, staging, budget, artifact, and isolation contract for candidate work |
 | `docs/guides/lora-candidates.md` | LoRA dataset, training, artifact, and evaluation contract |
 | `kaggle/` | Private Kaggle M2 FP32 train-save-resume script |
-| `src/` and `Cargo.toml` | Initial Rust sketch kept for comparison; its forward path returns zero logits and is not the training reference |
+| `src/` and `Cargo.toml` | Native Rust 3-6-9 Clotho/Lachesis/Atropos engine, WAL memory supervisor, and structural token sifter |
 
 ## Research boundary
 
@@ -496,4 +496,4 @@ For model, control, learning, growth, and deployment contracts, read the
 
 ## License
 
-MOIRA is available under the [MIT License](LICENSE).
+MOIRA is available under the [GNU General Public License v3.0 (GPL-3.0-or-later)](LICENSE).
