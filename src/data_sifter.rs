@@ -18,6 +18,7 @@ impl DataSifter {
         Self { vocab_limit: 4096 }
     }
 
+    #[allow(dead_code)]
     pub fn with_vocab_limit(vocab_limit: usize) -> Self {
         Self {
             vocab_limit: vocab_limit.max(1),

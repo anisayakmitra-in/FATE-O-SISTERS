@@ -1,26 +1,13 @@
 [package]
 name = "moira"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["ANISAYAK MITRA <266799942+anisayakmitra-in@users.noreply.github.com>"]
 repository = "https://github.com/anisayakmitra-in/FATE-O-SISTERS"
-description = "On-device latent reasoning engine for the FATE'O'SISTERS architecture"
+description = "100% Rust MOIRA 3-6-9 Latent Reasoning Engine, Tropical .pnn Compiler, Trainer, and Colab Remote Control Bridge"
 
 [dependencies]
-# Core tensor operations and neural network layers via Hugging Face Candle
-candle-core = { version = "0.8.0" }
-candle-nn = { version = "0.8.0" }
-
-# High-performance, lock-free channels for the GEPA background memory thread
-crossbeam-channel = "0.5"
-
-# Fast, thread-safe atomic configuration switches
-lazy_static = "1.5"
-atomic = "0.6"
-
-[features]
-default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal"]
-rocm = ["candle-core/rocm", "candle-nn/rocm"]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+base64 = "=0.22.1"

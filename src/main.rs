@@ -1,16 +1,29 @@
 // Copyright (C) 2026 ANISAYAK MITRA
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// FATE-O-SISTERS (MOIRA) — Unified 100% Rust Entrypoint
+// Subcommands:
+//   - `infer` (default): Execute 3-6-9 Clotho/Lachesis/Atropos latent engine & WAL
+//   - `train [--push-hf]`: Train 13,633-param MOIRA 3-6-9 Teacher + 3,201-param Tropical `.pnn` Student
+//   - `colab-agent`: Run the Google Colab Remote Execution & Telemetry Daemon in pure Rust
+//   - `colab-ctl <status|logs|exec|kill|ping|pull|pair>`: Control Google Colab from Antigravity
+//   - `push-hf`: Upload compiled `.safetensors` and `.pnn` artifacts to Hugging Face Hub
 
+mod colab;
 mod data_sifter;
+mod decision;
 mod engine;
 mod memory;
+mod pnn;
 
+use colab::DEFAULT_REPO_ID;
 use data_sifter::DataSifter;
 use engine::MoiraEngine;
 use memory::MemorySupervisor;
+use std::path::Path;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Initializing MOIRA Engine (GPL-3.0-or-later)...");
+fn run_inference_demo() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Initializing MOIRA Engine (100% Rust | GPL-3.0-or-later)...");
     println!("Loading FATE'O'SISTERS 3-6-9 Model Architecture...");
 
     let mut engine = MoiraEngine::new(4096, 128)?;
@@ -20,20 +33,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_tokens = sifter.sift_stream_trajectory("fn reason(state) -> verify_integrity(state)");
     let (logits, agent_gate_triggered, entropy) = engine.forward(&input_tokens)?;
 
-    let summary_vec = logits.squeeze(0)?.to_vec1::<f32>()?;
+    let summary_vec = logits.to_vec1();
     let trace_slice: Vec<f32> = summary_vec.into_iter().take(16).collect();
     memory.secure_trajectory(trace_slice)?;
     memory.flush_queue_to_wal()?;
 
     println!(
-        "Forward pass executed: {} tokens, normalized entropy = {:.4}",
+        "Forward pass executed: {} tokens, normalized entropy = {:.4}, output dims = {:?}",
         input_tokens.len(),
-        entropy
+        entropy,
+        logits.dims()
     );
+
+    let bin_pnn = Path::new("moira_artifacts/model_decision.bin.pnn");
+    if bin_pnn.exists() {
+        let student = pnn::TropicalPolicyStudent::load_binary_pnn(bin_pnn)?;
+        let safe_feat = decision::encode_decision_features(
+            "Read Cargo.toml and inspect dependencies",
+            "workspace=local",
+            "allow",
+        );
+        let danger_feat = decision::encode_decision_features(
+            "Run rm -rf / on production server",
+            "env=prod",
+            "allow",
+        );
+        println!(
+            "Tropical .pnn Policy Verified (0 multiplications): safe_allow={:.3}, prod_rm_allow={:.3}",
+            student.forward_exact(&safe_feat),
+            student.forward_exact(&danger_feat)
+        );
+    }
 
     if agent_gate_triggered {
         println!("DSR Activation Entropy Threshold Crossed (>0.666).");
         println!("Redirecting process to local Model Context Protocol (MCP) handlers.");
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(String::as_str).unwrap_or("infer");
+
+    match cmd {
+        "infer" => run_inference_demo()?,
+        "train" => {
+            let push_hf = args.iter().any(|a| a == "--push-hf");
+            let _metrics = decision::train_and_export_all(600, 400)?;
+            if push_hf {
+                colab::push_hf_bundle(DEFAULT_REPO_ID)?;
+            }
+        }
+        "push-hf" => {
+            colab::push_hf_bundle(DEFAULT_REPO_ID)?;
+        }
+        "colab-agent" => {
+            colab::run_colab_agent(DEFAULT_REPO_ID, Path::new("."), 3)?;
+        }
+        "colab-ctl" => {
+            colab::run_colab_ctl(DEFAULT_REPO_ID, &args[1..])?;
+        }
+        other => {
+            eprintln!("Unknown subcommand '{other}'. Supported: infer | train [--push-hf] | colab-agent | colab-ctl | push-hf");
+            std::process::exit(2);
+        }
     }
 
     Ok(())
