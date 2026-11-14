@@ -478,7 +478,29 @@ python -m pytest research/tests -p no:cacheprovider
 | `docs/guides/candidate-worker.md` | Permit, staging, budget, artifact, and isolation contract for candidate work |
 | `docs/guides/lora-candidates.md` | LoRA dataset, training, artifact, and evaluation contract |
 | `kaggle/` | Private Kaggle M2 FP32 train-save-resume script |
-| `src/` and `Cargo.toml` | Native Rust 3-6-9 Clotho/Lachesis/Atropos engine, WAL memory supervisor, and structural token sifter |
+| `src/main.rs` and `Cargo.toml` | Unified 100% Rust CLI (`infer`, `train [--push-hf]`, `colab-agent`, `colab-ctl`, `push-hf`) |
+| `src/decision.rs` | 100% Rust 13,633-parameter `MoiraDecisionModel` (3-6-9 Clotho/Lachesis/Atropos) trainer & native `.safetensors` writer |
+| `src/pnn.rs` | 100% Rust 3,201-parameter `TropicalPolicyStudent` Max-Plus $(\max, +)$ compiler & binary/JSON `.pnn` serializer |
+| `src/colab.rs` | 100% Rust Antigravity ↔ Google Colab Remote Control Bridge (`colab-agent`, `colab-ctl`) & HF NDJSON Commit client |
+| `src/engine.rs`, `src/memory.rs`, `src/data_sifter.rs` | Native Rust 3-6-9 Clotho/Lachesis/Atropos engine, WAL memory supervisor, and structural token sifter |
+
+## 100% Rust Engine, Trainer & Colab Remote Control (`moira v0.2.0`)
+
+```powershell
+# Run unit tests & build release binary
+cargo test
+cargo build --release
+
+# Train 13,633-param MOIRA 3-6-9 Teacher + 3,201-param Tropical .pnn Student and upload to Hugging Face Hub
+cargo run --release -- train --push-hf
+
+# Run on-device 3-6-9 inference + zero-multiplication Tropical .pnn policy check
+cargo run --release -- infer
+
+# Control Google Colab GPU remotely from Antigravity
+cargo run --release -- colab-ctl status
+cargo run --release -- colab-ctl exec "cargo run --release -- train --push-hf" --wait
+```
 
 ## Research boundary
 
