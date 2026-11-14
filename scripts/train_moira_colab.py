@@ -243,12 +243,13 @@ def run_moira_agent_training(
 def moira_3b_config():
     from moira.config import ModelConfig
 
+    # 44 layers × (TSKBlock(2048) [~34.08M] + SwiGLUFFN(2048, 5632) [~34.60M]) + Embeddings/Pulse ≈ 3.04B params
     return ModelConfig(
         vocab_size=8_192,
-        d_model=3_072,
-        n_layers=38,
-        n_heads=24,
-        ffn_dim=6_144,
+        d_model=2_048,
+        n_layers=44,
+        n_heads=16,
+        ffn_dim=5_632,
         thread_radius=8,
         spool_rank=64,
         knot_slots=16,
@@ -257,14 +258,104 @@ def moira_3b_config():
     )
 
 
+class SwiGLUFFN(nn.Module):
+    """Restores O(d_ffn) token-wise nonlinear hyperplane capacity missing in vanilla TSKBlock."""
+    def __init__(self, d_model: int, ffn_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.w_gate = nn.Linear(d_model, ffn_dim, bias=False)
+        self.w_up = nn.Linear(d_model, ffn_dim, bias=False)
+        self.w_down = nn.Linear(ffn_dim, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        return x + self.w_down(nn.functional.silu(self.w_gate(h)) * self.w_up(h))
+
+
+class Moira369PulseHead(nn.Module):
+    """
+    3-6-9 Perspective Decision Head over the 30D Pulse state
+    ([appraisal (12D) ; fast_affect (12D) ; slow_affect (6D)]).
+    """
+    def __init__(self, in_dim: int = 30, hidden_dim: int = 128):
+        super().__init__()
+        self.embed = nn.Linear(in_dim, hidden_dim)
+        self.clotho = nn.Linear(hidden_dim, hidden_dim)
+        self.lachesis = nn.Linear(hidden_dim, hidden_dim)
+        self.atropos = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, 1)
+
+    def forward(self, pulse_vec: torch.Tensor) -> torch.Tensor:
+        h = torch.tanh(self.embed(pulse_vec))
+        v_clotho = torch.tanh(self.clotho(h))
+        v_lachesis = h
+        for _ in range(9):
+            v_lachesis = 0.5 * (v_lachesis + torch.tanh(self.lachesis(v_lachesis)))
+        v_atropos = torch.tanh(self.atropos(v_lachesis))
+        v_mixed = (3.0 * v_clotho + 6.0 * v_lachesis + 9.0 * v_atropos) / 18.0
+        return self.out_proj(v_mixed)
+
+
+def _patch_vectorized_landmarks(block: nn.Module) -> None:
+    """
+    1. Eliminate per-batch CPU-GPU .item() syncs in TSKBlock._causal_sequence_landmarks.
+    2. Use 0.5 * mean + 0.5 * amax pooling per chunk to prevent 1/C boxcar high-frequency attenuation.
+    """
+    def _fast_causal_landmarks(hidden: torch.Tensor, valid_tokens: torch.Tensor):
+        batch, length, d_model = hidden.shape
+        landmarks = hidden.new_zeros((batch, block.knot_slots, d_model))
+        end_positions = torch.full(
+            (batch, block.knot_slots), -1, dtype=torch.int64, device=hidden.device
+        )
+        valid_lengths = valid_tokens.sum(dim=1)
+        for idx in range(block.knot_slots):
+            start = idx * block.causal_knot_width
+            if start >= block.causal_knot_max_tokens:
+                break
+            end = min(start + block.causal_knot_width, block.causal_knot_max_tokens)
+            if end > length:
+                break
+            admitted = valid_lengths >= end
+            chunk = hidden[:, start:end]
+            chunk_pool = 0.5 * chunk.mean(dim=1) + 0.5 * chunk.amax(dim=1)
+            landmarks[:, idx] = torch.where(admitted[:, None], chunk_pool, landmarks[:, idx])
+            end_positions[:, idx] = torch.where(admitted, end - 1, end_positions[:, idx])
+        type_ids = torch.zeros((batch, block.knot_slots), dtype=torch.int64, device=hidden.device)
+        landmark_valid = end_positions >= 0
+        query_positions = torch.arange(length, device=hidden.device).view(1, length, 1)
+        visibility = (
+            valid_tokens[:, :, None]
+            & landmark_valid[:, None, :]
+            & (end_positions[:, None, :] <= query_positions)
+        )
+        return landmarks, type_ids, end_positions, visibility
+
+    block._causal_sequence_landmarks = _fast_causal_landmarks
+
+
+def _patch_block_with_swiglu(block: nn.Module, swiglu: SwiGLUFFN) -> None:
+    orig_forward = block.forward
+
+    def _wrapped_forward(hidden: torch.Tensor, *args, **kwargs):
+        out_hidden, next_state = orig_forward(hidden, *args, **kwargs)
+        return swiglu(out_hidden), next_state
+
+    block.forward = _wrapped_forward
+
+
 def _encode_text_to_ids(text: str, max_len: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
     raw = list(text.encode("utf-8"))[:max_len]
     if not raw:
         raw = [0]
-    pad_len = max_len - len(raw)
+    eff_len = max(16, min(max_len, len(raw)))
+    pad_len = eff_len - len(raw)
     ids = raw + [0] * pad_len
     valid = [True] * len(raw) + [False] * pad_len
     return torch.tensor([ids], dtype=torch.int64), torch.tensor([valid], dtype=torch.bool)
+
+
+def _extract_pulse_30d(out) -> torch.Tensor:
+    return torch.cat([out.appraisal, out.state.pulse.fast, out.state.pulse.slow], dim=-1)
 
 
 def run_moira_3b_decision_text_training(
@@ -276,9 +367,9 @@ def run_moira_3b_decision_text_training(
     batch_size: int,
 ) -> dict[str, object]:
     """
-    Train a ~3B-parameter native MOIRA (TSKBlock + Pulse) model jointly on:
+    Train a ~3.04B-parameter MOIRA (TSKBlock + SwiGLUFFN + 3-6-9 Pulse Head) model jointly on:
       1. Causal text generation (output.logits)
-      2. Decision scoring (decision_head on output.appraisal)
+      2. 3-6-9 Decision scoring + pairwise margin ranking (Moira369PulseHead on 30D Pulse state)
     Exports sharded safetensors + modeling_moira_3b.py into ./moira_hf/moira_3b/.
     """
     src_path = str(fate_dir / "research" / "src")
@@ -291,31 +382,31 @@ def run_moira_3b_decision_text_training(
     from moira.model import MoiraModel
 
     print("\n" + "=" * 68)
-    print("STAGE 1 (3B): Native MOIRA ~3B Joint Decision + Text Training")
+    print("STAGE 1 (3B): MOIRA ~3.04B (TSK + SwiGLU + 3-6-9 Pulse) Joint Training")
     print("=" * 68)
 
     cfg = moira_3b_config()
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = MoiraModel(cfg).to(device=device, dtype=dtype)
-    decision_head = nn.Linear(12, 1).to(device=device, dtype=dtype)
+    swiglu_layers = nn.ModuleList([SwiGLUFFN(cfg.d_model, cfg.ffn_dim) for _ in range(cfg.n_layers)]).to(
+        device=device, dtype=dtype
+    )
+    for blk, ffn in zip(model.blocks, swiglu_layers):
+        _patch_vectorized_landmarks(blk)
+        _patch_block_with_swiglu(blk, ffn)
 
-    total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in decision_head.parameters())
-    print(f"[3B] Initialized MoiraModel + DecisionHead: {total_params:,} params ({total_params / 1e9:.2f}B) in {dtype}")
+    decision_head = Moira369PulseHead(30, 128).to(device=device, dtype=dtype)
+
+    all_params = list(model.parameters()) + list(swiglu_layers.parameters()) + list(decision_head.parameters())
+    total_params = sum(p.numel() for p in all_params)
+    print(f"[3B] Initialized Moira3B (TSK + SwiGLU + 3-6-9 Head): {total_params:,} params ({total_params / 1e9:.2f}B) in {dtype}")
 
     try:
         import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(
-            list(model.parameters()) + list(decision_head.parameters()),
-            lr=1e-4,
-            weight_decay=0.01,
-        )
+        optimizer = bnb.optim.AdamW8bit(all_params, lr=1e-4, weight_decay=0.01)
         print("[3B] Optimizer: bitsandbytes AdamW8bit")
     except Exception:
-        optimizer = optim.AdamW(
-            list(model.parameters()) + list(decision_head.parameters()),
-            lr=1e-4,
-            weight_decay=0.01,
-        )
+        optimizer = optim.AdamW(all_params, lr=1e-4, weight_decay=0.01)
         print("[3B] Optimizer: torch.optim.AdamW")
 
     needed = steps * batch_size
@@ -337,10 +428,12 @@ def run_moira_3b_decision_text_training(
     train_scenarios, eval_pairs = build_datasets()
     mse = nn.MSELoss()
     model.train()
+    swiglu_layers.train()
     decision_head.train()
 
     t0 = time.time()
     last_text_loss, last_dec_loss = 0.0, 0.0
+    num_pairs = len(train_scenarios) // 2
     for step in range(steps):
         start = (step * batch_size) % len(examples)
         batch_ex = examples[start : start + batch_size]
@@ -348,10 +441,11 @@ def run_moira_3b_decision_text_training(
             batch_ex = examples[:batch_size]
 
         batch = build_causal_batch(batch_ex, sequence_length=cfg.max_seq_len)
-        input_ids = batch.input_ids.to(device)
-        targets = batch.targets.to(device)
-        valid_tokens = batch.valid_tokens.to(device)
-        loss_mask = batch.loss_mask.to(device)
+        max_valid = max(16, int(batch.valid_tokens.sum(dim=1).max().item()))
+        input_ids = batch.input_ids[:, :max_valid].to(device)
+        targets = batch.targets[:, :max_valid].to(device)
+        valid_tokens = batch.valid_tokens[:, :max_valid].to(device)
+        loss_mask = batch.loss_mask[:, :max_valid].to(device)
         src_lens = _causal_source_lengths(loss_mask).to(device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -363,18 +457,24 @@ def run_moira_3b_decision_text_training(
         )
         text_loss = _masked_loss(out_text.logits.float(), targets, loss_mask)
 
-        # Joint decision step on a rotating scenario
-        p, ctx, lbl, score = train_scenarios[step % len(train_scenarios)]
-        dec_ids, dec_valid = _encode_text_to_ids(f"Prompt: {p}\nContext: {ctx}\nAction: {lbl}", cfg.max_seq_len)
-        dec_ids, dec_valid = dec_ids.to(device), dec_valid.to(device)
-        out_dec = model(dec_ids, mode=CognitiveMode.ATROPOS, valid_tokens=dec_valid)
-        pred_score = decision_head(out_dec.appraisal).float()
-        target_score = torch.tensor([[score]], dtype=torch.float32, device=device)
-        dec_loss = mse(pred_score, target_score)
+        # Joint pairwise decision step (chosen vs rejected)
+        pair_idx = (step % num_pairs) * 2
+        p_c, ctx_c, lbl_c, score_c = train_scenarios[pair_idx]
+        p_r, ctx_r, lbl_r, score_r = train_scenarios[pair_idx + 1]
+        ic, vc = _encode_text_to_ids(f"Prompt: {p_c}\nContext: {ctx_c}\nAction: {lbl_c}", cfg.max_seq_len)
+        ir, vr = _encode_text_to_ids(f"Prompt: {p_r}\nContext: {ctx_r}\nAction: {lbl_r}", cfg.max_seq_len)
+        out_c = model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device))
+        out_r = model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device))
+        pred_c = decision_head(_extract_pulse_30d(out_c)).float()
+        pred_r = decision_head(_extract_pulse_30d(out_r)).float()
+        tc = torch.tensor([[score_c]], dtype=torch.float32, device=device)
+        tr = torch.tensor([[score_r]], dtype=torch.float32, device=device)
+        margin_loss = torch.relu(2.0 - (pred_c - pred_r)).mean()
+        dec_loss = 0.5 * (mse(pred_c, tc) + mse(pred_r, tr)) + 0.5 * margin_loss
 
         loss = text_loss + 0.5 * dec_loss
         loss.backward()
-        nn.utils.clip_grad_norm_(list(model.parameters()) + list(decision_head.parameters()), 1.0)
+        nn.utils.clip_grad_norm_(all_params, 1.0)
         optimizer.step()
 
         last_text_loss = float(text_loss.detach().cpu().item())
@@ -384,6 +484,7 @@ def run_moira_3b_decision_text_training(
 
     # Evaluate 3B decision head on held-out pairs
     model.eval()
+    swiglu_layers.eval()
     decision_head.eval()
     correct = 0
     margins = []
@@ -391,8 +492,10 @@ def run_moira_3b_decision_text_training(
         for prompt, ctx, chosen, rejected in eval_pairs:
             ic, vc = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {chosen}", cfg.max_seq_len)
             ir, vr = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {rejected}", cfg.max_seq_len)
-            sc = decision_head(model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device)).appraisal).item()
-            sr = decision_head(model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device)).appraisal).item()
+            out_c = model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device))
+            out_r = model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device))
+            sc = decision_head(_extract_pulse_30d(out_c)).item()
+            sr = decision_head(_extract_pulse_30d(out_r)).item()
             if sc > sr:
                 correct += 1
             margins.append(sc - sr)
@@ -407,6 +510,8 @@ def run_moira_3b_decision_text_training(
     out_3b_dir = HF_DIR / "moira_3b"
     out_3b_dir.mkdir(parents=True, exist_ok=True)
     combined_sd = {f"backbone.{k}": v.detach().cpu() for k, v in model.state_dict().items()}
+    for k, v in swiglu_layers.state_dict().items():
+        combined_sd[f"swiglu.{k}"] = v.detach().cpu()
     for k, v in decision_head.state_dict().items():
         combined_sd[f"decision_head.{k}"] = v.detach().cpu()
     save_torch_state_dict(combined_sd, out_3b_dir, max_shard_size="4GB")
@@ -414,15 +519,56 @@ def run_moira_3b_decision_text_training(
     cfg_dict = asdict(cfg)
     cfg_dict.update({
         "architectures": ["Moira3BDecisionTextModel"],
-        "model_type": "moira-tsk-3b-decision-text",
+        "model_type": "moira-tsk-swiglu-3b-decision-text",
         "total_parameters": total_params,
         "dtype": "bfloat16",
+        "decision_head": "Moira369PulseHead(30->128->1)",
         "decision_eval_acc": eval_acc,
         "decision_avg_margin": eval_margin,
         "final_text_loss": last_text_loss,
         "final_decision_loss": last_dec_loss,
     })
     (out_3b_dir / "config.json").write_text(json.dumps(cfg_dict, indent=2), encoding="utf-8")
+    modeling_3b_code = '''# Copyright (C) 2026 ANISAYAK MITRA
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""MOIRA 3.04B Joint Decision + Text Architecture (TSKBlock + SwiGLUFFN + Moira369PulseHead)."""
+import torch
+import torch.nn as nn
+
+
+class SwiGLUFFN(nn.Module):
+    def __init__(self, d_model: int, ffn_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.w_gate = nn.Linear(d_model, ffn_dim, bias=False)
+        self.w_up = nn.Linear(d_model, ffn_dim, bias=False)
+        self.w_down = nn.Linear(ffn_dim, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        return x + self.w_down(nn.functional.silu(self.w_gate(h)) * self.w_up(h))
+
+
+class Moira369PulseHead(nn.Module):
+    def __init__(self, in_dim: int = 30, hidden_dim: int = 128):
+        super().__init__()
+        self.embed = nn.Linear(in_dim, hidden_dim)
+        self.clotho = nn.Linear(hidden_dim, hidden_dim)
+        self.lachesis = nn.Linear(hidden_dim, hidden_dim)
+        self.atropos = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, 1)
+
+    def forward(self, pulse_vec: torch.Tensor) -> torch.Tensor:
+        h = torch.tanh(self.embed(pulse_vec))
+        v_clotho = torch.tanh(self.clotho(h))
+        v_lachesis = h
+        for _ in range(9):
+            v_lachesis = 0.5 * (v_lachesis + torch.tanh(self.lachesis(v_lachesis)))
+        v_atropos = torch.tanh(self.atropos(v_lachesis))
+        v_mixed = (3.0 * v_clotho + 6.0 * v_lachesis + 9.0 * v_atropos) / 18.0
+        return self.out_proj(v_mixed)
+'''
+    (out_3b_dir / "modeling_moira_3b.py").write_text(modeling_3b_code, encoding="utf-8")
     print(f"[OK] Exported 3B Decision+Text shards to {out_3b_dir}/")
 
     return {
