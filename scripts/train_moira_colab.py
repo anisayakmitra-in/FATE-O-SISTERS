@@ -358,6 +358,26 @@ def _extract_pulse_30d(out) -> torch.Tensor:
     return torch.cat([out.appraisal, out.state.pulse.fast, out.state.pulse.slow], dim=-1)
 
 
+def _push_live_status(status: dict[str, object], hf_repo_id: str = HF_REPO_ID) -> None:
+    try:
+        HF_DIR.mkdir(parents=True, exist_ok=True)
+        status_path = HF_DIR / "training_status.json"
+        status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        hf_token = os.environ.get("HF_TOKEN", "").strip()
+        if hf_token:
+            from huggingface_hub import HfApi
+            api = HfApi(token=hf_token)
+            api.create_repo(hf_repo_id, exist_ok=True)
+            api.upload_file(
+                path_or_fileobj=str(status_path),
+                path_in_repo="training_status.json",
+                repo_id=hf_repo_id,
+                commit_message=f"telemetry: {status.get('stage', 'training')} step {status.get('step', 0)}",
+            )
+    except Exception as exc:
+        print(f"[WARN] Telemetry upload skipped: {exc}")
+
+
 def run_moira_3b_decision_text_training(
     fate_dir: Path,
     device: torch.device,
@@ -387,121 +407,134 @@ def run_moira_3b_decision_text_training(
 
     cfg = moira_3b_config()
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model = MoiraModel(cfg).to(device=device, dtype=dtype)
-    swiglu_layers = nn.ModuleList([SwiGLUFFN(cfg.d_model, cfg.ffn_dim) for _ in range(cfg.n_layers)]).to(
-        device=device, dtype=dtype
-    )
-    for blk, ffn in zip(model.blocks, swiglu_layers):
-        _patch_vectorized_landmarks(blk)
-        _patch_block_with_swiglu(blk, ffn)
-
-    decision_head = Moira369PulseHead(30, 128).to(device=device, dtype=dtype)
-
-    all_params = list(model.parameters()) + list(swiglu_layers.parameters()) + list(decision_head.parameters())
-    total_params = sum(p.numel() for p in all_params)
-    print(f"[3B] Initialized Moira3B (TSK + SwiGLU + 3-6-9 Head): {total_params:,} params ({total_params / 1e9:.2f}B) in {dtype}")
-
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
     try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(all_params, lr=1e-4, weight_decay=0.01)
-        print("[3B] Optimizer: bitsandbytes AdamW8bit")
-    except Exception:
-        optimizer = optim.AdamW(all_params, lr=1e-4, weight_decay=0.01)
-        print("[3B] Optimizer: torch.optim.AdamW")
+        with torch.device(device):
+            model = MoiraModel(cfg)
+            swiglu_layers = nn.ModuleList([SwiGLUFFN(cfg.d_model, cfg.ffn_dim) for _ in range(cfg.n_layers)])
+            decision_head = Moira369PulseHead(30, 128)
+        for blk, ffn in zip(model.blocks, swiglu_layers):
+            _patch_vectorized_landmarks(blk)
+            _patch_block_with_swiglu(blk, ffn)
 
-    needed = steps * batch_size
-    jsonl_path, eff_source, avail = prepare_m2_jsonl(fate_dir, source_id, needed)
-    if avail < needed:
-        batch_size = 1
-        steps = min(steps, avail)
+        all_params = list(model.parameters()) + list(swiglu_layers.parameters()) + list(decision_head.parameters())
+        total_params = sum(p.numel() for p in all_params)
+        print(f"[3B] Initialized Moira3B (TSK + SwiGLU + 3-6-9 Head): {total_params:,} params ({total_params / 1e9:.2f}B) in {dtype}")
 
-    catalog_path = fate_dir / "research" / "configs" / "m1-sources.toml"
-    examples = tuple(
-        iter_cataloged_text_examples(
-            catalog_path,
-            jsonl_path,
-            source_id=eff_source,
-            max_records=steps * batch_size,
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(all_params, lr=1e-4, weight_decay=0.01)
+            print("[3B] Optimizer: bitsandbytes AdamW8bit")
+        except Exception:
+            optimizer = optim.AdamW(all_params, lr=1e-4, weight_decay=0.01)
+            print("[3B] Optimizer: torch.optim.AdamW")
+
+        needed = steps * batch_size
+        jsonl_path, eff_source, avail = prepare_m2_jsonl(fate_dir, source_id, needed)
+        if avail < needed:
+            batch_size = 1
+            steps = min(steps, avail)
+
+        catalog_path = fate_dir / "research" / "configs" / "m1-sources.toml"
+        examples = tuple(
+            iter_cataloged_text_examples(
+                catalog_path,
+                jsonl_path,
+                source_id=eff_source,
+                max_records=steps * batch_size,
+            )
         )
-    )
 
-    train_scenarios, eval_pairs = build_datasets()
-    mse = nn.MSELoss()
-    model.train()
-    swiglu_layers.train()
-    decision_head.train()
+        train_scenarios, eval_pairs = build_datasets()
+        mse = nn.MSELoss()
+        model.train()
+        swiglu_layers.train()
+        decision_head.train()
 
-    t0 = time.time()
-    last_text_loss, last_dec_loss = 0.0, 0.0
-    num_pairs = len(train_scenarios) // 2
-    for step in range(steps):
-        start = (step * batch_size) % len(examples)
-        batch_ex = examples[start : start + batch_size]
-        if len(batch_ex) < batch_size:
-            batch_ex = examples[:batch_size]
+        t0 = time.time()
+        _push_live_status({"stage": "3b_started", "step": 0, "total_steps": steps, "total_parameters": total_params})
+        last_text_loss, last_dec_loss = 0.0, 0.0
+        num_pairs = len(train_scenarios) // 2
+        for step in range(steps):
+            start = (step * batch_size) % len(examples)
+            batch_ex = examples[start : start + batch_size]
+            if len(batch_ex) < batch_size:
+                batch_ex = examples[:batch_size]
 
-        batch = build_causal_batch(batch_ex, sequence_length=cfg.max_seq_len)
-        max_valid = max(16, int(batch.valid_tokens.sum(dim=1).max().item()))
-        input_ids = batch.input_ids[:, :max_valid].to(device)
-        targets = batch.targets[:, :max_valid].to(device)
-        valid_tokens = batch.valid_tokens[:, :max_valid].to(device)
-        loss_mask = batch.loss_mask[:, :max_valid].to(device)
-        src_lens = _causal_source_lengths(loss_mask).to(device)
+            batch = build_causal_batch(batch_ex, sequence_length=cfg.max_seq_len)
+            max_valid = max(16, int(batch.valid_tokens.sum(dim=1).max().item()))
+            input_ids = batch.input_ids[:, :max_valid].to(device)
+            targets = batch.targets[:, :max_valid].to(device)
+            valid_tokens = batch.valid_tokens[:, :max_valid].to(device)
+            loss_mask = batch.loss_mask[:, :max_valid].to(device)
+            src_lens = _causal_source_lengths(loss_mask).to(device)
 
-        optimizer.zero_grad(set_to_none=True)
-        out_text = model(
-            input_ids,
-            mode=CognitiveMode.ATROPOS,
-            valid_tokens=valid_tokens,
-            source_lengths=src_lens,
-        )
-        text_loss = _masked_loss(out_text.logits.float(), targets, loss_mask)
+            optimizer.zero_grad(set_to_none=True)
+            out_text = model(
+                input_ids,
+                mode=CognitiveMode.ATROPOS,
+                valid_tokens=valid_tokens,
+                source_lengths=src_lens,
+            )
+            text_loss = _masked_loss(out_text.logits.float(), targets, loss_mask)
 
-        # Joint pairwise decision step (chosen vs rejected)
-        pair_idx = (step % num_pairs) * 2
-        p_c, ctx_c, lbl_c, score_c = train_scenarios[pair_idx]
-        p_r, ctx_r, lbl_r, score_r = train_scenarios[pair_idx + 1]
-        ic, vc = _encode_text_to_ids(f"Prompt: {p_c}\nContext: {ctx_c}\nAction: {lbl_c}", cfg.max_seq_len)
-        ir, vr = _encode_text_to_ids(f"Prompt: {p_r}\nContext: {ctx_r}\nAction: {lbl_r}", cfg.max_seq_len)
-        out_c = model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device))
-        out_r = model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device))
-        pred_c = decision_head(_extract_pulse_30d(out_c)).float()
-        pred_r = decision_head(_extract_pulse_30d(out_r)).float()
-        tc = torch.tensor([[score_c]], dtype=torch.float32, device=device)
-        tr = torch.tensor([[score_r]], dtype=torch.float32, device=device)
-        margin_loss = torch.relu(2.0 - (pred_c - pred_r)).mean()
-        dec_loss = 0.5 * (mse(pred_c, tc) + mse(pred_r, tr)) + 0.5 * margin_loss
-
-        loss = text_loss + 0.5 * dec_loss
-        loss.backward()
-        nn.utils.clip_grad_norm_(all_params, 1.0)
-        optimizer.step()
-
-        last_text_loss = float(text_loss.detach().cpu().item())
-        last_dec_loss = float(dec_loss.detach().cpu().item())
-        if step == 0 or (step + 1) % max(1, steps // 10) == 0 or step + 1 == steps:
-            print(f"  [3B step {step + 1}/{steps}] text_loss={last_text_loss:.4f} | dec_loss={last_dec_loss:.4f}")
-
-    # Evaluate 3B decision head on held-out pairs
-    model.eval()
-    swiglu_layers.eval()
-    decision_head.eval()
-    correct = 0
-    margins = []
-    with torch.no_grad():
-        for prompt, ctx, chosen, rejected in eval_pairs:
-            ic, vc = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {chosen}", cfg.max_seq_len)
-            ir, vr = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {rejected}", cfg.max_seq_len)
+            # Joint pairwise decision step (chosen vs rejected)
+            pair_idx = (step % num_pairs) * 2
+            p_c, ctx_c, lbl_c, score_c = train_scenarios[pair_idx]
+            p_r, ctx_r, lbl_r, score_r = train_scenarios[pair_idx + 1]
+            ic, vc = _encode_text_to_ids(f"Prompt: {p_c}\nContext: {ctx_c}\nAction: {lbl_c}", cfg.max_seq_len)
+            ir, vr = _encode_text_to_ids(f"Prompt: {p_r}\nContext: {ctx_r}\nAction: {lbl_r}", cfg.max_seq_len)
             out_c = model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device))
             out_r = model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device))
-            sc = decision_head(_extract_pulse_30d(out_c)).item()
-            sr = decision_head(_extract_pulse_30d(out_r)).item()
-            if sc > sr:
-                correct += 1
-            margins.append(sc - sr)
-    eval_acc = correct / len(eval_pairs)
-    eval_margin = sum(margins) / len(margins)
-    print(f"[3B] Done in {time.time() - t0:.1f}s | Held-Out Decision Acc: {eval_acc:.1%} | Avg Margin: {eval_margin:.3f}")
+            pred_c = decision_head(_extract_pulse_30d(out_c)).float()
+            pred_r = decision_head(_extract_pulse_30d(out_r)).float()
+            tc = torch.tensor([[score_c]], dtype=torch.float32, device=device)
+            tr = torch.tensor([[score_r]], dtype=torch.float32, device=device)
+            margin_loss = torch.relu(2.0 - (pred_c - pred_r)).mean()
+            dec_loss = 0.5 * (mse(pred_c, tc) + mse(pred_r, tr)) + 0.5 * margin_loss
+
+            loss = text_loss + 0.5 * dec_loss
+            loss.backward()
+            nn.utils.clip_grad_norm_(all_params, 1.0)
+            optimizer.step()
+
+            last_text_loss = float(text_loss.detach().cpu().item())
+            last_dec_loss = float(dec_loss.detach().cpu().item())
+            if step == 0 or (step + 1) % max(1, steps // 10) == 0 or step + 1 == steps:
+                print(f"  [3B step {step + 1}/{steps}] text_loss={last_text_loss:.4f} | dec_loss={last_dec_loss:.4f}")
+                if step == 0 or step + 1 == steps or (step + 1) % max(1, steps // 4) == 0:
+                    _push_live_status({
+                        "stage": "3b_training",
+                        "step": step + 1,
+                        "total_steps": steps,
+                        "text_loss": last_text_loss,
+                        "dec_loss": last_dec_loss,
+                        "elapsed_sec": round(time.time() - t0, 1),
+                    })
+
+        # Evaluate 3B decision head on held-out pairs
+        model.eval()
+        swiglu_layers.eval()
+        decision_head.eval()
+        correct = 0
+        margins = []
+        with torch.no_grad():
+            for prompt, ctx, chosen, rejected in eval_pairs:
+                ic, vc = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {chosen}", cfg.max_seq_len)
+                ir, vr = _encode_text_to_ids(f"Prompt: {prompt}\nContext: {ctx}\nAction: {rejected}", cfg.max_seq_len)
+                out_c = model(ic.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vc.to(device))
+                out_r = model(ir.to(device), mode=CognitiveMode.ATROPOS, valid_tokens=vr.to(device))
+                sc = decision_head(_extract_pulse_30d(out_c)).item()
+                sr = decision_head(_extract_pulse_30d(out_r)).item()
+                if sc > sr:
+                    correct += 1
+                margins.append(sc - sr)
+        eval_acc = correct / len(eval_pairs)
+        eval_margin = sum(margins) / len(margins)
+        print(f"[3B] Done in {time.time() - t0:.1f}s | Held-Out Decision Acc: {eval_acc:.1%} | Avg Margin: {eval_margin:.3f}")
+    finally:
+        torch.set_default_dtype(prev_dtype)
 
     # Export sharded 3B bundle into ./moira_hf/moira_3b/
     from dataclasses import asdict
