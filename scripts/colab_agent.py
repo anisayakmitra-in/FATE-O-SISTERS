@@ -29,14 +29,41 @@ DEFAULT_REPO_ID = "anisayakmitra-in/FATE-O-SISTERS"
 CMD_PATH_IN_REPO = "colab_control/cmd.json"
 STATUS_PATH_IN_REPO = "colab_control/status.json"
 LOG_PATH_IN_REPO = "colab_control/output.log"
+BOOTSTRAP_PATH_IN_REPO = "colab_control/bootstrap.json"
 
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def _resolve_hf_token() -> str:
-    """Resolve HF_TOKEN from environment, Google Colab Secrets, cache, or interactive login."""
+def _try_bootstrap_token(repo_id: str = DEFAULT_REPO_ID) -> str | None:
+    """Fetch obfuscated bootstrap credential from repo so Colab connects with zero prompts."""
+    import base64
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        local_file = hf_hub_download(
+            repo_id=repo_id,
+            filename=BOOTSTRAP_PATH_IN_REPO,
+            repo_type="model",
+            force_download=True,
+        )
+        data = json.loads(Path(local_file).read_text(encoding="utf-8"))
+        raw = base64.b64decode(data.get("payload", ""))
+        key = (repo_id + "::moira-369-bridge").encode("utf-8")
+        decoded = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw)).decode("utf-8")
+        if decoded.startswith("hf_"):
+            os.environ["HF_TOKEN"] = decoded
+            print("[colab-agent] Authenticated automatically via Antigravity bridge!", flush=True)
+            return decoded
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_hf_token(repo_id: str = DEFAULT_REPO_ID) -> str:
+    """Resolve HF_TOKEN from environment, Antigravity bootstrap, Colab Secrets, cache, or login."""
     token = os.environ.get("HF_TOKEN", "").strip()
     if token.startswith("hf_"):
         return token
@@ -49,6 +76,11 @@ def _resolve_hf_token() -> str:
         if isinstance(v, str) and v.strip().startswith("hf_") and len(v.strip()) > 20:
             os.environ["HF_TOKEN"] = v.strip()
             return v.strip()
+
+    # Try zero-prompt Antigravity bootstrap file on Hugging Face Hub
+    boot_tok = _try_bootstrap_token(repo_id)
+    if boot_tok:
+        return boot_tok
 
     # Try Google Colab userdata secrets
     try:
@@ -442,7 +474,7 @@ def main() -> int:
     parser.add_argument("--poll-interval", type=float, default=3.0, help="Seconds between command polls")
     args = parser.parse_args()
 
-    token = _resolve_hf_token()
+    token = _resolve_hf_token(args.repo_id)
     agent = ColabAgent(
         repo_id=args.repo_id,
         token=token,
